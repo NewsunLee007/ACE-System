@@ -8,12 +8,13 @@ import {
 import { useTheme } from 'next-themes';
 
 const navigationConfig = [
-  { path: '/dashboard', label: '教务大屏', icon: LayoutDashboard },
-  { path: '/headteacher', label: '班主任视图', icon: Users },
+  { path: '/dashboard', label: '教务大屏', icon: LayoutDashboard, roles: ['教务处主任', '管理员'] },
+  { path: '/headteacher', label: '班主任视图', icon: Users, roles: ['班主任', '教务处主任', '管理员'] },
   {
     path: '/educational',
     label: '教务管理',
     icon: Briefcase,
+    roles: ['教务处主任', '管理员'],
     children: [
       { path: '/educational/subjects', label: '学科管理', icon: Library },
       { path: '/educational/role-settings', label: '角色设定', icon: Award },
@@ -24,10 +25,9 @@ const navigationConfig = [
       { path: '/educational/parents', label: '家长管理', icon: Heart },
     ]
   },
-  { path: '/exams', label: '考务管理', icon: BookOpen },
-  { path: '/analysis', label: '成绩分析', icon: BarChart3 },
-  { path: '/parent-portal', label: '家长门户', icon: Heart },
-  { path: '/settings', label: '系统设置', icon: Settings },
+  { path: '/exams', label: '考务管理', icon: BookOpen, roles: ['班主任', '教务处主任', '管理员'] },
+  { path: '/analysis', label: '成绩分析', icon: BarChart3, roles: ['班主任', '教务处主任', '管理员'] },
+  { path: '/settings', label: '系统设置', icon: Settings, roles: ['教务处主任', '管理员'] },
 ];
 
 export default function Layout() {
@@ -62,6 +62,20 @@ export default function Layout() {
   };
 
   const isRouteActive = (path) => location.pathname.startsWith(path);
+
+  // 过滤导航菜单
+  const filteredNavigation = navigationConfig.filter(item => {
+    if (!item.roles || !user) return true;
+    return item.roles.includes(user.role_name);
+  }).map(item => {
+    if (item.children) {
+      return {
+        ...item,
+        children: item.children.filter(child => !child.roles || (user && child.roles.includes(user.role_name)))
+      };
+    }
+    return item;
+  });
 
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-slate-950 transition-colors duration-200">
@@ -122,7 +136,7 @@ export default function Layout() {
           `}
         >
           <nav className="p-4 space-y-1">
-            {navigationConfig.map((item) => (
+            {filteredNavigation.map((item) => (
               <div key={item.path}>
                 {item.children ? (
                   <>

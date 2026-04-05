@@ -20,11 +20,27 @@ import SystemSettings from './components/SystemSettings';
 import { CommandMenu } from './components/CommandMenu';
 
 // Protected Route Wrapper
-const ProtectedRoute = ({ children }) => {
+const ProtectedRoute = ({ children, allowedRoles }) => {
   const token = localStorage.getItem('token');
-  if (!token) {
+  const userStr = localStorage.getItem('user');
+  
+  if (!token || !userStr) {
     return <Navigate to="/login" replace />;
   }
+  
+  try {
+    const user = JSON.parse(userStr);
+    if (allowedRoles && allowedRoles.length > 0 && !allowedRoles.includes(user.role_name)) {
+      // 如果是班主任，重定向到班主任视图
+      if (user.role_name === '班主任') {
+        return <Navigate to="/headteacher" replace />;
+      }
+      return <Navigate to="/login" replace />;
+    }
+  } catch (e) {
+    return <Navigate to="/login" replace />;
+  }
+
   return children;
 };
 
@@ -36,25 +52,25 @@ function App() {
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route path="/parent-h5" element={<ParentH5Portal />} />
+          <Route path="/parent-portal" element={<ParentPortal />} />
           
           <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
             <Route index element={<Navigate to="/dashboard" replace />} />
-            <Route path="dashboard" element={<Dashboard />} />
-            <Route path="headteacher" element={<HeadTeacherView />} />
+            <Route path="dashboard" element={<ProtectedRoute allowedRoles={['教务处主任', '管理员']}><Dashboard /></ProtectedRoute>} />
+            <Route path="headteacher" element={<ProtectedRoute allowedRoles={['班主任', '教务处主任', '管理员']}><HeadTeacherView /></ProtectedRoute>} />
             
             {/* Educational Management */}
-            <Route path="educational/subjects" element={<SubjectManagement />} />
-            <Route path="educational/role-settings" element={<RoleSettings />} />
-            <Route path="educational/classes" element={<ClassManagement />} />
-            <Route path="educational/teachers" element={<TeacherManagement />} />
-            <Route path="educational/roles" element={<RoleManagement />} />
-            <Route path="educational/students" element={<StudentManagement />} />
-            <Route path="educational/parents" element={<ParentManagement />} />
+            <Route path="educational/subjects" element={<ProtectedRoute allowedRoles={['教务处主任', '管理员']}><SubjectManagement /></ProtectedRoute>} />
+            <Route path="educational/role-settings" element={<ProtectedRoute allowedRoles={['教务处主任', '管理员']}><RoleSettings /></ProtectedRoute>} />
+            <Route path="educational/classes" element={<ProtectedRoute allowedRoles={['教务处主任', '管理员']}><ClassManagement /></ProtectedRoute>} />
+            <Route path="educational/teachers" element={<ProtectedRoute allowedRoles={['教务处主任', '管理员']}><TeacherManagement /></ProtectedRoute>} />
+            <Route path="educational/roles" element={<ProtectedRoute allowedRoles={['教务处主任', '管理员']}><RoleManagement /></ProtectedRoute>} />
+            <Route path="educational/students" element={<ProtectedRoute allowedRoles={['教务处主任', '管理员']}><StudentManagement /></ProtectedRoute>} />
+            <Route path="educational/parents" element={<ProtectedRoute allowedRoles={['教务处主任', '管理员']}><ParentManagement /></ProtectedRoute>} />
             
-            <Route path="exams" element={<ExamManagement />} />
-            <Route path="analysis" element={<ScoreAnalysis />} />
-            <Route path="parent-portal" element={<ParentPortal />} />
-            <Route path="settings" element={<SystemSettings />} />
+            <Route path="exams" element={<ProtectedRoute allowedRoles={['班主任', '教务处主任', '管理员']}><ExamManagement /></ProtectedRoute>} />
+            <Route path="analysis" element={<ProtectedRoute allowedRoles={['班主任', '教务处主任', '管理员']}><ScoreAnalysis /></ProtectedRoute>} />
+            <Route path="settings" element={<ProtectedRoute allowedRoles={['管理员', '教务处主任']}><SystemSettings /></ProtectedRoute>} />
           </Route>
         </Routes>
       </BrowserRouter>

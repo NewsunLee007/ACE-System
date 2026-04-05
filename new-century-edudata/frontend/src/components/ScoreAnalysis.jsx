@@ -49,6 +49,11 @@ import schoolData from '../data/schoolData';
 import SubjectThresholdAnalysis from './SubjectThresholdAnalysis';
 import SubjectScoreDistribution from './SubjectScoreDistribution';
 import SubjectScoreAnalysisBoard from './SubjectScoreAnalysisBoard';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs';
+import ScoreRawData from './score-analysis/ScoreRawData';
+import ThreeRatesStats from './score-analysis/ThreeRatesStats';
+import TopStudentsTracking from './score-analysis/TopStudentsTracking';
+import AdmissionPrediction from './score-analysis/AdmissionPrediction';
 
 const API_BASE_URL = 'http://localhost:8000/api/v1';
 
@@ -2574,43 +2579,89 @@ const ScoreAnalysis = ({ currentUser: propUser }) => {
             </div>
           </div>
 
-          {/* 分析结果 */}
-          <div id="section-analysis-result" className="bg-white rounded-lg shadow-sm p-6 scroll-mt-28">
-            <h2 className="text-lg font-semibold mb-4">分析结果</h2>
-            {renderAnalysisResult()}
-          </div>
+          {/* 分析结果区包裹在 Tabs 中 */}
+          <Tabs defaultValue="z-value" className="w-full">
+            <TabsList className="grid w-full grid-cols-2 md:grid-cols-5 mb-6 h-auto p-1 gap-2">
+              <TabsTrigger value="raw-data" className="py-2">原始数据展示</TabsTrigger>
+              <TabsTrigger value="z-value" className="py-2">Z值综合评价</TabsTrigger>
+              <TabsTrigger value="three-rates" className="py-2">三率一分统计</TabsTrigger>
+              <TabsTrigger value="top-students" className="py-2">尖子生追踪</TabsTrigger>
+              <TabsTrigger value="admission" className="py-2">模拟进线预测</TabsTrigger>
+            </TabsList>
 
-          {/* 各学科临界分分析 */}
-          {analysisResult && selectedExam && examScores.length > 0 && (
-            <div id="section-subject-threshold" className="scroll-mt-28">
-              <SubjectThresholdAnalysis
-                examData={selectedExam}
-                examScores={examScores}
-                subjects={selectedExam.subjects || ['语文', '数学', '英语', '科学', '社会']}
+            <TabsContent value="raw-data">
+              <ScoreRawData 
+                examData={selectedExam} 
+                onImportSuccess={(data) => {
+                  alert('导入成功，请点击"执行分析"刷新数据');
+                }} 
               />
-            </div>
-          )}
+            </TabsContent>
 
-          {/* 各学科分数段人数统计 */}
-          {analysisResult && selectedExam && examScores.length > 0 && (
-            <div id="section-subject-distribution" className="scroll-mt-28">
-              <SubjectScoreDistribution
-                examData={selectedExam}
-                examScores={examScores}
-                subjects={selectedExam.subjects || ['语文', '数学', '英语', '科学', '社会']}
-              />
-            </div>
-          )}
+            <TabsContent value="z-value" className="space-y-6">
+              {/* 原有分析结果 */}
+              <div id="section-analysis-result" className="bg-white rounded-lg shadow-sm p-6 scroll-mt-28">
+                <h2 className="text-lg font-semibold mb-4">分析结果</h2>
+                {renderAnalysisResult()}
+              </div>
 
-          {analysisResult && selectedExam && allScopeExamScores.length > 0 && (
-            <div id="section-subject-analysis-board" className="scroll-mt-28">
-              <SubjectScoreAnalysisBoard
-                examData={selectedExam}
-                allExamScores={allScopeExamScores}
-                classLayers={classLayers}
-              />
-            </div>
-          )}
+              {/* 各学科临界分分析 */}
+              {analysisResult && selectedExam && examScores.length > 0 && (
+                <div id="section-subject-threshold" className="scroll-mt-28">
+                  <SubjectThresholdAnalysis
+                    examData={selectedExam}
+                    examScores={examScores}
+                    subjects={selectedExam.subjects || ['语文', '数学', '英语', '科学', '社会']}
+                  />
+                </div>
+              )}
+
+              {/* 各学科分数段人数统计 */}
+              {analysisResult && selectedExam && examScores.length > 0 && (
+                <div id="section-subject-distribution" className="scroll-mt-28">
+                  <SubjectScoreDistribution
+                    examData={selectedExam}
+                    examScores={examScores}
+                    subjects={selectedExam.subjects || ['语文', '数学', '英语', '科学', '社会']}
+                  />
+                </div>
+              )}
+
+              {analysisResult && selectedExam && allScopeExamScores.length > 0 && (
+                <div id="section-subject-analysis-board" className="scroll-mt-28">
+                  <SubjectScoreAnalysisBoard
+                    examData={selectedExam}
+                    allExamScores={allScopeExamScores}
+                    classLayers={classLayers}
+                  />
+                </div>
+              )}
+            </TabsContent>
+
+            <TabsContent value="three-rates">
+              {analysisResult ? (
+                <ThreeRatesStats examScores={examScores} allScopeExamScores={allScopeExamScores} subjects={selectedExam?.subjects || []} classLayers={classLayers} />
+              ) : (
+                <div className="p-8 text-center text-gray-500 bg-white rounded-lg border">请先选择考试并执行分析</div>
+              )}
+            </TabsContent>
+
+            <TabsContent value="top-students">
+              {analysisResult ? (
+                <TopStudentsTracking examScores={allScopeExamScores} classLayers={classLayers} />
+              ) : (
+                <div className="p-8 text-center text-gray-500 bg-white rounded-lg border">请先选择考试并执行分析</div>
+              )}
+            </TabsContent>
+
+            <TabsContent value="admission">
+              {analysisResult ? (
+                <AdmissionPrediction examScores={allScopeExamScores} allScopeExamScores={allScopeExamScores} subjects={selectedExam?.subjects || []} classLayers={classLayers} />
+              ) : (
+                <div className="p-8 text-center text-gray-500 bg-white rounded-lg border">请先选择考试并执行分析</div>
+              )}
+            </TabsContent>
+          </Tabs>
 
           {/* 分析历史 */}
           <div id="section-analysis-history" className="bg-white rounded-lg shadow-sm p-6 scroll-mt-28">

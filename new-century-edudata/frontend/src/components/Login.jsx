@@ -1,7 +1,9 @@
 import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { School, User, Lock, Eye, EyeOff, Loader2 } from 'lucide-react';
 
-const Login = ({ onLogin }) => {
+const Login = () => {
+  const navigate = useNavigate();
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -17,21 +19,17 @@ const Login = ({ onLogin }) => {
       // 模拟登录请求
       await new Promise(resolve => setTimeout(resolve, 1000));
       
-      // 这里应该调用实际的API
-      // const response = await fetch('/api/v1/auth/login', {
-      //   method: 'POST',
-      //   headers: { 'Content-Type': 'application/json' },
-      //   body: JSON.stringify({ username, password })
-      // });
-      
       // 模拟成功登录
       if (username && password) {
-        onLogin({
+        const userData = {
           username,
           real_name: '李主任',
           role_name: '教务处主任',
           permission_code: 'edu_admin'
-        });
+        };
+        localStorage.setItem('user', JSON.stringify(userData));
+        localStorage.setItem('token', 'mock_token_' + Date.now());
+        navigate('/dashboard');
       } else {
         setError('请输入用户名和密码');
       }

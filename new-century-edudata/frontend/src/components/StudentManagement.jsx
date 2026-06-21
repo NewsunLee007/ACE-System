@@ -1,36 +1,66 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useState, useEffect } from 'react';
 import {
   Plus,
   Search,
-  Filter,
   GraduationCap,
   Users,
   User,
   UserCheck,
-  UserX,
   Edit,
   Eye,
   Trash2,
-  ChevronLeft,
-  ChevronRight,
   X,
   Download,
   Upload,
-  FileSpreadsheet,
   Square,
   CheckSquare,
-  AlertCircle,
-  RefreshCw,
   School,
   FileText
 } from 'lucide-react';
 import schoolData from '../data/schoolData';
+import { notify } from '../lib/notify';
+import { useConfirm } from './ui/confirm';
 import SmartImportModal from './SmartImportModal';
+import {
+  buildStudentImport,
+  commitStudentImport,
+  parseStudentImportText,
+} from '../lib/studentImport';
+import {
+  createStudentRecord,
+  fetchStudentList,
+  studentImportItemsToCsv,
+  updateStudentRecord,
+  uploadStudentImportFile,
+} from '../lib/studentApi';
+import { hasBackendAuthToken } from '../lib/sessionToken';
+import {
+  REGISTRY_STATUS_OPTIONS,
+  STUDENT_STATUS_OPTIONS,
+  buildStudentRegistryStats,
+  buildStudentRegistryTimeline,
+  getRegistryStatusFromStudent,
+  getStudentGradeLabel,
+  getStudentStatusColor,
+  getStudentStatusDisplay,
+  normalizeStudentRecordForRegistry,
+} from '../lib/studentRegistry';
+
+const hasBackendSession = hasBackendAuthToken;
+
+const isExcelFile = (file) => /\.(xls|xlsx)$/i.test(file?.name || '');
+
+const normalizeStudentListForRegistry = (items = []) => items.map(normalizeStudentRecordForRegistry);
 
 const StudentManagement = () => {
+  const { confirm: confirmAction } = useConfirm();
   const [students, setStudents] = useState([]);
   const [classes, setClasses] = useState([]);
-  const [loading, setLoading] = useState(false);
+  const [studentSyncSource, setStudentSyncSource] = useState('local');
+  const [studentListLoading, setStudentListLoading] = useState(false);
+  const [studentListError, setStudentListError] = useState('');
+  const [studentImporting, setStudentImporting] = useState(false);
+  const [studentImportBackendResult, setStudentImportBackendResult] = useState(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [showEditModal, setShowEditModal] = useState(false);
   const [showImportModal, setShowImportModal] = useState(false);
@@ -46,6 +76,8 @@ const StudentManagement = () => {
   // 智能导入相关状态
   const [showSmartImport, setShowSmartImport] = useState(false);
   const [importPreviewData, setImportPreviewData] = useState([]);
+  const skipInitialStudentSync = React.useRef(true);
+  const localStudentCacheRef = React.useRef([]);
   
   // 选中的学生（用于查看详情）
   const [selectedStudentForDetail, setSelectedStudentForDetail] = useState(null);
@@ -74,6 +106,11 @@ const StudentManagement = () => {
     class_id: '',
     status: '在籍',
     enrollment_year: 2024,
+    registry_status: '正常在籍',
+    enrollment_type: '正常入学',
+    source_school: '',
+    status_changed_at: '',
+    status_reason: '',
     // 提前招生信息
     early_admission_school: '',
     early_admission_type: '',
@@ -85,16 +122,70 @@ const StudentManagement = () => {
 
   // 从数据中心加载数据
   useEffect(() => {
-    setStudents(schoolData.students || []);
+    const normalizedStudents = normalizeStudentListForRegistry(schoolData.students || []);
+    localStudentCacheRef.current = normalizedStudents;
+    setStudents(normalizedStudents);
+    schoolData.students = normalizedStudents;
     const loadedClasses = schoolData.classes || [];
     setClasses(loadedClasses);
     setEarlyAdmissions(schoolData.earlyAdmissions || []);
   }, []);
 
+  const refreshStudents = useCallback(async () => {
+    if (!hasBackendSession()) {
+      setStudentSyncSource('local');
+      return null;
+    }
+
+    setStudentListLoading(true);
+    try {
+      const payload = await fetchStudentList({ status: '', pageSize: 100 }, classes);
+      const remoteStudents = normalizeStudentListForRegistry(payload.students || []);
+      if (remoteStudents.length === 0 && localStudentCacheRef.current.length > 0) {
+        setStudents(localStudentCacheRef.current);
+        setStudentSyncSource('local');
+        setStudentListError('后端学生库暂无学生记录，当前显示本地真实导入数据。');
+        return {
+          ...payload,
+          students: localStudentCacheRef.current,
+          source: 'local-fallback',
+        };
+      }
+
+      setStudents(remoteStudents);
+      if (remoteStudents.length > 0) {
+        localStudentCacheRef.current = remoteStudents;
+      }
+      setStudentSyncSource('backend');
+      setStudentListError('');
+      return payload;
+    } catch (error) {
+      setStudentSyncSource('local');
+      setStudentListError(`后端学生库暂不可用，当前显示本地缓存：${error.message || '连接失败'}`);
+      return null;
+    } finally {
+      setStudentListLoading(false);
+    }
+  }, [classes]);
+
+  useEffect(() => {
+    if (classes.length > 0) {
+      refreshStudents();
+    }
+  }, [classes.length, refreshStudents]);
+
   // 同步students到schoolData
   useEffect(() => {
+    if (skipInitialStudentSync.current) {
+      skipInitialStudentSync.current = false;
+      return;
+    }
+    schoolData.students = students;
     if (students.length > 0) {
-      schoolData.students = students;
+      localStudentCacheRef.current = students;
+    }
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new Event('schoolData:changed'));
     }
   }, [students]);
 
@@ -159,19 +250,6 @@ const StudentManagement = () => {
     return { valid: true };
   };
 
-  // 验证身份证号
-  const validateIdCard = (idCard) => {
-    if (!idCard || idCard.trim() === '') {
-      return { valid: true }; // 身份证号可选
-    }
-    const idCardStr = idCard.trim();
-    // 18位身份证验证
-    if (!/^\d{17}[\dXx]$/.test(idCardStr)) {
-      return { valid: false, message: '身份证号格式不正确，应为18位' };
-    }
-    return { valid: true };
-  };
-
   // 验证表单
   const validateForm = () => {
     const errors = {};
@@ -202,8 +280,13 @@ const StudentManagement = () => {
       name: '',
       gender: '1',
       class_id: '',
-      status: '在读',
-      enrollment_year: 2024
+      status: '在籍',
+      enrollment_year: 2024,
+      registry_status: '正常在籍',
+      enrollment_type: '正常入学',
+      source_school: '',
+      status_changed_at: '',
+      status_reason: ''
     });
     setFormErrors({});
     setSelectedStudent(null);
@@ -236,6 +319,11 @@ const StudentManagement = () => {
       class_id: student.class_id || '',
       status: student.status || '在籍',
       enrollment_year: student.enrollment_year || 2024,
+      registry_status: student.registry_status || getRegistryStatusFromStudent(student),
+      enrollment_type: student.enrollment_type || '正常入学',
+      source_school: student.source_school || '',
+      status_changed_at: student.status_changed_at || '',
+      status_reason: student.status_reason || '',
       // 提前招生信息
       early_admission_school: schoolValue,
       early_admission_type: typeValue,
@@ -246,7 +334,7 @@ const StudentManagement = () => {
     setShowEditModal(true);
   };
 
-  const handleSaveStudent = (e) => {
+  const handleSaveStudent = async (e) => {
     e.preventDefault();
 
     if (!validateForm()) {
@@ -260,22 +348,59 @@ const StudentManagement = () => {
         gender: parseInt(formData.gender),
         class_id: parseInt(formData.class_id),
         status: formData.status,
-        enrollment_year: parseInt(formData.enrollment_year)
+        enrollment_year: parseInt(formData.enrollment_year),
+        registry_status: formData.registry_status || getRegistryStatusFromStudent(formData),
+        enrollment_type: formData.enrollment_type || '正常入学',
+        source_school: formData.source_school || '',
+        status_changed_at: formData.status_changed_at || '',
+        status_reason: formData.status_reason || ''
       };
 
       let studentId;
 
-      if (selectedStudent) {
+      if (hasBackendSession()) {
+        if (selectedStudent) {
+          const result = await updateStudentRecord(selectedStudent.id, formData, classes);
+          if (result?.success === false) {
+            notify(result.message || '学生信息更新失败', 'warning');
+            return;
+          }
+          await refreshStudents();
+          notify(result?.message || '学生信息更新成功！', 'success');
+          setShowEditModal(false);
+          studentId = selectedStudent.id;
+        } else {
+          const result = await createStudentRecord(formData, classes);
+          if (result?.success === false) {
+            notify(result.message || '学生添加失败', 'warning');
+            return;
+          }
+          studentId = result?.student_id;
+          if (formData.status && formData.status !== '在读' && studentId) {
+            await updateStudentRecord(studentId, formData, classes);
+          }
+          const reloaded = await refreshStudents();
+          if (!reloaded) {
+            const newStudent = {
+              id: studentId || Date.now(),
+              ...studentData
+            };
+            setStudents(prev => [...prev, newStudent]);
+          }
+          notify(result?.message || '学生添加成功！', 'success');
+          setShowCreateModal(false);
+        }
+      } else if (selectedStudent) {
         // 更新现有学生
         const updatedStudents = students.map(s =>
           s.id === selectedStudent.id
-            ? { ...s, ...studentData }
+            ? normalizeStudentRecordForRegistry({ ...s, ...studentData })
             : s
         );
         setStudents(updatedStudents);
         schoolData.students = updatedStudents;
         studentId = selectedStudent.id;
-        alert('学生信息更新成功！');
+        notify('学生信息更新成功！', 'success');
         setShowEditModal(false);
       } else {
         // 创建新学生
@@ -284,10 +409,10 @@ const StudentManagement = () => {
           ...studentData
         };
         studentId = newStudent.id;
-        const updatedStudents = [...students, newStudent];
+        const updatedStudents = [...students, normalizeStudentRecordForRegistry(newStudent)];
         setStudents(updatedStudents);
         schoolData.students = updatedStudents;
-        alert('学生添加成功！');
+        notify('学生添加成功！', 'success');
         setShowCreateModal(false);
       }
 
@@ -343,6 +468,11 @@ const StudentManagement = () => {
         class_id: '',
         status: '在籍',
         enrollment_year: 2024,
+        registry_status: '正常在籍',
+        enrollment_type: '正常入学',
+        source_school: '',
+        status_changed_at: '',
+        status_reason: '',
         early_admission_school: '',
         early_admission_type: '',
         early_admission_date: '',
@@ -351,21 +481,31 @@ const StudentManagement = () => {
       setFormErrors({});
     } catch (error) {
       console.error('保存学生信息失败:', error);
-      alert('保存失败：' + error.message);
+      notify('保存失败：' + error.message, 'error');
     }
   };
 
-  const handleDeleteStudent = (id) => {
-    if (window.confirm('确定要删除这名学生吗？')) {
-      try {
-        const updatedStudents = students.filter(s => s.id !== id);
-        setStudents(updatedStudents);
-        schoolData.students = updatedStudents;
-        alert('删除成功！');
-      } catch (error) {
-        console.error('删除学生失败:', error);
-        alert('删除失败：' + error.message);
-      }
+  const handleDeleteStudent = async (id) => {
+    const confirmed = await confirmAction({
+      title: '删除学生',
+      message: '确定要删除这名学生吗？',
+      confirmText: '删除'
+    });
+    if (!confirmed) return;
+
+    if (hasBackendSession()) {
+      notify('后端学生库不支持物理删除；请将学生状态调整为转学、退学或休学以保留历史成绩。', 'warning');
+      return;
+    }
+
+    try {
+      const updatedStudents = students.filter(s => s.id !== id);
+      setStudents(updatedStudents);
+      schoolData.students = updatedStudents;
+      notify('删除成功！');
+    } catch (error) {
+      console.error('删除学生失败:', error);
+      notify('删除失败：' + error.message);
     }
   };
 
@@ -384,32 +524,30 @@ const StudentManagement = () => {
 
   // 获取学生的成绩信息
   const getStudentScores = (studentId) => {
-    return (schoolData.scores || []).filter(score => score.student_id === studentId);
+    return (schoolData.examScores || schoolData.scores || []).filter(score => score.student_id === studentId);
   };
 
   // 下载导入模板
   const downloadTemplate = () => {
-    // 获取现有班级编号作为示例
-    const classNos = classes.slice(0, 2).map(c => c.class_no || c.name);
-    const sampleClass1 = classNos[0] || '701';
-    const sampleClass2 = classNos[1] || '702';
+    const sampleClass1 = classes[0] || { id: 701, enrollment_year: schoolData.config.currentAcademicYear };
+    const sampleClass2 = classes[1] || { id: 702, enrollment_year: schoolData.config.currentAcademicYear };
     
     // 移除身份证列，保护学生隐私
-    const headers = ['学籍辅号', '姓名', '性别(男/女)', '班级编号', '状态(在读/休学/转学/退学)', '入学年份'];
+    const headers = ['学籍辅号', '姓名', '性别(男/女)', '班级编号', '状态(在籍/借读/休学/转学/退学/请长假)', '入学年份'];
     const sampleData = [
-      ['20240701001', '张小明', '男', sampleClass1, '在读', '2024'],
-      ['20240701002', '李小红', '女', sampleClass2, '在读', '2024'],
+      ['20250701001', '张小明', '男', sampleClass1.id, '在籍', sampleClass1.enrollment_year],
+      ['20250701002', '李小红', '女', sampleClass2.id, '在籍', sampleClass2.enrollment_year],
     ];
     
     // 添加格式说明
     const notes = [
       '',
-      '【填写说明】',
-      '1. 班级编号格式：可以使用 "701" 或 "701班" 格式',
-      '2. 学籍辅号格式：如 20240701001（2024年入学+7年级+01班+001号）',
-      '3. 性别：男 或 女',
-      '4. 状态：在读、休学、转学、退学',
-      '5. 入学年份：如 2024',
+      '# 填写说明',
+      '# 1. 班级编号可以填 701、701班、01 或 2025级01班',
+      '# 2. 学籍辅号格式：10-13位数字，如 20250701001',
+      '# 3. 性别：男 或 女',
+      '# 4. 状态：在籍、借读、休学、转学、退学、请长假；其他值会进入待核验',
+      '# 5. 入学年份可留空，系统会优先按班级入学年份识别',
     ];
     
     const csvContent = [
@@ -424,303 +562,145 @@ const StudentManagement = () => {
     link.click();
   };
 
-  // 导出学生数据
-  const exportData = () => {
-    // 根据是否有提前招生筛选，决定导出字段
-    const hasEarlyAdmissionFilter = !!filterEarlyAdmission;
-    const headers = hasEarlyAdmissionFilter 
-      ? ['学籍辅号', '姓名', '性别', '班级', '班主任', '状态', '入学年份', '提前招生学校', '录取类型', '录取日期']
-      : ['学籍辅号', '姓名', '性别', '班级', '班主任', '状态', '入学年份'];
-    
-    const data = filteredStudents.map(s => {
-      const cls = schoolData.getClassById(s.class_id);
-      const headTeacher = cls ? schoolData.getHeadTeacherByClassId(cls.id) : null;
-      const admission = earlyAdmissions.find(a => a.student_id === s.id);
-      
-      const baseData = [
-        s.student_code, 
-        s.name, 
-        s.gender === 1 ? '男' : '女', 
-        cls ? schoolData.formatClassName(cls.id) : '未分配',
-        headTeacher ? headTeacher.name : '未设置',
-        s.status, 
-        s.enrollment_year
-      ];
-      
-      if (hasEarlyAdmissionFilter) {
-        baseData.push(
-          admission ? admission.school_name : '',
-          admission ? admission.admission_type : '',
-          admission ? admission.admission_date : ''
-        );
-      }
-      
-      return baseData;
-    });
-    
-    const csvContent = [headers.join(','), ...data.map(row => row.join(','))].join('\n');
-    const blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    
-    // 根据筛选条件生成文件名
-    let fileName = '学生名单';
-    if (filterEarlyAdmission === 'all') {
-      fileName = '提前招生学生名单';
-    } else if (filterEarlyAdmission) {
-      fileName = `${filterEarlyAdmission}提前招生名单`;
-    } else if (filterClass) {
-      const cls = schoolData.getClassById(parseInt(filterClass));
-      fileName = cls ? `${schoolData.formatClassName(cls.id)}学生名单` : '班级学生名单';
-    }
-    
-    link.download = `${fileName}_${new Date().toLocaleDateString()}.csv`;
-    link.click();
-  };
-
   // 智能导入 - 解析文件并显示预览
-  const handleImportPreview = () => {
+  const handleImportPreview = async () => {
     if (!importFile) {
-      alert('请先选择要导入的文件');
+      notify('请先选择要导入的文件');
+      return;
+    }
+
+    setStudentImportBackendResult(null);
+
+    if (isExcelFile(importFile)) {
+      if (!hasBackendSession()) {
+        notify('Excel 文件需要登录后写入后端学生库；当前会话未检测到登录 token。', 'error');
+        return;
+      }
+
+      setStudentImporting(true);
+      try {
+        const result = await uploadStudentImportFile({
+          file: importFile,
+          filename: importFile.name,
+        });
+        if (result?.success === false) {
+          notify(result.message || '学生导入失败', 'warning');
+          return;
+        }
+        setStudentImportBackendResult(result);
+        await refreshStudents();
+        setShowImportModal(false);
+        setImportFile(null);
+        notify(result?.message || '学生导入完成，学生库已刷新。', 'success');
+      } catch (error) {
+        notify('导入失败：' + (error.message || '请稍后重试'), 'error');
+      } finally {
+        setStudentImporting(false);
+      }
       return;
     }
     
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
-        const content = e.target.result;
-        const lines = content.split('\n').filter(line => line.trim());
-        
-        console.log('当前班级数据:', classes);
-        console.log('班级数量:', classes.length);
-        
-        if (lines.length < 2) {
-          alert('文件格式错误：缺少表头或数据行');
+        const parsed = parseStudentImportText(e.target.result || '');
+        const result = buildStudentImport({
+          parsedRows: parsed.rows,
+          students,
+          classes,
+          currentAcademicYear: schoolData.config.currentAcademicYear,
+          formatClassName: schoolData.formatClassName.bind(schoolData),
+        });
+
+        if (result.items.length === 0) {
+          notify('没有可导入的学生数据');
           return;
         }
-        
-        const previewData = [];
-        
-        for (let i = 1; i < lines.length; i++) {
-          const cols = lines[i].split(',');
-          // 只要求至少有4列：学籍辅号、姓名、性别、班级
-          if (cols.length >= 4) {
-            const studentCode = cols[0]?.trim() || '';
-            const name = cols[1]?.trim() || '';
-            
-            // 跳过空行
-            if (!studentCode && !name) continue;
-            
-            // 性别识别 - 支持多种格式：1/2, 男/女, M/F
-            const genderRaw = cols[2]?.trim() || '';
-            let gender = 1; // 默认为男
-            if (genderRaw === '0' || genderRaw === '2' || genderRaw === '女' || genderRaw.toLowerCase() === 'f') {
-              gender = 0; // 女
-            } else if (genderRaw === '1' || genderRaw === '男' || genderRaw.toLowerCase() === 'm') {
-              gender = 1; // 男
-            }
-            
-            const classNo = cols[3]?.trim() || '';
-            
-            // 状态识别 - 支持自定义状态（第5列，可选）
-            const statusRaw = cols[4]?.trim();
-            let status = statusRaw || '在读'; // 如果为空则默认为"在读"
-            
-            // 入学年份（第6列，可选）
-            const enrollmentYear = parseInt(cols[5]?.trim()) || 2024;
-            
-            // 根据班级编号查找班级ID（匹配class_no字段）
-            // 支持多种格式：701、701班、2025级01班
-            console.log('查找班级编号:', classNo);
-            console.log('可用班级:', classes.map(c => ({ id: c.id, class_no: c.class_no, name: c.name })));
-            
-            // 标准化班级编号（去掉"班"字）
-            const normalizedClassNo = classNo.replace(/班$/, '');
-            
-            const classObj = classes.find(c => {
-              const matchClassNo = c.class_no === classNo || c.class_no === normalizedClassNo;
-              const matchName = c.name === classNo || c.name === normalizedClassNo;
-              // 还支持从班级名称中提取编号匹配，如 "2025级01班" 匹配 "701"
-              const nameMatchClassNo = c.name && c.name.match(/(\d+)班$/)?.[1] === normalizedClassNo;
-              console.log(`  班级 ${c.class_no}/${c.name}: class_no匹配=${matchClassNo}, name匹配=${matchName}, name提取匹配=${nameMatchClassNo}`);
-              return matchClassNo || matchName || nameMatchClassNo;
-            });
-            const classId = classObj ? classObj.id : null;
-            console.log('匹配结果:', classObj ? `找到班级ID=${classId}` : '未找到');
-            
-            // 验证学籍辅号
-            const codeValidation = validateStudentCode(studentCode);
-            
-            // 验证班级
-            let classError = null;
-            if (!classNo) {
-              classError = '班级不能为空';
-            } else if (!classObj) {
-              classError = `班级编号"${classNo}"不存在，请检查班级编号`;
-            }
-            
-            // 验证姓名
-            let nameError = null;
-            if (!name) {
-              nameError = '姓名不能为空';
-            }
-            
-            // 合并错误信息
-            let error = null;
-            if (!codeValidation.valid) {
-              error = codeValidation.message;
-            } else if (classError) {
-              error = classError;
-            } else if (nameError) {
-              error = nameError;
-            }
-            
-            // 查找是否已存在
-            const existingStudent = students.find(s => s.student_code === studentCode);
-            
-            if (existingStudent) {
-              // 检查是否有变化
-              const changes = [];
-              if (name !== existingStudent.name) changes.push('name');
-              if (gender !== existingStudent.gender) changes.push('gender');
-              if (classId !== existingStudent.class_id) changes.push('class_id');
-              if (status !== existingStudent.status) changes.push('status');
-              if (enrollmentYear !== existingStudent.enrollment_year) changes.push('enrollment_year');
-              
-              previewData.push({
-                type: changes.length > 0 ? 'update' : 'unchanged',
-                data: { student_code: studentCode, name, gender, class_id: classId, status, enrollment_year: enrollmentYear, id_card: '' },
-                existingData: existingStudent,
-                changes,
-                error: error
-              });
-            } else {
-              previewData.push({
-                type: 'new',
-                data: { student_code: studentCode, name, gender, class_id: classId, status, enrollment_year: enrollmentYear, id_card: '' },
-                error: error
-              });
-            }
-          }
-        }
-        
-        setImportPreviewData(previewData);
+
+        setImportPreviewData(result.items);
         setShowSmartImport(true);
         setShowImportModal(false);
       } catch (error) {
         console.error('解析导入文件失败:', error);
-        alert('解析文件失败：' + error.message);
+        notify('解析文件失败：' + error.message);
       }
     };
     
     reader.onerror = () => {
-      alert('文件读取失败');
+      notify('文件读取失败');
     };
     
     reader.readAsText(importFile);
   };
 
   // 确认智能导入
-  const handleConfirmImport = (selectedData) => {
+  const handleConfirmImport = async (selectedData) => {
     try {
-      let addedCount = 0;
-      let updatedCount = 0;
-      let errorCount = 0;
-      let errorDetails = [];
-      
-      selectedData.forEach(item => {
-        if (item.error) {
-          errorCount++;
-          // 收集前5个错误详情
-          if (errorDetails.length < 5) {
-            errorDetails.push(`${item.data.name || item.data.student_code}: ${item.error}`);
-          }
+      const importResult = { items: selectedData };
+      const addedCount = selectedData.filter(item => item.type === 'new').length;
+      const updatedCount = selectedData.filter(item => item.type === 'update').length;
+
+      if (addedCount === 0 && updatedCount === 0) {
+        notify('没有选择需要写入的学生变更');
+        return;
+      }
+
+      if (hasBackendSession()) {
+        setStudentImporting(true);
+        const csv = studentImportItemsToCsv({ items: selectedData, classes });
+        const backendResult = await uploadStudentImportFile({
+          file: new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8;' }),
+          filename: 'students_selected_import.csv',
+        });
+        if (backendResult?.success === false) {
+          notify(backendResult.message || '后端导入失败', 'warning');
           return;
         }
-        
-        if (item.type === 'new') {
-          // 创建新学生
-          const newStudent = {
-            id: Date.now() + Math.random(),
-            student_code: item.data.student_code,
-            name: item.data.name,
-            gender: item.data.gender,
-            class_id: item.data.class_id,
-            status: item.data.status,
-            enrollment_year: item.data.enrollment_year
-          };
-          schoolData.students.push(newStudent);
-          addedCount++;
-        } else if (item.type === 'update') {
-          // 更新现有学生
-          const existing = item.existingData;
-          existing.name = item.data.name;
-          existing.gender = item.data.gender;
-          existing.class_id = item.data.class_id;
-          existing.status = item.data.status;
-          existing.enrollment_year = item.data.enrollment_year;
-          updatedCount++;
-        }
+        setStudentImportBackendResult(backendResult);
+        await refreshStudents();
+        setShowSmartImport(false);
+        setImportFile(null);
+        notify(backendResult?.message || `导入完成：新增 ${addedCount} 人，更新 ${updatedCount} 人`, 'success');
+        return;
+      }
+
+      const updatedStudents = commitStudentImport({
+        students,
+        importResult,
       });
-      
-      setStudents([...schoolData.students]);
+
+      setStudents(updatedStudents);
+      schoolData.students = updatedStudents;
       setShowSmartImport(false);
       setImportFile(null);
       
-      let message = `导入完成：新增 ${addedCount} 人，更新 ${updatedCount} 人`;
-      if (errorCount > 0) {
-        message += `，${errorCount} 条数据有误`;
-        message += '\n\n错误详情（前5条）：\n' + errorDetails.join('\n');
-      }
-      alert(message);
+      notify(`导入完成：新增 ${addedCount} 人，更新 ${updatedCount} 人`, 'success');
     } catch (error) {
       console.error('导入失败:', error);
-      alert('导入失败：' + error.message);
+      notify('导入失败：' + error.message, 'error');
+    } finally {
+      setStudentImporting(false);
     }
   };
 
   const getGenderText = (gender) => gender === 1 ? '男' : '女';
 
-  // 根据班级ID计算入学年份
-  // 2025学年第二学期：
-  // 七年级（2025年9月入学）-> 2025级
-  // 八年级（2024年9月入学）-> 2024级
-  // 九年级（2023年9月入学）-> 2023级
-  const getEnrollmentYearByClassId = (classId) => {
-    const grade = Math.floor(classId / 100);
-    // 直接根据年级返回对应的入学年份
-    // 701-713: 2025级, 801-818: 2024级, 901-916: 2023级
-    if (grade === 7) return 2025;
-    if (grade === 8) return 2024;
-    if (grade === 9) return 2023;
-    return 2025;
-  };
-
   // 格式化班级名称
   const formatClassDisplayName = (cls) => {
     if (!cls) return '未分配';
-    const grade = Math.floor(cls.id / 100);
-    const classNo = cls.id % 100;
-    const enrollmentYear = getEnrollmentYearByClassId(cls.id);
-    return `${enrollmentYear}级${classNo.toString().padStart(2, '0')}班`;
+    return schoolData.formatClassName(cls.id);
   };
 
   const getStatusColor = (status) => {
-    switch (status) {
-      case '在读': return 'bg-green-100 text-green-700';
-      case '休学': return 'bg-yellow-100 text-yellow-700';
-      case '转学': return 'bg-blue-100 text-blue-700';
-      case '退学': return 'bg-red-100 text-red-700';
-      default: return 'bg-gray-100 text-gray-700';
-    }
+    return getStudentStatusColor(status);
   };
 
   // 准备导出预览数据
   const prepareExportPreview = () => {
     const hasEarlyAdmissionFilter = !!filterEarlyAdmission;
     const headers = hasEarlyAdmissionFilter
-      ? ['学籍辅号', '姓名', '性别', '班级', '班主任', '状态', '提前招生学校', '录取类型', '录取日期', '入学年份']
-      : ['学籍辅号', '姓名', '性别', '班级', '班主任', '状态', '入学年份'];
+      ? ['学籍辅号', '姓名', '性别', '当前年级', '班级', '班主任', '状态', '学籍状态', '提前招生学校', '录取类型', '录取日期', '入学年份']
+      : ['学籍辅号', '姓名', '性别', '当前年级', '班级', '班主任', '状态', '学籍状态', '入学年份'];
 
     const data = filteredStudents.map(s => {
       const cls = schoolData.getClassById(s.class_id);
@@ -731,9 +711,11 @@ const StudentManagement = () => {
         '学籍辅号': s.student_code,
         '姓名': s.name,
         '性别': s.gender === 1 ? '男' : '女',
+        '当前年级': getStudentGradeLabel(s, classes),
         '班级': cls ? schoolData.formatClassName(cls.id) : '未分配',
         '班主任': headTeacher ? headTeacher.name : '未设置',
-        '状态': s.status,
+        '状态': getStudentStatusDisplay(s),
+        '学籍状态': getRegistryStatusFromStudent(s),
         '入学年份': s.enrollment_year
       };
 
@@ -752,7 +734,7 @@ const StudentManagement = () => {
 
   // 确认导出
   const confirmExport = () => {
-    const { headers, data } = exportPreviewData;
+    const { data } = exportPreviewData;
     const headerRow = Object.keys(data[0] || {});
     const rows = data.map(row => headerRow.map(key => row[key]));
 
@@ -845,13 +827,13 @@ const StudentManagement = () => {
 
   const confirmEarlyAdmissionImport = () => {
     if (!earlyAdmissionImportPreview.preview || earlyAdmissionImportPreview.preview.length === 0) {
-      alert('没有可导入的数据');
+      notify('没有可导入的数据');
       return;
     }
 
     const validRecords = earlyAdmissionImportPreview.preview.filter(r => r.valid);
     if (validRecords.length === 0) {
-      alert('没有有效的数据可导入');
+      notify('没有有效的数据可导入');
       return;
     }
 
@@ -893,7 +875,7 @@ const StudentManagement = () => {
       }
     });
 
-    alert(`导入完成！新增 ${successCount} 条记录，更新 ${updateCount} 条记录`);
+    notify(`导入完成！新增 ${successCount} 条记录，更新 ${updateCount} 条记录`);
     setShowEarlyAdmissionImportModal(false);
     setEarlyAdmissionImportFile(null);
     setEarlyAdmissionImportPreview([]);
@@ -916,22 +898,32 @@ const StudentManagement = () => {
     }
   };
 
-  const handleBatchDelete = () => {
+  const handleBatchDelete = async () => {
     if (selectedIds.length === 0) {
-      alert('请先选择要删除的学生');
+      notify('请先选择要删除的学生');
       return;
     }
-    if (window.confirm(`确定要删除选中的 ${selectedIds.length} 名学生吗？`)) {
-      try {
-        const updatedStudents = students.filter(s => !selectedIds.includes(s.id));
-        setStudents(updatedStudents);
-        schoolData.students = updatedStudents;
-        setSelectedIds([]);
-        alert('批量删除成功！');
-      } catch (error) {
-        console.error('批量删除失败:', error);
-        alert('批量删除失败：' + error.message);
-      }
+    const confirmed = await confirmAction({
+      title: '批量删除学生',
+      message: `确定要删除选中的 ${selectedIds.length} 名学生吗？`,
+      confirmText: '批量删除'
+    });
+    if (!confirmed) return;
+
+    if (hasBackendSession()) {
+      notify('后端学生库不支持批量物理删除；请批量维护学生状态，避免丢失历史成绩。', 'warning');
+      return;
+    }
+
+    try {
+      const updatedStudents = students.filter(s => !selectedIds.includes(s.id));
+      setStudents(updatedStudents);
+      schoolData.students = updatedStudents;
+      setSelectedIds([]);
+      notify('批量删除成功！');
+    } catch (error) {
+      console.error('批量删除失败:', error);
+      notify('批量删除失败：' + error.message);
     }
   };
 
@@ -976,6 +968,10 @@ const StudentManagement = () => {
     return matchSearch && matchGrade && matchClass && matchStatus && matchEarlyAdmission;
   });
 
+  const registryStats = React.useMemo(() => (
+    buildStudentRegistryStats(students, classes)
+  ), [students, classes]);
+
   // 表单输入处理
   const handleInputChange = (field, value) => {
     setFormData(prev => ({ ...prev, [field]: value }));
@@ -989,8 +985,46 @@ const StudentManagement = () => {
     <div className="min-h-screen bg-gray-50 p-6">
       {/* 页面标题 */}
       <div className="mb-6">
-        <h1 className="text-2xl font-bold text-gray-800">学生管理</h1>
-        <p className="text-gray-500 mt-1">管理学生学籍信息，支持批量导入导出</p>
+        <h1 className="text-2xl font-bold text-gray-800">学生学籍管理</h1>
+        <p className="text-gray-500 mt-1">统一维护学生建档、分班、在籍状态、学籍异动和家校关联信息</p>
+      </div>
+
+      {(studentListLoading || studentListError || studentSyncSource === 'backend') && (
+        <div className={`mb-4 flex items-center gap-2 rounded-lg border p-3 text-sm ${
+          studentListError
+            ? 'border-amber-100 bg-amber-50 text-amber-700'
+            : 'border-emerald-100 bg-emerald-50 text-emerald-700'
+        }`}>
+          {studentListError ? <X className="h-4 w-4" /> : <UserCheck className="h-4 w-4" />}
+          <span>
+            {studentListLoading
+              ? '正在同步后端学生库...'
+              : studentListError || '已连接后端学生库，学生名单来自数据库。'}
+          </span>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 gap-3 mb-6 md:grid-cols-4">
+        <div className="bg-white rounded-lg shadow-sm p-4">
+          <p className="text-xs text-gray-500">在籍比例</p>
+          <p className="mt-1 text-2xl font-bold text-emerald-600">{registryStats.activeRate.toFixed(1)}%</p>
+          <p className="mt-1 text-xs text-gray-500">在籍/在读/借读/请长假 {registryStats.activeCount} 人</p>
+        </div>
+        <div className="bg-white rounded-lg shadow-sm p-4">
+          <p className="text-xs text-gray-500">学籍异动</p>
+          <p className="mt-1 text-2xl font-bold text-orange-600">{registryStats.movementCount}</p>
+          <p className="mt-1 text-xs text-gray-500">休学、转学、退学、毕业</p>
+        </div>
+        <div className="bg-white rounded-lg shadow-sm p-4">
+          <p className="text-xs text-gray-500">待核验状态</p>
+          <p className="mt-1 text-2xl font-bold text-purple-600">{registryStats.anomalyCount}</p>
+          <p className="mt-1 text-xs text-gray-500">来自导入源的非标准状态</p>
+        </div>
+        <div className="bg-white rounded-lg shadow-sm p-4">
+          <p className="text-xs text-gray-500">未匹配班级</p>
+          <p className="mt-1 text-2xl font-bold text-slate-600">{registryStats.unassignedCount}</p>
+          <p className="mt-1 text-xs text-gray-500">需补充分班或班级档案</p>
+        </div>
       </div>
 
       {/* 统计卡片 - 根据筛选条件动态计算 */}
@@ -1013,20 +1047,14 @@ const StudentManagement = () => {
             : uniqueClasses.length;
         
         // 动态获取所有实际存在的状态（从当前筛选后的学生中）
-        const actualStatuses = [...new Set(targetStudents.map(s => s.status).filter(Boolean))].sort();
+        const actualStatuses = [...new Set(targetStudents.map(s => s.status).filter(Boolean))]
+          .sort((a, b) => {
+            const indexA = STUDENT_STATUS_OPTIONS.indexOf(a);
+            const indexB = STUDENT_STATUS_OPTIONS.indexOf(b);
+            return (indexA === -1 ? 99 : indexA) - (indexB === -1 ? 99 : indexB);
+          });
         
         // 状态颜色映射（预定义一些常用状态的颜色，未知状态使用默认灰色）
-        const statusColors = {
-          '在籍': { bg: 'bg-green-100', text: 'text-green-600', num: 'text-green-600' },
-          '在读': { bg: 'bg-green-100', text: 'text-green-600', num: 'text-green-600' },
-          '林川': { bg: 'bg-blue-100', text: 'text-blue-600', num: 'text-blue-600' },
-          '借读': { bg: 'bg-yellow-100', text: 'text-yellow-600', num: 'text-yellow-600' },
-          '休学': { bg: 'bg-orange-100', text: 'text-orange-600', num: 'text-orange-600' },
-          '退学': { bg: 'bg-red-100', text: 'text-red-600', num: 'text-red-600' },
-          '请长假': { bg: 'bg-purple-100', text: 'text-purple-600', num: 'text-purple-600' },
-          '转学': { bg: 'bg-gray-100', text: 'text-gray-600', num: 'text-gray-600' },
-        };
-        
         return (
           <div className="space-y-3 mb-6">
             {/* 第一行：基础统计 */}
@@ -1088,16 +1116,16 @@ const StudentManagement = () => {
             <div className={`grid gap-3 ${actualStatuses.length <= 6 ? 'grid-cols-6' : actualStatuses.length <= 8 ? 'grid-cols-4' : 'grid-cols-6'}`}>
               {actualStatuses.map(status => {
                 const count = targetStudents.filter(s => s.status === status).length;
-                const color = statusColors[status] || { bg: 'bg-gray-100', text: 'text-gray-600', num: 'text-gray-600' };
+                const [bgClass, textClass] = getStudentStatusColor(status).split(' ');
                 return (
                   <div key={status} className="bg-white rounded-lg shadow-sm p-3">
                     <div className="flex items-center">
-                      <div className={`p-2 rounded-full ${color.bg} ${color.text} mr-3`}>
+                      <div className={`p-2 rounded-full ${bgClass} ${textClass} mr-3`}>
                         <UserCheck className="h-5 w-5" />
                       </div>
                       <div>
                         <p className="text-xs text-gray-500">{status}</p>
-                        <p className={`text-xl font-bold ${color.num}`}>{count}</p>
+                        <p className={`text-xl font-bold ${textClass}`}>{count}</p>
                       </div>
                     </div>
                   </div>
@@ -1255,9 +1283,11 @@ const StudentManagement = () => {
               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">学籍辅号</th>
               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">姓名</th>
               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">性别</th>
+              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">当前年级</th>
               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">班级</th>
               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">班主任</th>
               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">状态</th>
+              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">学籍状态</th>
               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">提前招生</th>
               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">入学年份</th>
               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">操作</th>
@@ -1285,13 +1315,15 @@ const StudentManagement = () => {
                   <td className="px-6 py-4 text-sm font-medium text-blue-600">{student.student_code}</td>
                   <td className="px-6 py-4 text-sm text-gray-900">{student.name}</td>
                   <td className="px-6 py-4 text-sm text-gray-500">{getGenderText(student.gender)}</td>
+                  <td className="px-6 py-4 text-sm text-gray-500">{getStudentGradeLabel(student, classes)}</td>
                   <td className="px-6 py-4 text-sm text-gray-500">{classInfo.name}</td>
                   <td className="px-6 py-4 text-sm text-gray-500">{headTeacher}</td>
                   <td className="px-6 py-4">
                     <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${getStatusColor(student.status)}`}>
-                      {student.status}
+                      {getStudentStatusDisplay(student)}
                     </span>
                   </td>
+                  <td className="px-6 py-4 text-sm text-gray-500">{getRegistryStatusFromStudent(student)}</td>
                   <td className="px-6 py-4">
                     {admission ? (
                       <div className="flex flex-col">
@@ -1438,16 +1470,84 @@ const StudentManagement = () => {
                   <label className="block text-sm font-medium text-gray-700 mb-1">状态</label>
                   <select
                     value={formData.status}
-                    onChange={(e) => handleInputChange('status', e.target.value)}
+                    onChange={(e) => {
+                      const nextStatus = e.target.value;
+                      setFormData(prev => ({
+                        ...prev,
+                        status: nextStatus,
+                        registry_status: getRegistryStatusFromStudent({ status: nextStatus }),
+                      }));
+                    }}
                     className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
                   >
-                    <option value="在籍">在籍</option>
-                    <option value="林川">林川</option>
-                    <option value="借读">借读</option>
-                    <option value="休学">休学</option>
-                    <option value="退学">退学</option>
-                    <option value="请长假">请长假</option>
+                    {STUDENT_STATUS_OPTIONS.map(status => (
+                      <option key={status} value={status}>{status}</option>
+                    ))}
                   </select>
+                </div>
+              </div>
+
+              <div className="border-t pt-4 mt-4">
+                <h3 className="text-sm font-medium text-gray-700 mb-3 flex items-center gap-2">
+                  <FileText className="w-4 h-4 text-blue-600" />
+                  学籍状态
+                </h3>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">学籍状态</label>
+                    <select
+                      value={formData.registry_status}
+                      onChange={(e) => handleInputChange('registry_status', e.target.value)}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
+                    >
+                      {REGISTRY_STATUS_OPTIONS.map(status => (
+                        <option key={status} value={status}>{status}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">入学方式</label>
+                    <select
+                      value={formData.enrollment_type}
+                      onChange={(e) => handleInputChange('enrollment_type', e.target.value)}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
+                    >
+                      {['正常入学', '转入', '借读', '复学', '其他'].map(type => (
+                        <option key={type} value={type}>{type}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-4 mt-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">来源学校</label>
+                    <input
+                      type="text"
+                      value={formData.source_school}
+                      onChange={(e) => handleInputChange('source_school', e.target.value)}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
+                      placeholder="转入或借读学生可填写"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">异动日期</label>
+                    <input
+                      type="date"
+                      value={formData.status_changed_at}
+                      onChange={(e) => handleInputChange('status_changed_at', e.target.value)}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
+                    />
+                  </div>
+                </div>
+                <div className="mt-4">
+                  <label className="block text-sm font-medium text-gray-700 mb-1">异动原因</label>
+                  <input
+                    type="text"
+                    value={formData.status_reason}
+                    onChange={(e) => handleInputChange('status_reason', e.target.value)}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
+                    placeholder="如休学、转学、借读原因，可留空"
+                  />
                 </div>
               </div>
 
@@ -1578,10 +1678,15 @@ const StudentManagement = () => {
               <div className="bg-blue-50 p-4 rounded-lg">
                 <h3 className="font-medium text-blue-900 mb-2">导入说明</h3>
                 <ul className="text-sm text-blue-700 space-y-1">
-                  <li>• 支持CSV格式文件</li>
-                  <li>• 请使用模板格式导入</li>
+                  <li>• 支持 CSV/TSV 预览导入，Excel 文件登录后直接写入后端学生库</li>
+                  <li>• 请使用模板格式导入，系统会识别班级编号、状态和入学年份</li>
                 </ul>
               </div>
+              {studentImportBackendResult && (
+                <div className="rounded-lg border border-emerald-100 bg-emerald-50 p-3 text-sm text-emerald-800">
+                  {studentImportBackendResult.message || '后端学生库导入完成。'}
+                </div>
+              )}
               <div
                 className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center cursor-pointer hover:border-blue-400 hover:bg-blue-50 transition-colors"
                 onClick={() => fileInputRef.current?.click()}
@@ -1593,7 +1698,7 @@ const StudentManagement = () => {
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept=".csv"
+                  accept=".csv,.tsv,.txt,.xls,.xlsx"
                   className="hidden"
                   onClick={(e) => { e.target.value = null; }}
                   onChange={(e) => {
@@ -1621,10 +1726,10 @@ const StudentManagement = () => {
                   </button>
                   <button
                     onClick={handleImportPreview}
-                    disabled={!importFile}
-                    className={`px-4 py-2 rounded-lg ${importFile ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-gray-300 text-gray-500 cursor-not-allowed'}`}
+                    disabled={studentImporting}
+                    className="px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-gray-300"
                   >
-                    预览导入
+                    {studentImporting ? '写入中...' : (importFile && isExcelFile(importFile) ? '写入后端' : '预览导入')}
                   </button>
                 </div>
               </div>
@@ -1643,8 +1748,16 @@ const StudentManagement = () => {
         columns={[
           { key: 'student_code', label: '学籍辅号' },
           { key: 'name', label: '姓名' },
-          { key: 'gender', label: '性别' },
-          { key: 'status', label: '状态' }
+          { key: 'gender', label: '性别', render: value => getGenderText(value) },
+          {
+            key: 'class_id',
+            label: '班级',
+            render: value => {
+              const cls = classes.find(item => Number(item.id) === Number(value));
+              return cls ? schoolData.formatClassName(cls.id) : '未匹配';
+            }
+          },
+          { key: 'status', label: '状态', render: (_value, row) => getStudentStatusDisplay(row?.data || row) }
         ]}
       />
 
@@ -1668,6 +1781,11 @@ const StudentManagement = () => {
               const headTeacher = getStudentHeadTeacher(student);
               const parents = getStudentParents(student.id);
               const scores = getStudentScores(student.id);
+              const registryTimeline = buildStudentRegistryTimeline(
+                student,
+                classes,
+                schoolData.formatClassName.bind(schoolData)
+              );
               
               return (
                 <div className="space-y-6">
@@ -1693,8 +1811,12 @@ const StudentManagement = () => {
                       <div>
                         <p className="text-sm text-gray-500">状态</p>
                         <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${getStatusColor(student.status)}`}>
-                          {student.status}
+                          {getStudentStatusDisplay(student)}
                         </span>
+                      </div>
+                      <div>
+                        <p className="text-sm text-gray-500">当前年级</p>
+                        <p className="font-medium text-gray-900">{getStudentGradeLabel(student, classes)}</p>
                       </div>
                       <div>
                         <p className="text-sm text-gray-500">班级</p>
@@ -1708,6 +1830,47 @@ const StudentManagement = () => {
                         <p className="text-sm text-gray-500">入学年份</p>
                         <p className="font-medium text-gray-900">{student.enrollment_year}</p>
                       </div>
+                      <div>
+                        <p className="text-sm text-gray-500">学籍状态</p>
+                        <p className="font-medium text-gray-900">{getRegistryStatusFromStudent(student)}</p>
+                      </div>
+                      <div>
+                        <p className="text-sm text-gray-500">入学方式</p>
+                        <p className="font-medium text-gray-900">{student.enrollment_type || '正常入学'}</p>
+                      </div>
+                      <div>
+                        <p className="text-sm text-gray-500">来源学校</p>
+                        <p className="font-medium text-gray-900">{student.source_school || '-'}</p>
+                      </div>
+                      <div>
+                        <p className="text-sm text-gray-500">异动日期</p>
+                        <p className="font-medium text-gray-900">{student.status_changed_at || '-'}</p>
+                      </div>
+                      <div>
+                        <p className="text-sm text-gray-500">异动原因</p>
+                        <p className="font-medium text-gray-900">{student.status_reason || '-'}</p>
+                      </div>
+                    </div>
+                    {student.status === '待核验' && student.raw_status && (
+                      <div className="mt-4 rounded-lg border border-purple-100 bg-white p-3 text-sm text-purple-700">
+                        导入源状态为“{student.raw_status}”，当前已进入待核验，请在学籍状态中确认后保存。
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="bg-white border border-gray-100 rounded-lg p-4">
+                    <h3 className="text-lg font-semibold text-gray-800 mb-4 flex items-center gap-2">
+                      <FileText className="w-5 h-5 text-blue-600" />
+                      学籍轨迹
+                    </h3>
+                    <div className="grid gap-3 md:grid-cols-3">
+                      {registryTimeline.map((item) => (
+                        <div key={item.label} className="rounded-lg border border-gray-100 p-3">
+                          <p className="text-xs text-gray-500">{item.date || '-'}</p>
+                          <p className="mt-1 font-medium text-gray-900">{item.label}</p>
+                          <p className="mt-1 text-sm text-gray-600">{item.detail}</p>
+                        </div>
+                      ))}
                     </div>
                   </div>
 
@@ -1759,14 +1922,18 @@ const StudentManagement = () => {
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-gray-200">
-                            {scores.slice(0, 10).map((score, index) => (
-                              <tr key={index} className="bg-white">
-                                <td className="px-4 py-2 text-sm text-gray-900">{score.exam_name || '-'}</td>
-                                <td className="px-4 py-2 text-sm text-gray-900">{score.subject_name || '-'}</td>
-                                <td className="px-4 py-2 text-sm font-medium text-gray-900">{score.score}</td>
-                                <td className="px-4 py-2 text-sm text-gray-500">{score.rank || '-'}</td>
-                              </tr>
-                            ))}
+                            {scores.slice(0, 10).map((score, index) => {
+                              const exam = (schoolData.exams || []).find(item => item.id === score.exam_id);
+                              const subjectNames = score.subject_name || (score.scores ? Object.keys(score.scores).join('、') : '总分');
+                              return (
+                                <tr key={index} className="bg-white">
+                                  <td className="px-4 py-2 text-sm text-gray-900">{score.exam_name || exam?.name || score.exam_id || '-'}</td>
+                                  <td className="px-4 py-2 text-sm text-gray-900">{subjectNames}</td>
+                                  <td className="px-4 py-2 text-sm font-medium text-gray-900">{score.score ?? score.total_score ?? '-'}</td>
+                                  <td className="px-4 py-2 text-sm text-gray-500">{score.rank || '-'}</td>
+                                </tr>
+                              );
+                            })}
                           </tbody>
                         </table>
                         {scores.length > 10 && (
@@ -2019,7 +2186,7 @@ const StudentManagement = () => {
             {(() => {
               // 按年级和班级统计
               const gradeStats = {};
-              const statusOrder = ['在籍', '林川', '借读', '休学', '退学', '请长假'];
+              const statusOrder = STUDENT_STATUS_OPTIONS;
               
               uniqueGrades.forEach(grade => {
                 gradeStats[grade] = {

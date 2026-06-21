@@ -1,24 +1,61 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Command } from 'cmdk';
 import { useNavigate } from 'react-router-dom';
-import { LayoutDashboard, Users, BookOpen, Settings, Search, X } from 'lucide-react';
+import { Search, X } from 'lucide-react';
+import { getFlatNavigationForRole, getUserRole } from '../lib/navigation';
+
+const readStoredUser = () => {
+  const userStr = localStorage.getItem('user');
+  if (!userStr) return null;
+
+  try {
+    return JSON.parse(userStr);
+  } catch (error) {
+    return null;
+  }
+};
 
 export function CommandMenu() {
   const [open, setOpen] = useState(false);
+  const [user, setUser] = useState(() => readStoredUser());
   const navigate = useNavigate();
 
-  // Toggle the menu when ⌘K is pressed
   useEffect(() => {
     const down = (e) => {
       if (e.key === 'k' && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
+        setUser(readStoredUser());
         setOpen((open) => !open);
       }
     };
+    const openCommandMenu = () => {
+      setUser(readStoredUser());
+      setOpen(true);
+    };
 
     document.addEventListener('keydown', down);
-    return () => document.removeEventListener('keydown', down);
+    document.addEventListener('ace:open-command-menu', openCommandMenu);
+
+    return () => {
+      document.removeEventListener('keydown', down);
+      document.removeEventListener('ace:open-command-menu', openCommandMenu);
+    };
   }, []);
+
+  const commandGroups = useMemo(() => {
+    const entries = getFlatNavigationForRole(getUserRole(user));
+
+    return entries.reduce((groups, item) => {
+      const groupLabel = item.groupLabel || '常用入口';
+      const existingGroup = groups.find((group) => group.label === groupLabel);
+      if (existingGroup) {
+        existingGroup.items.push(item);
+      } else {
+        groups.push({ label: groupLabel, items: [item] });
+      }
+      return groups;
+    }, []);
+  }, [user]);
 
   const runCommand = (command) => {
     setOpen(false);
@@ -59,57 +96,33 @@ export function CommandMenu() {
               未找到结果。
             </Command.Empty>
 
-            <Command.Group heading="常用" className="px-2 text-xs font-medium text-slate-500 dark:text-slate-400 my-2">
-              <Command.Item
-                onSelect={() => runCommand(() => navigate('/dashboard'))}
-                className="flex items-center gap-2 px-2 py-2 mt-1 rounded-md text-sm cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 hover:text-blue-600 dark:hover:text-blue-400 text-slate-700 dark:text-slate-300"
-              >
-                <LayoutDashboard className="w-4 h-4" />
-                <span>教务大屏</span>
-              </Command.Item>
-              <Command.Item
-                onSelect={() => runCommand(() => navigate('/headteacher'))}
-                className="flex items-center gap-2 px-2 py-2 mt-1 rounded-md text-sm cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 hover:text-blue-600 dark:hover:text-blue-400 text-slate-700 dark:text-slate-300"
-              >
-                <Users className="w-4 h-4" />
-                <span>班主任视图</span>
-              </Command.Item>
-            </Command.Group>
+            {commandGroups.map((group, groupIndex) => (
+              <React.Fragment key={group.label}>
+                {groupIndex > 0 && <Command.Separator className="h-px bg-slate-100 dark:bg-slate-800 mx-2 my-1" />}
+                <Command.Group heading={group.label} className="px-2 text-xs font-medium text-slate-500 dark:text-slate-400 my-2">
+                  {group.items.map((item) => {
+                    const Icon = item.icon;
 
-            <Command.Separator className="h-px bg-slate-100 dark:bg-slate-800 mx-2 my-1" />
-
-            <Command.Group heading="教务管理" className="px-2 text-xs font-medium text-slate-500 dark:text-slate-400 my-2">
-              <Command.Item
-                onSelect={() => runCommand(() => navigate('/educational/classes'))}
-                className="flex items-center gap-2 px-2 py-2 mt-1 rounded-md text-sm cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 hover:text-blue-600 dark:hover:text-blue-400 text-slate-700 dark:text-slate-300"
-              >
-                <span>班级管理</span>
-              </Command.Item>
-              <Command.Item
-                onSelect={() => runCommand(() => navigate('/educational/students'))}
-                className="flex items-center gap-2 px-2 py-2 mt-1 rounded-md text-sm cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 hover:text-blue-600 dark:hover:text-blue-400 text-slate-700 dark:text-slate-300"
-              >
-                <span>学生管理</span>
-              </Command.Item>
-              <Command.Item
-                onSelect={() => runCommand(() => navigate('/educational/teachers'))}
-                className="flex items-center gap-2 px-2 py-2 mt-1 rounded-md text-sm cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 hover:text-blue-600 dark:hover:text-blue-400 text-slate-700 dark:text-slate-300"
-              >
-                <span>教师管理</span>
-              </Command.Item>
-            </Command.Group>
-
-            <Command.Separator className="h-px bg-slate-100 dark:bg-slate-800 mx-2 my-1" />
-
-            <Command.Group heading="系统" className="px-2 text-xs font-medium text-slate-500 dark:text-slate-400 my-2">
-              <Command.Item
-                onSelect={() => runCommand(() => navigate('/settings'))}
-                className="flex items-center gap-2 px-2 py-2 mt-1 rounded-md text-sm cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 hover:text-blue-600 dark:hover:text-blue-400 text-slate-700 dark:text-slate-300"
-              >
-                <Settings className="w-4 h-4" />
-                <span>系统设置</span>
-              </Command.Item>
-            </Command.Group>
+                    return (
+                      <Command.Item
+                        key={item.path}
+                        value={`${item.label} ${item.description || ''} ${group.label}`}
+                        onSelect={() => runCommand(() => navigate(item.path))}
+                        className="flex items-center gap-3 px-2 py-2 mt-1 rounded-md text-sm cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 hover:text-blue-600 dark:hover:text-blue-400 text-slate-700 dark:text-slate-300"
+                      >
+                        <Icon className="w-4 h-4 flex-shrink-0" />
+                        <span className="min-w-0">
+                          <span className="block font-medium text-slate-800 dark:text-slate-100">{item.label}</span>
+                          {item.description && (
+                            <span className="block truncate text-xs text-slate-500 dark:text-slate-400">{item.description}</span>
+                          )}
+                        </span>
+                      </Command.Item>
+                    );
+                  })}
+                </Command.Group>
+              </React.Fragment>
+            ))}
 
           </Command.List>
         </Command>

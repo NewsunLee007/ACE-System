@@ -17,3 +17,5 @@ env/
 *.xlsx
 *.csv
 .trae/
+数据导入/
+.vercel/

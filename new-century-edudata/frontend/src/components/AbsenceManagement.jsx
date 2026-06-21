@@ -3,7 +3,10 @@
  * 支持教务处统一录入和班主任上报两种模式
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useState, useEffect } from 'react';
+import { API_BASE_URL } from '../lib/api';
+import { notify } from '../lib/notify';
+import { useConfirm } from './ui/confirm';
 import {
   AlertCircle,
   CheckCircle,
@@ -11,29 +14,18 @@ import {
   Plus,
   Search,
   Filter,
-  MoreVertical,
-  Calendar,
-  User,
-  BookOpen,
-  FileText,
   Trash2,
   Edit,
-  Eye,
   X,
   Upload,
-  Download,
   ChevronLeft,
   ChevronRight,
-  Users,
-  TrendingUp,
-  BarChart3
+  Users
 } from 'lucide-react';
-
-// API基础URL
-const API_BASE_URL = 'http://localhost:8000/api/v1';
 
 const AbsenceManagement = ({ mode = 'admin', examId = null, className = null }) => {
   // mode: 'admin' - 教务处模式, 'teacher' - 班主任模式
+  const { confirm: confirmAction } = useConfirm();
   
   // 状态管理
   const [absenceRecords, setAbsenceRecords] = useState([]);
@@ -41,7 +33,6 @@ const AbsenceManagement = ({ mode = 'admin', examId = null, className = null }) 
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [showAuditModal, setShowAuditModal] = useState(false);
   const [selectedRecord, setSelectedRecord] = useState(null);
-  const [currentUser, setCurrentUser] = useState(null);
   
   // 筛选条件
   const [filters, setFilters] = useState({
@@ -91,14 +82,8 @@ const AbsenceManagement = ({ mode = 'admin', examId = null, className = null }) 
   const reasonTypes = ['病假', '事假', '旷考', '其他'];
   const statusOptions = ['待审核', '已通过', '已驳回'];
   
-  // 获取当前用户信息
-  useEffect(() => {
-    const user = JSON.parse(localStorage.getItem('user') || '{}');
-    setCurrentUser(user);
-  }, []);
-  
   // 获取缺考记录列表
-  const fetchAbsenceRecords = async () => {
+  const fetchAbsenceRecords = useCallback(async () => {
     setLoading(true);
     try {
       const params = new URLSearchParams({
@@ -123,10 +108,10 @@ const AbsenceManagement = ({ mode = 'admin', examId = null, className = null }) 
     } finally {
       setLoading(false);
     }
-  };
+  }, [filters, pagination.page, pagination.page_size]);
   
   // 获取统计数据
-  const fetchStatistics = async () => {
+  const fetchStatistics = useCallback(async () => {
     if (!filters.exam_id) return;
     
     try {
@@ -148,13 +133,13 @@ const AbsenceManagement = ({ mode = 'admin', examId = null, className = null }) 
     } catch (error) {
       console.error('获取统计数据失败:', error);
     }
-  };
+  }, [filters.exam_id]);
   
   // 初始加载
   useEffect(() => {
     fetchAbsenceRecords();
     fetchStatistics();
-  }, [filters, pagination.page]);
+  }, [fetchAbsenceRecords, fetchStatistics]);
   
   // 创建缺考记录
   const handleCreate = async (e) => {
@@ -172,17 +157,17 @@ const AbsenceManagement = ({ mode = 'admin', examId = null, className = null }) 
       
       const data = await response.json();
       if (data.success) {
-        alert(data.message);
+        notify(data.message);
         setShowCreateModal(false);
         fetchAbsenceRecords();
         fetchStatistics();
         resetForm();
       } else {
-        alert(data.message || '创建失败');
+        notify(data.message || '创建失败');
       }
     } catch (error) {
       console.error('创建缺考记录失败:', error);
-      alert('创建失败，请检查网络连接');
+      notify('创建失败，请检查网络连接');
     }
   };
   
@@ -204,25 +189,28 @@ const AbsenceManagement = ({ mode = 'admin', examId = null, className = null }) 
       
       const data = await response.json();
       if (data.success) {
-        alert(data.message);
+        notify(data.message);
         setShowAuditModal(false);
         setSelectedRecord(null);
         fetchAbsenceRecords();
         fetchStatistics();
       } else {
-        alert(data.message || '审核失败');
+        notify(data.message || '审核失败');
       }
     } catch (error) {
       console.error('审核失败:', error);
-      alert('审核失败，请检查网络连接');
+      notify('审核失败，请检查网络连接');
     }
   };
   
   // 删除缺考记录
   const handleDelete = async (record) => {
-    if (!window.confirm(`确定要删除 ${record.student_name} 的缺考记录吗？`)) {
-      return;
-    }
+    const confirmed = await confirmAction({
+      title: '删除缺考记录',
+      message: `确定要删除 ${record.student_name} 的缺考记录吗？`,
+      confirmText: '删除'
+    });
+    if (!confirmed) return;
     
     try {
       const response = await fetch(`${API_BASE_URL}/absence/${record.id}/delete`, {
@@ -234,15 +222,15 @@ const AbsenceManagement = ({ mode = 'admin', examId = null, className = null }) 
       
       const data = await response.json();
       if (data.success) {
-        alert('删除成功');
+        notify('删除成功');
         fetchAbsenceRecords();
         fetchStatistics();
       } else {
-        alert(data.message || '删除失败');
+        notify(data.message || '删除失败');
       }
     } catch (error) {
       console.error('删除失败:', error);
-      alert('删除失败，请检查网络连接');
+      notify('删除失败，请检查网络连接');
     }
   };
   

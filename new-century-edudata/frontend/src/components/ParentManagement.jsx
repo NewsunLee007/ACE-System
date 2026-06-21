@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useState, useEffect } from 'react';
 import {
   Plus,
   Search,
@@ -13,8 +13,6 @@ import {
   CheckCircle,
   X,
   Eye,
-  MessageSquare,
-  Send,
   Download,
   Upload,
   FileSpreadsheet,
@@ -22,10 +20,34 @@ import {
   CheckSquare
 } from 'lucide-react';
 import schoolData from '../data/schoolData';
+import { notify } from '../lib/notify';
+import {
+  buildParentImport,
+  commitParentImport,
+  parseParentImportText,
+} from '../lib/parentImport';
+import {
+  bindParentStudent,
+  createParentRecord,
+  fetchParentList,
+  unbindParentStudent,
+  updateParentRecord,
+} from '../lib/parentManagementApi';
+import { hasBackendAuthToken } from '../lib/sessionToken';
+import { useConfirm } from './ui/confirm';
+
+const hasBackendSession = hasBackendAuthToken;
+
+const isSensitiveImportHeader = (header) => ['初始密码', '密码', 'password', 'initial_password'].includes(header);
 
 const ParentManagement = () => {
+  const { confirm: confirmAction } = useConfirm();
   const [parents, setParents] = useState([]);
-  const [loading, setLoading] = useState(false);
+  const [parentSyncSource, setParentSyncSource] = useState('local');
+  const [parentListLoading, setParentListLoading] = useState(false);
+  const [parentListError, setParentListError] = useState('');
+  const [parentSaving, setParentSaving] = useState(false);
+  const [parentImporting, setParentImporting] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [filterStatus, setFilterStatus] = useState('all');
   const [showAddModal, setShowAddModal] = useState(false);
@@ -41,6 +63,7 @@ const ParentManagement = () => {
     name: '',
     phone: '',
     email: '',
+    initial_password: '',
     relation: '父亲',
     status: 'active'
   });
@@ -49,16 +72,87 @@ const ParentManagement = () => {
     student_id: '',
     relation: '父亲'
   });
-  const [importFile, setImportFile] = useState(null);
+  const [importText, setImportText] = useState('');
+  const [importFileName, setImportFileName] = useState('');
+  const [importHeaders, setImportHeaders] = useState([]);
+  const [importRows, setImportRows] = useState([]);
+  const [importPreview, setImportPreview] = useState(null);
+  const [importError, setImportError] = useState('');
+  const [importResult, setImportResult] = useState(null);
   const fileInputRef = React.useRef(null);
+  const skipInitialParentSync = React.useRef(true);
+  const localParentCacheRef = React.useRef([]);
+  const backendSessionActive = hasBackendSession();
 
   useEffect(() => {
-    // 从schoolData加载家长数据
-    setParents(schoolData.parents || []);
+    const localParents = schoolData.parents || [];
+    localParentCacheRef.current = localParents;
+    setParents(localParents);
   }, []);
+
+  const refreshParents = useCallback(async () => {
+    if (!hasBackendSession()) {
+      setParentSyncSource('local');
+      return null;
+    }
+
+    setParentListLoading(true);
+    try {
+      const payload = await fetchParentList({ pageSize: 100 });
+      const remoteParents = payload.parents || [];
+      if (remoteParents.length === 0 && localParentCacheRef.current.length > 0) {
+        setParents(localParentCacheRef.current);
+        setParentSyncSource('local');
+        setParentListError('后端家长库暂无家长记录，当前显示本地真实导入数据。');
+        return {
+          ...payload,
+          parents: localParentCacheRef.current,
+          source: 'local-fallback',
+        };
+      }
+
+      setParents(remoteParents);
+      if (remoteParents.length > 0) {
+        localParentCacheRef.current = remoteParents;
+      }
+      setParentSyncSource('backend');
+      setParentListError('');
+      return payload;
+    } catch (error) {
+      setParentSyncSource('local');
+      setParentListError(`后端家长库暂不可用，当前显示本地缓存：${error.message || '连接失败'}`);
+      return null;
+    } finally {
+      setParentListLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshParents();
+  }, [refreshParents]);
+
+  useEffect(() => {
+    if (skipInitialParentSync.current) {
+      skipInitialParentSync.current = false;
+      return;
+    }
+    schoolData.parents = parents;
+    if (parents.length > 0) {
+      localParentCacheRef.current = parents;
+    }
+  }, [parents]);
 
   // 获取家长关联的学生信息（从schoolData查询）
   const getParentChildren = (parent) => {
+    if (Array.isArray(parent.students) && parent.students.length > 0) {
+      return parent.students.map(student => ({
+        id: Number(student.student_id || student.id),
+        name: student.name,
+        student_code: student.student_code,
+        class_id: Number(student.class_id) || student.class_id,
+        class_name: student.class_name || student.class_id || '未分配班级'
+      }));
+    }
     if (!parent.student_ids || parent.student_ids.length === 0) {
       return [];
     }
@@ -90,10 +184,10 @@ const ParentManagement = () => {
 
   // 下载导入模板
   const downloadTemplate = () => {
-    const headers = ['家长姓名', '与学生关系(父亲/母亲/爷爷/奶奶/外公/外婆/其他)', '联系电话', '邮箱(可选)', '学生学籍辅号', '学生姓名', '状态(正常/停用)'];
+    const headers = ['家长姓名', '与学生关系(父亲/母亲/爷爷/奶奶/外公/外婆/其他)', '联系电话', '邮箱(可选)', '初始密码', '学生学籍辅号', '学生姓名', '状态(正常/停用)'];
     const sampleData = [
-      ['张大明', '父亲', '13800138001', '', '20240701001', '张三', '正常'],
-      ['李秀英', '母亲', '13800138002', '', '20240701002', '李四', '正常'],
+      ['张大明', '父亲', '13800138001', '', 'ChangeMe123', '20240701001', '张三', '正常'],
+      ['李秀英', '母亲', '13800138002', '', 'ChangeMe123', '20240701002', '李四', '正常'],
     ];
     
     const csvContent = [headers.join(','), ...sampleData.map(row => row.join(','))].join('\n');
@@ -125,111 +219,131 @@ const ParentManagement = () => {
     link.click();
   };
 
+  const resetImportState = () => {
+    setImportText('');
+    setImportFileName('');
+    setImportHeaders([]);
+    setImportRows([]);
+    setImportPreview(null);
+    setImportError('');
+    setImportResult(null);
+  };
+
+  const previewImport = (text) => {
+    if (!text.trim()) {
+      setImportHeaders([]);
+      setImportRows([]);
+      setImportPreview(null);
+      setImportError('');
+      setImportResult(null);
+      return null;
+    }
+
+    try {
+      const parsed = parseParentImportText(text);
+      const result = buildParentImport({
+        parsedRows: parsed.rows,
+        parents,
+        students: schoolData.students || [],
+      });
+      setImportHeaders(parsed.headers);
+      setImportRows(parsed.rows);
+      setImportPreview(result);
+      setImportResult(null);
+      setImportError(result.items.length === 0 ? (result.errors[0] || '没有可导入的数据') : '');
+      return result;
+    } catch (error) {
+      setImportHeaders([]);
+      setImportRows([]);
+      setImportPreview(null);
+      setImportError(error.message);
+      setImportResult(null);
+      return null;
+    }
+  };
+
+  const handleImportFileChange = (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (readerEvent) => {
+      const text = readerEvent.target?.result || '';
+      setImportFileName(file.name);
+      setImportText(text);
+      previewImport(text);
+    };
+    reader.readAsText(file);
+    event.target.value = '';
+  };
+
   // 处理导入
-  const handleImport = () => {
-    if (!importFile) {
-      alert('请先选择要导入的文件');
+  const handleImport = async () => {
+    const result = importPreview || previewImport(importText);
+    if (!result || result.items.length === 0) {
+      setImportError(result?.errors?.[0] || '没有可导入的数据');
       return;
     }
-    
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const content = e.target.result;
-      const lines = content.split('\n').filter(line => line.trim());
-      
-      if (lines.length < 2) {
-        alert('文件格式错误：缺少表头或数据行');
+
+    if (hasBackendSession()) {
+      const missingPasswordItems = result.items.filter(item => (
+        item.type === 'new' && String(item.data?.initial_password || '').trim().length < 6
+      ));
+      if (missingPasswordItems.length > 0) {
+        setImportError(`有 ${missingPasswordItems.length} 位新增家长缺少至少 6 位初始密码。`);
         return;
       }
-      
-      // 跳过标题行，解析数据
-      const newParents = [];
-      const errors = [];
-      
-      for (let i = 1; i < lines.length; i++) {
-        const cols = lines[i].split(',');
-        if (cols.length >= 3) {
-          const name = cols[0]?.trim();
-          const relation = cols[1]?.trim();
-          const phone = cols[2]?.trim();
-          const email = cols[3]?.trim();
-          const studentCode = cols[4]?.trim();
-          const studentName = cols[5]?.trim();
-          const status = cols[6]?.trim();
 
-          // 验证必填字段
-          if (!name) {
-            errors.push(`第${i + 1}行: 家长姓名不能为空`);
-            continue;
-          }
-          if (!phone) {
-            errors.push(`第${i + 1}行: 联系电话不能为空`);
-            continue;
-          }
-
-          // 查找学生ID（通过学籍号）
-          const studentIds = [];
-          if (studentCode) {
-            const student = schoolData.students.find(s => s.student_code === studentCode);
-            if (student) {
-              // 验证学生姓名是否匹配
-              if (studentName && student.name !== studentName) {
-                errors.push(`第${i + 1}行: 学籍号 "${studentCode}" 对应的学生姓名是 "${student.name}"，但您填写的是 "${studentName}"，请核对`);
-                continue;
-              }
-              studentIds.push(student.id);
-            } else {
-              errors.push(`第${i + 1}行: 学籍辅号 "${studentCode}" 不存在，请先导入该学生`);
-              continue;
+      setParentImporting(true);
+      try {
+        for (const item of result.items) {
+          const data = item.data || {};
+          let parentId = item.existingData?.id;
+          if (item.type === 'new') {
+            const created = await createParentRecord(data);
+            if (created?.success === false) {
+              throw new Error(created.message || `${data.name || data.phone} 创建失败`);
             }
-          } else {
-            errors.push(`第${i + 1}行: 学生学籍辅号不能为空`);
-            continue;
+            parentId = created.parent_id;
+          } else if (parentId) {
+            const updated = await updateParentRecord(parentId, data);
+            if (updated?.success === false) {
+              throw new Error(updated.message || `${data.name || data.phone} 更新失败`);
+            }
           }
 
-          newParents.push({
-            id: Date.now() + i,
-            name: name,
-            relation: relation || '父亲',
-            phone: phone,
-            email: email || '',
-            status: status === '停用' ? 'inactive' : 'active',
-            created_at: new Date().toISOString().split('T')[0],
-            student_ids: studentIds
-          });
+          if (parentId) {
+            for (const studentId of data.student_ids || []) {
+              const bound = await bindParentStudent({
+                parentId,
+                studentId,
+                relation: data.relation,
+              });
+              if (bound?.success === false) {
+                throw new Error(bound.message || `${data.name || data.phone} 绑定学生失败`);
+              }
+            }
+          }
         }
+        await refreshParents();
+        setImportResult(result);
+        setImportError(result.errors.length ? `已写入有效家长数据，但有 ${result.errors.length} 行需要检查。` : '');
+        notify(`家长导入完成：新增 ${result.insertedCount} 条，更新 ${result.updatedCount} 条，绑定学生 ${result.boundStudentCount} 人次。`, result.errors.length ? 'warning' : 'success');
+        return;
+      } catch (error) {
+        setImportError(error.message || '后端家长导入失败');
+        notify('家长导入失败：' + (error.message || '请稍后重试'), 'error');
+        return;
+      } finally {
+        setParentImporting(false);
       }
-      
-      // 显示结果
-      let message = '';
-      if (newParents.length > 0) {
-        const updatedParents = [...parents, ...newParents];
-        setParents(updatedParents);
-        // 同步到schoolData
-        schoolData.parents = updatedParents;
-        message += `成功导入 ${newParents.length} 条家长数据\n`;
-      }
-      
-      if (errors.length > 0) {
-        message += `\n错误信息（前5条）：\n${errors.slice(0, 5).join('\n')}`;
-        if (errors.length > 5) {
-          message += `\n...还有 ${errors.length - 5} 条错误`;
-        }
-      }
-      
-      if (newParents.length === 0 && errors.length === 0) {
-        message = '未能解析到有效数据，请检查文件格式';
-      }
-      
-      alert(message);
-      
-      if (newParents.length > 0) {
-        setShowImportModal(false);
-        setImportFile(null);
-      }
-    };
-    
-    reader.readAsText(importFile);
+    }
+
+    const updatedParents = commitParentImport({ parents, importResult: result });
+    setParents(updatedParents);
+    setImportResult(result);
+    setImportError(result.errors.length ? `已写入有效家长数据，但有 ${result.errors.length} 行需要检查。` : '');
+    notify(`家长导入完成：新增 ${result.insertedCount} 条，更新 ${result.updatedCount} 条，绑定学生 ${result.boundStudentCount} 人次。`, result.errors.length ? 'warning' : 'success');
   };
 
   const handleAddParent = () => {
@@ -237,6 +351,7 @@ const ParentManagement = () => {
       name: '',
       phone: '',
       email: '',
+      initial_password: '',
       relation: '父亲',
       status: 'active'
     });
@@ -249,6 +364,7 @@ const ParentManagement = () => {
       name: parent.name,
       phone: parent.phone,
       email: parent.email,
+      initial_password: '',
       relation: parent.relation,
       status: parent.status
     });
@@ -269,42 +385,107 @@ const ParentManagement = () => {
     setShowBindModal(true);
   };
 
-  const handleSaveAdd = (e) => {
+  const handleSaveAdd = async (e) => {
     e.preventDefault();
+    if (hasBackendSession()) {
+      if (formData.initial_password.trim().length < 6) {
+        notify('后端创建家长账号时，初始密码至少需要 6 位。', 'warning');
+        return;
+      }
+      setParentSaving(true);
+      try {
+        const result = await createParentRecord(formData);
+        if (result?.success === false) {
+          notify(result.message || '家长账号创建失败', 'warning');
+          return;
+        }
+        await refreshParents();
+        setShowAddModal(false);
+        notify(result?.message || '家长账号创建成功！', 'success');
+      } catch (error) {
+        notify('家长账号创建失败：' + (error.message || '请稍后重试'), 'error');
+      } finally {
+        setParentSaving(false);
+      }
+      return;
+    }
+
+    const localParentData = { ...formData };
+    delete localParentData.initial_password;
     const newParent = {
       id: parents.length + 1,
-      ...formData,
+      ...localParentData,
       created_at: new Date().toISOString().split('T')[0],
       student_ids: []
     };
     const updatedParents = [...parents, newParent];
     setParents(updatedParents);
-    // 同步到schoolData
-    schoolData.parents = updatedParents;
     setShowAddModal(false);
-    alert('家长添加成功！');
+    notify('家长添加成功！');
   };
 
-  const handleSaveEdit = (e) => {
+  const handleSaveEdit = async (e) => {
     e.preventDefault();
     if (selectedParent) {
+      if (hasBackendSession()) {
+        setParentSaving(true);
+        try {
+          const result = await updateParentRecord(selectedParent.id, formData);
+          if (result?.success === false) {
+            notify(result.message || '家长信息更新失败', 'warning');
+            return;
+          }
+          await refreshParents();
+          setShowEditModal(false);
+          notify(result?.message || '家长信息更新成功！', 'success');
+        } catch (error) {
+          notify('家长信息更新失败：' + (error.message || '请稍后重试'), 'error');
+        } finally {
+          setParentSaving(false);
+        }
+        return;
+      }
+
+      const localParentData = { ...formData };
+      delete localParentData.initial_password;
       const updatedParents = parents.map(p =>
         p.id === selectedParent.id
-          ? { ...p, ...formData }
+          ? { ...p, ...localParentData }
           : p
       );
       setParents(updatedParents);
-      // 同步到schoolData
-      schoolData.parents = updatedParents;
       setShowEditModal(false);
-      alert('家长信息更新成功！');
+      notify('家长信息更新成功！');
     }
   };
 
-  const handleSaveBind = (e) => {
+  const handleSaveBind = async (e) => {
     e.preventDefault();
     if (selectedParent && bindForm.student_id) {
       const studentId = parseInt(bindForm.student_id);
+      if (hasBackendSession()) {
+        setParentSaving(true);
+        try {
+          const result = await bindParentStudent({
+            parentId: selectedParent.id,
+            studentId,
+            relation: bindForm.relation,
+          });
+          if (result?.success === false) {
+            notify(result.message || '学生绑定失败', 'warning');
+            return;
+          }
+          await refreshParents();
+          setShowBindModal(false);
+          notify(result?.message || '学生绑定成功！', 'success');
+        } catch (error) {
+          notify('学生绑定失败：' + (error.message || '请稍后重试'), 'error');
+        } finally {
+          setParentSaving(false);
+        }
+        return;
+      }
+
       const student = schoolData.getStudentById(studentId);
       if (student) {
         const currentStudentIds = selectedParent.student_ids || [];
@@ -315,24 +496,44 @@ const ParentManagement = () => {
               : p
           );
           setParents(updatedParents);
-          // 同步到schoolData
-          schoolData.parents = updatedParents;
           setShowBindModal(false);
-          alert('学生绑定成功！');
+          notify('学生绑定成功！');
         } else {
-          alert('该学生已绑定');
+          notify('该学生已绑定');
         }
       }
     }
   };
 
-  const handleDeleteParent = (id) => {
-    if (window.confirm('确定要删除这位家长吗？')) {
-      const updatedParents = parents.filter(p => p.id !== id);
-      setParents(updatedParents);
-      // 同步到schoolData
-      schoolData.parents = updatedParents;
+  const handleDeleteParent = async (id) => {
+    const confirmed = await confirmAction({
+      title: hasBackendSession() ? '停用家长账号' : '删除家长',
+      message: hasBackendSession()
+        ? '确定要停用这位家长账号吗？学生绑定关系会保留。'
+        : '确定要删除这位家长吗？',
+      confirmText: hasBackendSession() ? '停用账号' : '删除'
+    });
+    if (!confirmed) return;
+
+    if (hasBackendSession()) {
+      const parent = parents.find(p => p.id === id);
+      if (!parent) return;
+      try {
+        const result = await updateParentRecord(id, { ...parent, status: 'inactive' });
+        if (result?.success === false) {
+          notify(result.message || '家长账号停用失败', 'warning');
+          return;
+        }
+        await refreshParents();
+        notify(result?.message || '家长账号已停用', 'success');
+      } catch (error) {
+        notify('家长账号停用失败：' + (error.message || '请稍后重试'), 'error');
+      }
+      return;
     }
+
+    const updatedParents = parents.filter(p => p.id !== id);
+    setParents(updatedParents);
   };
 
   // 批量选择相关函数
@@ -352,32 +553,70 @@ const ParentManagement = () => {
     }
   };
 
-  const handleBatchDelete = () => {
+  const handleBatchDelete = async () => {
     if (selectedIds.length === 0) {
-      alert('请先选择要删除的家长');
+      notify('请先选择要删除的家长');
       return;
     }
-    if (window.confirm(`确定要删除选中的 ${selectedIds.length} 位家长吗？`)) {
-      const updatedParents = parents.filter(p => !selectedIds.includes(p.id));
-      setParents(updatedParents);
-      // 同步到schoolData
-      schoolData.parents = updatedParents;
-      setSelectedIds([]);
-      alert('批量删除成功！');
+    const confirmed = await confirmAction({
+      title: hasBackendSession() ? '批量停用家长账号' : '批量删除家长',
+      message: hasBackendSession()
+        ? `确定要停用选中的 ${selectedIds.length} 位家长账号吗？学生绑定关系会保留。`
+        : `确定要删除选中的 ${selectedIds.length} 位家长吗？`,
+      confirmText: hasBackendSession() ? '批量停用' : '批量删除'
+    });
+    if (!confirmed) return;
+
+    if (hasBackendSession()) {
+      try {
+        const targets = parents.filter(parent => selectedIds.includes(parent.id));
+        for (const parent of targets) {
+          await updateParentRecord(parent.id, { ...parent, status: 'inactive' });
+        }
+        await refreshParents();
+        setSelectedIds([]);
+        notify(`已停用 ${targets.length} 位家长账号。`, 'success');
+      } catch (error) {
+        notify('批量停用失败：' + (error.message || '请稍后重试'), 'error');
+      }
+      return;
     }
+
+    const updatedParents = parents.filter(p => !selectedIds.includes(p.id));
+    setParents(updatedParents);
+    setSelectedIds([]);
+    notify('批量删除成功！');
   };
 
-  const handleUnbindStudent = (parentId, studentId) => {
-    if (window.confirm('确定要解除与该学生的绑定关系吗？')) {
-      const updatedParents = parents.map(p =>
-        p.id === parentId
-          ? { ...p, student_ids: (p.student_ids || []).filter(id => id !== studentId) }
-          : p
-      );
-      setParents(updatedParents);
-      // 同步到schoolData
-      schoolData.parents = updatedParents;
+  const handleUnbindStudent = async (parentId, studentId) => {
+    const confirmed = await confirmAction({
+      title: '解除学生绑定',
+      message: '确定要解除与该学生的绑定关系吗？',
+      confirmText: '解除绑定'
+    });
+    if (!confirmed) return;
+
+    if (hasBackendSession()) {
+      try {
+        const result = await unbindParentStudent({ parentId, studentId });
+        if (result?.success === false) {
+          notify(result.message || '解除绑定失败', 'warning');
+          return;
+        }
+        await refreshParents();
+        notify(result?.message || '学生绑定已解除', 'success');
+      } catch (error) {
+        notify('解除绑定失败：' + (error.message || '请稍后重试'), 'error');
+      }
+      return;
     }
+
+    const updatedParents = parents.map(p =>
+      p.id === parentId
+        ? { ...p, student_ids: (p.student_ids || []).filter(id => id !== studentId) }
+        : p
+    );
+    setParents(updatedParents);
   };
 
   const getStatusBadge = (status) => {
@@ -397,8 +636,9 @@ const ParentManagement = () => {
   };
 
   const filteredParents = parents.filter(parent => {
-    const matchSearch = parent.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                       parent.phone.includes(searchTerm);
+    const keyword = searchTerm.toLowerCase();
+    const matchSearch = String(parent.name || '').toLowerCase().includes(keyword) ||
+                       String(parent.phone || '').includes(searchTerm);
     const matchStatus = filterStatus === 'all' || parent.status === filterStatus;
     return matchSearch && matchStatus;
   });
@@ -417,6 +657,21 @@ const ParentManagement = () => {
         <h1 className="text-2xl font-bold text-gray-800">家长管理</h1>
         <p className="text-gray-500 mt-1">管理家长信息、学生绑定关系（通过学生关联班级）</p>
       </div>
+
+      {(parentListLoading || parentListError || parentSyncSource === 'backend') && (
+        <div className={`mb-4 flex items-center gap-2 rounded-lg border p-3 text-sm ${
+          parentListError
+            ? 'border-amber-100 bg-amber-50 text-amber-700'
+            : 'border-emerald-100 bg-emerald-50 text-emerald-700'
+        }`}>
+          {parentListError ? <X className="h-4 w-4" /> : <CheckCircle className="h-4 w-4" />}
+          <span>
+            {parentListLoading
+              ? '正在同步后端家长库...'
+              : parentListError || '已连接后端家长库，家长账号和学生绑定来自数据库。'}
+          </span>
+        </div>
+      )}
 
       {/* 统计卡片 */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
@@ -502,11 +757,14 @@ const ParentManagement = () => {
                 className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700"
               >
                 <Trash2 className="w-4 h-4" />
-                批量删除 ({selectedIds.length})
+                {backendSessionActive ? '批量停用' : '批量删除'} ({selectedIds.length})
               </button>
             )}
             <button 
-              onClick={() => setShowImportModal(true)}
+              onClick={() => {
+                resetImportState();
+                setShowImportModal(true);
+              }}
               className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50"
             >
               <Upload className="w-4 h-4" />
@@ -717,6 +975,18 @@ const ParentManagement = () => {
                   className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
                 />
               </div>
+              {backendSessionActive && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">初始密码 *</label>
+                  <input
+                    type="password"
+                    value={formData.initial_password}
+                    onChange={(e) => setFormData({...formData, initial_password: e.target.value})}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">用于创建家长登录账号，至少 6 位。</p>
+                </div>
+              )}
               <div className="flex justify-end gap-3 mt-6">
                 <button
                   type="button"
@@ -727,9 +997,14 @@ const ParentManagement = () => {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                  disabled={parentSaving}
+                  className={`px-4 py-2 rounded-lg ${
+                    parentSaving
+                      ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                      : 'bg-blue-600 text-white hover:bg-blue-700'
+                  }`}
                 >
-                  保存
+                  {parentSaving ? '保存中...' : '保存'}
                 </button>
               </div>
             </form>
@@ -815,9 +1090,14 @@ const ParentManagement = () => {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                  disabled={parentSaving}
+                  className={`px-4 py-2 rounded-lg ${
+                    parentSaving
+                      ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                      : 'bg-blue-600 text-white hover:bg-blue-700'
+                  }`}
                 >
-                  保存
+                  {parentSaving ? '保存中...' : '保存'}
                 </button>
               </div>
             </form>
@@ -877,9 +1157,14 @@ const ParentManagement = () => {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700"
+                  disabled={parentSaving}
+                  className={`px-4 py-2 rounded-lg ${
+                    parentSaving
+                      ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                      : 'bg-green-600 text-white hover:bg-green-700'
+                  }`}
                 >
-                  绑定
+                  {parentSaving ? '绑定中...' : '绑定'}
                 </button>
               </div>
             </form>
@@ -975,19 +1260,26 @@ const ParentManagement = () => {
 
       {/* 导入弹窗 */}
       {showImportModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg w-full max-w-md p-6">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-xl font-bold text-gray-800">导入家长数据</h2>
-              <button onClick={() => setShowImportModal(false)}><X className="w-6 h-6 text-gray-400" /></button>
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 overflow-y-auto">
+          <div className="bg-white rounded-lg w-full max-w-5xl m-4 max-h-[92vh] overflow-y-auto p-6">
+            <div className="flex flex-col gap-3 border-b border-gray-200 pb-4 md:flex-row md:items-start md:justify-between">
+              <div>
+                <h2 className="text-xl font-bold text-gray-800">导入家长数据</h2>
+                <p className="mt-1 text-sm text-gray-500">通过学籍辅号绑定学生，确认前会预检新增、更新和异常行。</p>
+              </div>
+              <button onClick={() => setShowImportModal(false)} className="self-end md:self-start">
+                <X className="w-6 h-6 text-gray-400" />
+              </button>
             </div>
-            <div className="space-y-4">
+
+            <div className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-[0.9fr_1.1fr]">
+              <div className="space-y-4">
               <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
                 <div className="flex items-start gap-3">
                   <FileSpreadsheet className="w-5 h-5 text-blue-600 mt-0.5" />
                   <div>
                     <p className="text-sm font-medium text-blue-900">下载导入模板</p>
-                    <p className="text-xs text-blue-700 mt-1">请使用标准模板格式导入家长数据，支持通过学籍号自动关联学生</p>
+                    <p className="text-xs text-blue-700 mt-1">字段包含家长姓名、关系、联系电话、初始密码、学生学籍辅号和状态。</p>
                     <button 
                       onClick={downloadTemplate}
                       className="mt-2 text-xs bg-blue-600 text-white px-3 py-1.5 rounded hover:bg-blue-700 flex items-center gap-1"
@@ -998,33 +1290,128 @@ const ParentManagement = () => {
                   </div>
                 </div>
               </div>
-              <div 
-                className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center cursor-pointer hover:border-blue-400 hover:bg-blue-50 transition-colors"
-                onClick={() => fileInputRef.current?.click()}
-              >
-                <Upload className="w-8 h-8 text-gray-400 mx-auto mb-2" />
-                <p className="text-sm text-gray-600">
-                  {importFile ? importFile.name : '点击或拖拽文件到此处上传'}
-                </p>
-                <p className="text-xs text-gray-400 mt-1">支持 CSV、Excel 格式</p>
-                <input 
-                  ref={fileInputRef}
-                  type="file" 
-                  accept=".csv,.xlsx,.xls" 
-                  className="hidden" 
-                  onChange={(e) => setImportFile(e.target.files[0])}
-                />
-              </div>
-              <div className="flex justify-end gap-3">
-                <button onClick={() => {setShowImportModal(false); setImportFile(null);}} className="px-4 py-2 border border-gray-300 rounded-lg">取消</button>
-                <button 
-                  onClick={handleImport}
-                  disabled={!importFile}
-                  className={`px-4 py-2 rounded-lg ${importFile ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-gray-300 text-gray-500 cursor-not-allowed'}`}
+
+                <button
+                  type="button"
+                  className="w-full border-2 border-dashed border-gray-300 rounded-lg p-8 text-center cursor-pointer hover:border-blue-400 hover:bg-blue-50 transition-colors"
+                  onClick={() => fileInputRef.current?.click()}
                 >
-                  开始导入
+                  <Upload className="w-8 h-8 text-gray-400 mx-auto mb-2" />
+                  <p className="text-sm font-medium text-gray-700">
+                    {importFileName || '选择 CSV/TSV 文件'}
+                  </p>
+                  <p className="text-xs text-gray-400 mt-1">也可以从 Excel 复制后粘贴到右侧</p>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".csv,.tsv,.txt"
+                    className="hidden"
+                    onChange={handleImportFileChange}
+                  />
                 </button>
               </div>
+
+              <div>
+                <label className="mb-2 block text-sm font-medium text-gray-700">粘贴家长绑定表</label>
+                <textarea
+                  value={importText}
+                  onChange={(event) => {
+                    setImportText(event.target.value);
+                    setImportFileName('');
+                    previewImport(event.target.value);
+                  }}
+                  className="h-56 w-full resize-none rounded-lg border border-gray-300 p-3 text-sm outline-none focus:ring-2 focus:ring-blue-500"
+                  placeholder="家长姓名\t与学生关系\t联系电话\t邮箱\t初始密码\t学生学籍辅号\t学生姓名\t状态"
+                />
+              </div>
+            </div>
+
+            {importError && (
+              <div className={`mt-4 flex items-start gap-2 rounded-lg p-3 text-sm ${importResult ? 'bg-amber-50 text-amber-800' : 'bg-red-50 text-red-700'}`}>
+                <X className="mt-0.5 h-4 w-4 flex-shrink-0" />
+                <span>{importError}</span>
+              </div>
+            )}
+
+            {importPreview && (
+              <div className="mt-5 space-y-4">
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                  {[
+                    ['新增', importPreview.insertedCount],
+                    ['更新', importPreview.updatedCount],
+                    ['绑定学生', importPreview.boundStudentCount],
+                    ['需检查', importPreview.errors.length],
+                  ].map(([label, value]) => (
+                    <div key={label} className="rounded-lg border border-gray-200 bg-gray-50 p-4">
+                      <p className="text-xs text-gray-500">{label}</p>
+                      <p className="mt-1 text-2xl font-bold text-gray-900">{value}</p>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="rounded-lg border border-gray-200">
+                  <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
+                    <p className="font-medium text-gray-800">解析预览</p>
+                    <p className="text-sm text-gray-500">共 {importRows.length} 行，仅显示前 20 行</p>
+                  </div>
+                  <div className="max-h-64 overflow-auto">
+                    <table className="w-full min-w-[720px] text-sm">
+                      <thead className="sticky top-0 bg-gray-50">
+                        <tr>
+                          {importHeaders.map(header => (
+                            <th key={header} className="px-3 py-2 text-left font-medium text-gray-500">{header}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-100">
+                        {importRows.slice(0, 20).map((row, rowIndex) => (
+                          <tr key={rowIndex}>
+                            {importHeaders.map(header => (
+                              <td key={header} className="whitespace-nowrap px-3 py-2 text-gray-700">
+                                {isSensitiveImportHeader(header) && row[header] ? '已填写' : row[header] || '-'}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                {importPreview.errors.length > 0 && (
+                  <div className="rounded-lg bg-amber-50 p-4 text-sm text-amber-800">
+                    <p className="font-medium">需检查行</p>
+                    <ul className="mt-2 space-y-1">
+                      {importPreview.errors.slice(0, 8).map(item => (
+                        <li key={item}>{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {importResult && (
+              <div className="mt-4 flex items-center gap-2 rounded-lg bg-emerald-50 p-3 text-sm text-emerald-800">
+                <CheckCircle className="h-4 w-4" />
+                <span>家长档案和学生绑定已写入。</span>
+              </div>
+            )}
+
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                onClick={() => setShowImportModal(false)}
+                className="px-4 py-2 border border-gray-300 rounded-lg"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleImport}
+                disabled={!importPreview?.items?.length || parentImporting}
+                className="px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-gray-300"
+              >
+                {parentImporting ? '写入中...' : '确认写入'}
+              </button>
             </div>
           </div>
         </div>

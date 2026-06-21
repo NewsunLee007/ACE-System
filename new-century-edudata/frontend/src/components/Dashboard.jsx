@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   BarChart,
   Bar,
@@ -6,10 +7,7 @@ import {
   YAxis,
   CartesianGrid,
   Tooltip,
-  Legend,
   ResponsiveContainer,
-  LineChart,
-  Line,
   Cell
 } from 'recharts';
 import {
@@ -19,76 +17,401 @@ import {
   Target,
   Award,
   ChevronDown,
-  Download,
-  RefreshCw
+  Upload,
+  RefreshCw,
+  BarChart3,
+  MonitorPlay
 } from 'lucide-react';
+import schoolData from '../data/schoolData';
+import { fetchExamListWithStatistics, fetchExamScoreRows } from '../lib/examApi';
+import { getStoredDashboardPreviewRole } from '../lib/rolePreview';
+import { recalculateScoreRanks } from '../lib/scoreImport';
+import { hasBackendAuthToken } from '../lib/sessionToken';
+
+const DEFAULT_SUBJECTS = ['语文', '数学', '英语', '科学', '社会'];
+
+const DEFAULT_LAYERS = [
+  { id: 'ALL', code: 'ALL', name: '全段', description: '全年级全部班级' },
+  { id: 'A', code: 'A', name: 'A层', description: 'A层班级对比' },
+  { id: 'B', code: 'B', name: 'B层', description: 'B层班级对比' },
+  { id: 'C', code: 'C', name: 'C层', description: 'C层班级对比' },
+];
+
+const getClassId = (score) => {
+  if (score?.class_id) return Number(score.class_id);
+  const classText = String(score?.class_name || score?.className || '');
+  const match = classText.match(/\d{3,4}/);
+  return match ? Number(match[0]) : null;
+};
+
+const getClassName = (score) => {
+  const classId = getClassId(score);
+  if (classId) return String(classId);
+  return String(score?.class_name || score?.className || '未知');
+};
+
+const getSubjects = (exam, scores) => {
+  if (Array.isArray(exam?.subjects) && exam.subjects.length > 0) return exam.subjects;
+  const detected = Array.from(new Set((scores || []).flatMap(s => Object.keys(s.scores || {}))));
+  return detected.length > 0 ? detected : DEFAULT_SUBJECTS;
+};
+
+const mean = (values) => {
+  const nums = values.filter(v => Number.isFinite(v));
+  return nums.length ? nums.reduce((sum, v) => sum + v, 0) / nums.length : 0;
+};
+
+const std = (values) => {
+  const nums = values.filter(v => Number.isFinite(v));
+  if (!nums.length) return 0;
+  const avg = mean(nums);
+  return Math.sqrt(nums.reduce((sum, v) => sum + (v - avg) ** 2, 0) / nums.length);
+};
+
+const valueAtPercent = (values, pct) => {
+  const nums = values.filter(v => Number.isFinite(v)).sort((a, b) => b - a);
+  if (!nums.length) return 0;
+  const index = Math.min(nums.length - 1, Math.max(0, Math.ceil(nums.length * pct) - 1));
+  return nums[index] || 0;
+};
+
+const formatNumber = (value, digits = 1) => {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Number(n.toFixed(digits));
+};
+
+const formatSignedNumber = (value, digits = 1) => {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '-';
+  return `${n >= 0 ? '+' : ''}${n.toFixed(digits)}`;
+};
+
+const diffTextColor = (value) => (Number(value) >= 0 ? 'text-green-600' : 'text-red-600');
+
+const normalizeLayerCode = (value) => String(value || '').trim().toUpperCase();
+
+const normalizeExam = (exam) => ({
+  ...exam,
+  id: Number(exam.id),
+  name: exam.exam_name || exam.name || `考试 ${exam.id}`,
+  grade: exam.grade_level || exam.grade || '',
+});
+
+const hasBackendToken = hasBackendAuthToken;
+const isDashboardPreviewActive = () => getStoredDashboardPreviewRole() !== 'actual';
+
+const getLocalExamScores = (examId) => (
+  (schoolData.examScores || []).filter(score => Number(score.exam_id) === Number(examId))
+);
+
+const dataNoticeTone = (source) => (
+  source === 'backend'
+    ? 'border-green-100 bg-green-50 text-green-700'
+    : 'border-amber-100 bg-amber-50 text-amber-700'
+);
 
 // 教务处统测大屏组件
-const Dashboard = () => {
+const Dashboard = ({
+  title = '教务处看板',
+  description = '',
+  defaultLayer = 'A',
+  allowedGrades = null,
+}) => {
+  const navigate = useNavigate();
   const [selectedExam, setSelectedExam] = useState(null);
-  const [selectedLayer, setSelectedLayer] = useState(null);
+  const [selectedLayer, setSelectedLayer] = useState(defaultLayer);
   const [dashboardData, setDashboardData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [exams, setExams] = useState([]);
-  const [layers, setLayers] = useState([]);
+  const [scoreRowsByExam, setScoreRowsByExam] = useState({});
+  const [dataSource, setDataSource] = useState(hasBackendToken() ? 'backend' : 'local');
+  const [syncMessage, setSyncMessage] = useState(hasBackendToken() ? '正在同步后端考试库' : '未登录后端，当前使用本地成绩缓存');
+  const [layers] = useState(DEFAULT_LAYERS);
+  const allowedGradeKey = Array.isArray(allowedGrades) ? allowedGrades.filter(Boolean).join('|') : '';
 
-  // 模拟数据获取
-  useEffect(() => {
-    // 模拟考试列表
-    setExams([
-      { id: 1, name: '2025-1 7年级教学调研', grade: '7年级' },
-      { id: 2, name: '2024-2 7年级期末统考', grade: '7年级' },
-      { id: 3, name: '2024-2 8年级期中考试', grade: '8年级' },
-    ]);
+  const filterExamsByAllowedGrades = useCallback((items = []) => {
+    const allowed = allowedGradeKey ? allowedGradeKey.split('|') : [];
+    if (!allowed.length) return items;
+    return items.filter(exam => allowed.includes(exam.grade));
+  }, [allowedGradeKey]);
 
-    // 模拟分层列表
-    setLayers([
-      { id: 1, name: 'A层 (701-710)', description: '前10个班级对比' },
-      { id: 2, name: 'B层 (701-712)', description: '前12个班级对比' },
-      { id: 3, name: '全段 (701-718)', description: '全部18个班级' },
-    ]);
+  const getScoreRowsForExam = useCallback((examId) => {
+    if (!examId) return [];
+    const cachedRows = scoreRowsByExam[Number(examId)];
+    if (cachedRows) return cachedRows;
+    return dataSource === 'backend' ? [] : getLocalExamScores(examId);
+  }, [dataSource, scoreRowsByExam]);
 
-    // 模拟看板数据
-    setDashboardData({
-      exam_id: 1,
-      exam_name: '2025-1 7年级教学调研',
-      layer_id: 1,
-      layer_name: 'A层 (701-710)',
-      layer_stats: {
-        total_students: 450,
-        mean_score: 385.5,
-        std_score: 45.23,
-        max_score: 485,
-        min_score: 185,
-        threshold_20: 425,
-        threshold_40: 398,
-        threshold_60: 375,
-        threshold_80: 345,
-      },
-      class_rankings: [
-        { class_name: '702', final_z_value: 0.8234, class_mean: 412.5, top20_ratio: 0.35, top80_ratio: 0.85, class_count: 45 },
-        { class_name: '705', final_z_value: 0.6543, class_mean: 405.2, top20_ratio: 0.30, top80_ratio: 0.82, class_count: 46 },
-        { class_name: '701', final_z_value: 0.5432, class_mean: 398.5, top20_ratio: 0.28, top80_ratio: 0.78, class_count: 44 },
-        { class_name: '708', final_z_value: 0.4321, class_mean: 392.0, top20_ratio: 0.25, top80_ratio: 0.75, class_count: 45 },
-        { class_name: '703', final_z_value: 0.3210, class_mean: 388.5, top20_ratio: 0.22, top80_ratio: 0.72, class_count: 45 },
-        { class_name: '710', final_z_value: 0.2109, class_mean: 382.0, top20_ratio: 0.20, top80_ratio: 0.70, class_count: 44 },
-        { class_name: '704', final_z_value: 0.1098, class_mean: 378.5, top20_ratio: 0.18, top80_ratio: 0.68, class_count: 46 },
-        { class_name: '706', final_z_value: -0.0123, class_mean: 375.0, top20_ratio: 0.15, top80_ratio: 0.65, class_count: 45 },
-        { class_name: '709', final_z_value: -0.1234, class_mean: 368.5, top20_ratio: 0.12, top80_ratio: 0.62, class_count: 45 },
-        { class_name: '707', final_z_value: -0.2345, class_mean: 362.0, top20_ratio: 0.10, top80_ratio: 0.58, class_count: 45 },
-      ],
-      subject_thresholds: [
-        { percentage: 0.20, label: '前20%', threshold_total: 425, threshold_chinese: 88, threshold_math: 85, threshold_english: 82, threshold_science: 90, threshold_society: 85, student_count: 90 },
-        { percentage: 0.40, label: '前40%', threshold_total: 398, threshold_chinese: 82, threshold_math: 78, threshold_english: 75, threshold_science: 82, threshold_society: 78, student_count: 180 },
-        { percentage: 0.60, label: '前60%', threshold_total: 375, threshold_chinese: 76, threshold_math: 72, threshold_english: 68, threshold_science: 75, threshold_society: 72, student_count: 270 },
-        { percentage: 0.80, label: '前80%', threshold_total: 345, threshold_chinese: 70, threshold_math: 65, threshold_english: 60, threshold_science: 68, threshold_society: 65, student_count: 360 },
-      ],
+  const buildDashboardData = useCallback((examId, layerCode) => {
+    const exam = exams.find(item => Number(item.id) === Number(examId));
+    if (!exam) return null;
+
+    const examScores = getScoreRowsForExam(exam.id);
+    const subjects = getSubjects(exam, examScores);
+    const layer = layers.find(item => item.code === layerCode) || layers.find(item => item.code === 'ALL') || layers[0];
+    const layersForGrade = (schoolData.classLayers || [])
+      .filter(item => !exam.grade || item.grade_level === exam.grade);
+    const layerByClass = new Map(layersForGrade
+      .map(item => [Number(item.class_id), normalizeLayerCode(item.layer_code)])
+      .filter(([classId, code]) => Number.isFinite(classId) && code));
+
+    const getLayerCodeForScore = (score) => {
+      const classId = getClassId(score);
+      const explicitCode = normalizeLayerCode(score?.layer_code || score?._layer);
+      if (explicitCode) return explicitCode;
+      return layerByClass.get(classId) || '';
+    };
+
+    const isInLayer = (score) => {
+      const classId = getClassId(score);
+      if (!classId) return false;
+      if (layer.code === 'ALL') return true;
+      const classLayerCode = getLayerCodeForScore(score);
+      if (classLayerCode) return classLayerCode === layer.code;
+      return true;
+    };
+
+    const scopedScores = examScores.filter(isInLayer);
+    const validScores = scopedScores.filter(score => score.is_valid !== false && score.is_included !== false);
+    const allValidScores = examScores.filter(score => score.is_valid !== false && score.is_included !== false);
+    const totals = validScores
+      .map(score => Number(score.total_score))
+      .filter(value => Number.isFinite(value) && value > 0);
+
+    if (!validScores.length || !totals.length) {
+      return {
+        exam_id: exam.id,
+        exam_name: exam.name,
+        layer_id: layer.id,
+        layer_name: layer.name,
+        layer_stats: {
+          total_students: 0,
+          mean_score: 0,
+          std_score: 0,
+          max_score: 0,
+          min_score: 0,
+          threshold_20: 0,
+          threshold_40: 0,
+          threshold_60: 0,
+          threshold_80: 0,
+        },
+        class_rankings: [],
+        subject_thresholds: [],
+      };
+    }
+
+    const layerMean = mean(totals);
+    const layerStd = std(totals);
+    const threshold20 = valueAtPercent(totals, 0.2);
+    const threshold40 = valueAtPercent(totals, 0.4);
+    const threshold60 = valueAtPercent(totals, 0.6);
+    const threshold80 = valueAtPercent(totals, 0.8);
+
+    const sameLayerTotals = new Map();
+    allValidScores.forEach(score => {
+      const total = Number(score.total_score);
+      if (!Number.isFinite(total) || total <= 0) return;
+      const layerCodeForScore = getLayerCodeForScore(score) || '未分层';
+      if (!sameLayerTotals.has(layerCodeForScore)) sameLayerTotals.set(layerCodeForScore, []);
+      sameLayerTotals.get(layerCodeForScore).push(total);
     });
-  }, []);
+    const sameLayerMeans = new Map(Array.from(sameLayerTotals.entries()).map(([code, values]) => [code, mean(values)]));
+
+    const classGroups = new Map();
+    validScores.forEach(score => {
+      const className = getClassName(score);
+      if (!classGroups.has(className)) classGroups.set(className, []);
+      classGroups.get(className).push(score);
+    });
+
+    const classRankings = Array.from(classGroups.entries()).map(([className, rows]) => {
+      const representativeClassId = getClassId(rows[0]);
+      const classLayerCode = getLayerCodeForScore(rows[0]) || '未分层';
+      const classTotals = rows.map(score => Number(score.total_score)).filter(value => Number.isFinite(value) && value > 0);
+      const classMean = mean(classTotals);
+      const standardScore = layerStd > 0 ? (classMean - layerMean) / layerStd : 0;
+      const top20Ratio = classTotals.length ? classTotals.filter(value => value >= threshold20).length / classTotals.length : 0;
+      const top80Ratio = classTotals.length ? classTotals.filter(value => value >= threshold80).length / classTotals.length : 0;
+      const finalZValue = standardScore * 0.5 + top20Ratio * 0.2 + top80Ratio * 0.3;
+      const sameLayerMean = sameLayerMeans.get(classLayerCode) ?? layerMean;
+
+      return {
+        class_id: representativeClassId,
+        class_name: className,
+        layer_code: classLayerCode,
+        final_z_value: formatNumber(finalZValue, 4),
+        class_mean: formatNumber(classMean, 1),
+        range_mean_diff: formatNumber(classMean - layerMean, 1),
+        same_layer_mean: formatNumber(sameLayerMean, 1),
+        same_layer_diff: formatNumber(classMean - sameLayerMean, 1),
+        top20_ratio: top20Ratio,
+        top80_ratio: top80Ratio,
+        class_count: classTotals.length,
+      };
+    }).sort((a, b) => b.final_z_value - a.final_z_value);
+
+    const subjectKeyMap = {
+      '语文': 'threshold_chinese',
+      '数学': 'threshold_math',
+      '英语': 'threshold_english',
+      '科学': 'threshold_science',
+      '社会': 'threshold_society',
+    };
+
+    const subjectThresholds = [0.2, 0.4, 0.6, 0.8].map(pct => {
+      const row = {
+        percentage: pct,
+        label: `前${Math.round(pct * 100)}%`,
+        threshold_total: formatNumber(valueAtPercent(totals, pct), 1),
+        student_count: Math.min(validScores.length, Math.ceil(validScores.length * pct)),
+      };
+
+      subjects.forEach(subject => {
+        const key = subjectKeyMap[subject];
+        if (!key) return;
+        const subjectScores = validScores
+          .map(score => Number(score.scores?.[subject]))
+          .filter(value => Number.isFinite(value));
+        row[key] = formatNumber(valueAtPercent(subjectScores, pct), 1);
+      });
+
+      return row;
+    });
+
+    return {
+      exam_id: exam.id,
+      exam_name: exam.name,
+      layer_id: layer.id,
+      layer_name: layer.name,
+      layer_stats: {
+        total_students: validScores.length,
+        mean_score: formatNumber(layerMean, 1),
+        std_score: formatNumber(layerStd, 2),
+        max_score: formatNumber(Math.max(...totals), 1),
+        min_score: formatNumber(Math.min(...totals), 1),
+        threshold_20: formatNumber(threshold20, 1),
+        threshold_40: formatNumber(threshold40, 1),
+        threshold_60: formatNumber(threshold60, 1),
+        threshold_80: formatNumber(threshold80, 1),
+      },
+      class_rankings: classRankings,
+      subject_thresholds: subjectThresholds,
+      meeting_summary: {
+        top_class: classRankings[0] || null,
+        weak_class: classRankings[classRankings.length - 1] || null,
+        spread: formatNumber(Math.max(...totals) - Math.min(...totals), 1),
+        excellent_line: formatNumber(threshold20, 1),
+        middle_line: formatNumber(threshold60, 1),
+        risk_line: formatNumber(threshold80, 1),
+      }
+    };
+  }, [exams, getScoreRowsForExam, layers]);
+
+  const refreshDashboard = useCallback((examId = selectedExam, layerCode = selectedLayer) => {
+    setLoading(true);
+    setDashboardData(buildDashboardData(examId, layerCode));
+    setTimeout(() => setLoading(false), 250);
+  }, [buildDashboardData, selectedExam, selectedLayer]);
+
+  useEffect(() => {
+    const loadLocalExams = () => {
+      const localExams = filterExamsByAllowedGrades((schoolData.exams || []).map(normalizeExam));
+      setExams(localExams);
+      setDataSource('local');
+      setSyncMessage(hasBackendToken() ? '后端考试库暂不可用，当前使用本地成绩缓存' : '未登录后端，当前使用本地成绩缓存');
+
+      if (localExams.length > 0) {
+        setSelectedExam(prev => (
+          prev && localExams.some(exam => Number(exam.id) === Number(prev))
+            ? prev
+            : String(localExams[0].id)
+        ));
+      } else {
+        setSelectedExam(null);
+        setDashboardData(null);
+      }
+    };
+
+    const loadExams = async () => {
+      if (!hasBackendToken()) {
+        loadLocalExams();
+        return;
+      }
+
+      try {
+        setSyncMessage('正在同步后端考试库');
+        const payload = await fetchExamListWithStatistics({ pageSize: 100 });
+        const backendExams = filterExamsByAllowedGrades((payload.exams || []).map(normalizeExam));
+        if (backendExams.length === 0 && isDashboardPreviewActive()) {
+          loadLocalExams();
+          return;
+        }
+
+        setExams(backendExams);
+        setDataSource('backend');
+        setSyncMessage(`已同步后端考试库 · ${backendExams.length}场考试`);
+
+        if (backendExams.length > 0) {
+          setSelectedExam(prev => (
+            prev && backendExams.some(exam => Number(exam.id) === Number(prev))
+              ? prev
+              : String(backendExams[0].id)
+          ));
+        } else {
+          setSelectedExam(null);
+          setDashboardData(null);
+        }
+      } catch {
+        loadLocalExams();
+      }
+    };
+
+    loadExams();
+    window.addEventListener('schoolData:changed', loadExams);
+    return () => window.removeEventListener('schoolData:changed', loadExams);
+  }, [filterExamsByAllowedGrades]);
+
+  useEffect(() => {
+    let alive = true;
+
+    const loadScoreRows = async () => {
+      if (!selectedExam || dataSource !== 'backend' || scoreRowsByExam[Number(selectedExam)]) return;
+
+      setLoading(true);
+      try {
+        const payload = await fetchExamScoreRows(selectedExam, { includeInvalid: true });
+        const rankedRows = recalculateScoreRanks(payload.scores || [])
+          .map(row => ({ ...row, exam_id: row.exam_id ?? Number(selectedExam) }));
+        if (!alive) return;
+        setScoreRowsByExam(prev => ({
+          ...prev,
+          [Number(selectedExam)]: rankedRows,
+        }));
+        setSyncMessage(`已同步后端成绩行 · ${rankedRows.length}条`);
+      } catch {
+        if (!alive) return;
+        setSyncMessage('后端成绩行暂不可用，当前考试暂无可展示成绩');
+      } finally {
+        if (alive) setLoading(false);
+      }
+    };
+
+    loadScoreRows();
+
+    return () => {
+      alive = false;
+    };
+  }, [dataSource, scoreRowsByExam, selectedExam]);
+
+  useEffect(() => {
+    if (selectedExam && exams.length > 0) {
+      setDashboardData(buildDashboardData(selectedExam, selectedLayer));
+    }
+  }, [selectedExam, selectedLayer, exams, buildDashboardData]);
 
   const handleRefresh = () => {
-    setLoading(true);
-    setTimeout(() => setLoading(false), 1000);
+    refreshDashboard();
   };
 
   const getZValueColor = (zValue) => {
@@ -105,12 +428,22 @@ const Dashboard = () => {
     return '需改进';
   };
 
+  if (!dashboardData && exams.length === 0) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-gray-50">
+        <div className="text-center">
+          <p className="text-gray-600">暂无考试数据，请先在考务管理中创建考试并导入成绩。</p>
+        </div>
+      </div>
+    );
+  }
+
   if (!dashboardData) {
     return (
       <div className="flex items-center justify-center h-screen bg-gray-50">
         <div className="text-center">
           <RefreshCw className="w-8 h-8 animate-spin text-blue-600 mx-auto mb-4" />
-          <p className="text-gray-600">加载中...</p>
+          <p className="text-gray-600">正在加载教务大屏数据...</p>
         </div>
       </div>
     );
@@ -122,10 +455,13 @@ const Dashboard = () => {
       <div className="bg-white rounded-lg shadow-sm p-4 mb-6">
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-2xl font-bold text-gray-800">教务处统测数据看板</h1>
+            <h1 className="text-2xl font-bold text-gray-800">{title}</h1>
             <p className="text-sm text-gray-500 mt-1">
-              {dashboardData.exam_name} | {dashboardData.layer_name}
+              {dashboardData.exam_name} | {dashboardData.layer_name}{description ? ` | ${description}` : ''}
             </p>
+            <div className={`mt-2 inline-flex rounded-lg border px-3 py-1 text-xs ${dataNoticeTone(dataSource)}`}>
+              {syncMessage}
+            </div>
           </div>
           <div className="flex items-center gap-4">
             {/* 考试选择 */}
@@ -172,9 +508,17 @@ const Dashboard = () => {
               刷新数据
             </button>
 
+            <button
+              onClick={() => navigate('/analysis')}
+              className="flex items-center gap-2 bg-emerald-600 text-white px-4 py-2 rounded-lg hover:bg-emerald-700 transition-colors"
+            >
+              <BarChart3 className="w-4 h-4" />
+              成绩分析
+            </button>
+
             {/* 导出按钮 */}
             <button className="flex items-center gap-2 bg-gray-600 text-white px-4 py-2 rounded-lg hover:bg-gray-700 transition-colors">
-              <Download className="w-4 h-4" />
+              <Upload className="w-4 h-4" />
               导出报表
             </button>
           </div>
@@ -241,6 +585,29 @@ const Dashboard = () => {
               <Award className="w-6 h-6 text-purple-600" />
             </div>
           </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-6">
+        <div className="bg-white rounded-lg shadow-sm p-6">
+          <p className="text-sm text-gray-500 mb-1">班级均分极差</p>
+          <p className="text-3xl font-bold text-gray-800">{dashboardData.meeting_summary.spread}</p>
+          <p className="text-xs text-gray-400 mt-1">用于判断层内离散度</p>
+        </div>
+        <div className="bg-white rounded-lg shadow-sm p-6">
+          <p className="text-sm text-gray-500 mb-1">领跑班级</p>
+          <p className="text-3xl font-bold text-green-700">{dashboardData.meeting_summary.top_class?.class_name || '-'}</p>
+          <p className="text-xs text-gray-400 mt-1">Z值 {dashboardData.meeting_summary.top_class?.final_z_value ?? '-'}</p>
+        </div>
+        <div className="bg-white rounded-lg shadow-sm p-6">
+          <p className="text-sm text-gray-500 mb-1">重点帮扶班级</p>
+          <p className="text-3xl font-bold text-red-600">{dashboardData.meeting_summary.weak_class?.class_name || '-'}</p>
+          <p className="text-xs text-gray-400 mt-1">均分 {dashboardData.meeting_summary.weak_class?.class_mean ?? '-'}</p>
+        </div>
+        <div className="bg-white rounded-lg shadow-sm p-6">
+          <p className="text-sm text-gray-500 mb-1">会议展示</p>
+          <p className="text-3xl font-bold text-blue-700">一键</p>
+          <p className="text-xs text-gray-400 mt-1">下方展示板可直接投屏</p>
         </div>
       </div>
 
@@ -360,10 +727,12 @@ const Dashboard = () => {
               <tr className="bg-gray-50">
                 <th className="px-4 py-3 text-left font-semibold text-gray-700">排名</th>
                 <th className="px-4 py-3 text-left font-semibold text-gray-700">班级</th>
+                <th className="px-4 py-3 text-center font-semibold text-gray-700">层次</th>
                 <th className="px-4 py-3 text-center font-semibold text-gray-700">综合Z值</th>
                 <th className="px-4 py-3 text-center font-semibold text-gray-700">等级</th>
                 <th className="px-4 py-3 text-center font-semibold text-gray-700">班级均分</th>
                 <th className="px-4 py-3 text-center font-semibold text-gray-700">与年段差</th>
+                <th className="px-4 py-3 text-center font-semibold text-gray-700">与同层次差</th>
                 <th className="px-4 py-3 text-center font-semibold text-gray-700">前20%率</th>
                 <th className="px-4 py-3 text-center font-semibold text-gray-700">前80%率</th>
                 <th className="px-4 py-3 text-center font-semibold text-gray-700">有效人数</th>
@@ -379,6 +748,7 @@ const Dashboard = () => {
                     {index > 2 && <span className="text-gray-500">{index + 1}</span>}
                   </td>
                   <td className="px-4 py-3 font-medium text-gray-800">{cls.class_name}班</td>
+                  <td className="px-4 py-3 text-center text-gray-600">{cls.layer_code || '-'}</td>
                   <td className="px-4 py-3 text-center">
                     <span
                       className="px-2 py-1 rounded text-white font-medium"
@@ -390,9 +760,13 @@ const Dashboard = () => {
                   <td className="px-4 py-3 text-center text-gray-600">{getZValueLevel(cls.final_z_value)}</td>
                   <td className="px-4 py-3 text-center font-medium">{cls.class_mean}</td>
                   <td className="px-4 py-3 text-center">
-                    <span className={cls.class_mean - dashboardData.layer_stats.mean_score >= 0 ? 'text-green-600' : 'text-red-600'}>
-                      {cls.class_mean - dashboardData.layer_stats.mean_score >= 0 ? '+' : ''}
-                      {(cls.class_mean - dashboardData.layer_stats.mean_score).toFixed(1)}
+                    <span className={diffTextColor(cls.range_mean_diff)}>
+                      {formatSignedNumber(cls.range_mean_diff)}
+                    </span>
+                  </td>
+                  <td className="px-4 py-3 text-center">
+                    <span className={diffTextColor(cls.same_layer_diff)}>
+                      {formatSignedNumber(cls.same_layer_diff)}
                     </span>
                   </td>
                   <td className="px-4 py-3 text-center">{(cls.top20_ratio * 100).toFixed(1)}%</td>
@@ -402,6 +776,55 @@ const Dashboard = () => {
               ))}
             </tbody>
           </table>
+        </div>
+      </div>
+
+      <div className="mt-6 bg-slate-900 text-white rounded-lg shadow-sm p-8">
+        <div className="flex items-center justify-between gap-4 mb-6">
+          <div>
+            <h2 className="text-3xl font-bold flex items-center gap-3">
+              <MonitorPlay className="w-8 h-8 text-blue-300" />
+              统测分析结果展示
+            </h2>
+            <p className="text-slate-300 mt-2 text-lg">{dashboardData.exam_name} · {dashboardData.layer_name}</p>
+          </div>
+          <button
+            onClick={() => navigate('/analysis')}
+            className="bg-white text-slate-900 px-5 py-3 rounded-lg font-semibold hover:bg-blue-50"
+          >
+            打开完整成绩分析
+          </button>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+          <div className="bg-slate-800 rounded-lg p-5">
+            <p className="text-slate-400 text-base">核心结论</p>
+            <p className="text-2xl font-bold mt-3">
+              当前均分 {dashboardData.layer_stats.mean_score}，标准差 {dashboardData.layer_stats.std_score}
+            </p>
+          </div>
+          <div className="bg-slate-800 rounded-lg p-5">
+            <p className="text-slate-400 text-base">优势班级</p>
+            <p className="text-2xl font-bold mt-3 text-green-300">
+              {dashboardData.meeting_summary.top_class?.class_name || '-'}班 · 均分 {dashboardData.meeting_summary.top_class?.class_mean || '-'}
+            </p>
+          </div>
+          <div className="bg-slate-800 rounded-lg p-5">
+            <p className="text-slate-400 text-base">干预重点</p>
+            <p className="text-2xl font-bold mt-3 text-red-300">
+              {dashboardData.meeting_summary.weak_class?.class_name || '-'}班 · 需跟踪低分段
+            </p>
+          </div>
+        </div>
+        <div className="mt-6 h-72 bg-white rounded-lg p-4">
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={dashboardData.class_rankings.slice(0, 10)}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="class_name" />
+              <YAxis />
+              <Tooltip />
+              <Bar dataKey="class_mean" name="班级均分" fill="#2563eb" />
+            </BarChart>
+          </ResponsiveContainer>
         </div>
       </div>
 

@@ -16,13 +16,20 @@ from routers import (
     data_import_api,
     auth_api,
     exam_management_api,
+    class_management_api,
     student_management_api,
     teacher_management_api,
+    teacher_duties_api,
+    parent_management_api,
+    role_settings_api,
+    subject_management_api,
     report_api,
     audit_api,
     absence_management_api,
     score_analysis_api,
-    layered_analysis_api
+    layered_analysis_api,
+    ai_analysis_api,
+    score_visibility_api
 )
 from core.database import init_db
 
@@ -58,13 +65,20 @@ app.include_router(class_longitudinal_api.router)
 app.include_router(parent_query_api.router)
 app.include_router(data_import_api.router)
 app.include_router(exam_management_api.router)
+app.include_router(class_management_api.router)
 app.include_router(student_management_api.router)
 app.include_router(teacher_management_api.router)
+app.include_router(teacher_duties_api.router)
+app.include_router(parent_management_api.router)
+app.include_router(role_settings_api.router)
+app.include_router(subject_management_api.router)
 app.include_router(report_api.router)
 app.include_router(audit_api.router)
 app.include_router(absence_management_api.router)
 app.include_router(score_analysis_api.router)
 app.include_router(layered_analysis_api.router)
+app.include_router(ai_analysis_api.router)
+app.include_router(score_visibility_api.router)
 
 
 @app.on_event("startup")

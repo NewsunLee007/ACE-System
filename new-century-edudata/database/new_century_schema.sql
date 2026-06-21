@@ -45,7 +45,32 @@ CREATE TABLE `sys_users` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='系统用户表';
 
 -- ============================================
--- 3. 学生档案表 (核心底座 - 学籍辅号为唯一标识)
+-- 3. 角色前端配置扩展表
+-- ============================================
+CREATE TABLE `sys_role_settings` (
+  `role_id` INT PRIMARY KEY COMMENT '系统角色ID',
+  `frontend_role_id` VARCHAR(80) NOT NULL UNIQUE COMMENT '前端角色标识',
+  `display_level` INT DEFAULT 1 COMMENT '前端显示级别',
+  `permissions_json` TEXT COMMENT '权限标识JSON数组',
+  `is_system` TINYINT(1) DEFAULT 0 COMMENT '是否系统预设角色',
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  FOREIGN KEY (`role_id`) REFERENCES `sys_roles`(`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='角色前端配置扩展表';
+
+-- ============================================
+-- 4. 家长资料与学生绑定表
+-- ============================================
+CREATE TABLE `biz_parent_profiles` (
+  `parent_user_id` BIGINT PRIMARY KEY COMMENT '家长用户ID',
+  `relation` VARCHAR(20) DEFAULT '父亲' COMMENT '默认亲属关系',
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  FOREIGN KEY (`parent_user_id`) REFERENCES `sys_users`(`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='家长资料扩展表';
+
+-- ============================================
+-- 4. 学生档案表 (核心底座 - 学籍辅号为唯一标识)
 -- ============================================
 CREATE TABLE `biz_students` (
   `id` BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '学生内部ID',
@@ -64,8 +89,42 @@ CREATE TABLE `biz_students` (
   INDEX `idx_enrollment_year` (`enrollment_year`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='学生档案表-以学籍辅号为唯一标识';
 
+CREATE TABLE `biz_parent_student_rel` (
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '绑定ID',
+  `parent_user_id` BIGINT NOT NULL COMMENT '家长用户ID',
+  `student_id` BIGINT NOT NULL COMMENT '学生ID',
+  `relation` VARCHAR(20) DEFAULT '父亲' COMMENT '亲属关系',
+  `is_active` TINYINT(1) DEFAULT 1 COMMENT '是否有效',
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  FOREIGN KEY (`parent_user_id`) REFERENCES `sys_users`(`id`) ON DELETE CASCADE,
+  FOREIGN KEY (`student_id`) REFERENCES `biz_students`(`id`) ON DELETE CASCADE,
+  UNIQUE KEY `uk_parent_student` (`parent_user_id`, `student_id`),
+  INDEX `idx_parent_user` (`parent_user_id`),
+  INDEX `idx_student` (`student_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='家长学生绑定关系表';
+
 -- ============================================
--- 4. 学籍异动记录表
+-- 5. 班级基础信息表
+-- ============================================
+CREATE TABLE `biz_classes` (
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '内部ID',
+  `class_code` VARCHAR(20) NOT NULL UNIQUE COMMENT '班级编号，如701',
+  `class_no` VARCHAR(20) NOT NULL COMMENT '班级序号，如01',
+  `name` VARCHAR(100) NOT NULL COMMENT '班级名称',
+  `enrollment_year` INT NOT NULL COMMENT '入学年份',
+  `classroom_location` VARCHAR(100) COMMENT '教室位置',
+  `status` VARCHAR(20) DEFAULT 'active' COMMENT 'active/inactive',
+  `created_by` BIGINT COMMENT '创建人ID',
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  UNIQUE KEY `uk_enrollment_class_no` (`enrollment_year`, `class_no`),
+  INDEX `idx_class_status` (`status`),
+  INDEX `idx_enrollment_year` (`enrollment_year`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='班级基础信息表';
+
+-- ============================================
+-- 6. 学籍异动记录表
 -- ============================================
 CREATE TABLE `biz_status_changes` (
   `id` BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '记录ID',
@@ -107,7 +166,55 @@ CREATE TABLE `biz_teacher_class_rel` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='教师班级关系表-解绑教师与成绩直接关联';
 
 -- ============================================
--- 6. 考试基础信息表
+-- 6. 教师职务任命表 (支持多职务，不覆盖基础角色)
+-- ============================================
+CREATE TABLE `biz_teacher_duties` (
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '教师职务ID',
+  `teacher_id` BIGINT NOT NULL COMMENT '教师用户ID',
+  `duty_type` VARCHAR(50) NOT NULL COMMENT '职务类型: head_teacher/lesson_leader/research_leader/grade_leader/grade_deputy/dept_director/dept_deputy/vice_principal/principal',
+  `term` VARCHAR(20) NOT NULL COMMENT '学期',
+  `grade_name` VARCHAR(20) COMMENT '职务年级',
+  `subject_name` VARCHAR(50) COMMENT '职务学科',
+  `class_name` VARCHAR(20) COMMENT '班级范围',
+  `scope_label` VARCHAR(100) COMMENT '职务范围说明',
+  `is_active` TINYINT(1) DEFAULT 1 COMMENT '是否有效',
+  `assigned_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '任命时间',
+  `ended_at` TIMESTAMP NULL COMMENT '解除时间',
+  `created_by` BIGINT COMMENT '创建人ID',
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  FOREIGN KEY (`teacher_id`) REFERENCES `sys_users`(`id`),
+  INDEX `idx_teacher_duty_term` (`teacher_id`, `term`, `duty_type`),
+  INDEX `idx_duty_scope` (`duty_type`, `term`, `grade_name`, `subject_name`, `class_name`),
+  INDEX `idx_duty_active` (`is_active`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='教师职务任命表';
+
+-- ============================================
+-- 6. 学科目录表
+-- ============================================
+CREATE TABLE `biz_subjects` (
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '学科ID',
+  `name` VARCHAR(50) NOT NULL COMMENT '学科名称',
+  `code` VARCHAR(20) COMMENT '学科代码',
+  `description` VARCHAR(255) COMMENT '学科说明',
+  `sort_order` INT DEFAULT 0 COMMENT '排序',
+  `is_active` TINYINT(1) DEFAULT 1 COMMENT '是否启用',
+  `created_by` BIGINT COMMENT '创建人ID',
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  UNIQUE KEY `uk_subject_name` (`name`),
+  INDEX `idx_subject_active_order` (`is_active`, `sort_order`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='学科目录表';
+
+INSERT INTO `biz_subjects` (`name`, `code`, `description`, `sort_order`) VALUES
+('语文', 'YW', '基础学科', 1),
+('数学', 'SX', '基础学科', 2),
+('英语', 'YY', '外语学科', 3),
+('科学', 'KX', '综合科学', 4),
+('社会', 'SH', '社会学科', 5);
+
+-- ============================================
+-- 7. 考试基础信息表
 -- ============================================
 CREATE TABLE `biz_exams` (
   `id` BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '考试ID',
@@ -125,7 +232,7 @@ CREATE TABLE `biz_exams` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='考试基础信息表';
 
 -- ============================================
--- 7. 成绩明细表 (宽表设计 - 空间换时间)
+-- 8. 成绩明细表 (宽表设计 - 空间换时间)
 -- ============================================
 -- 核心字段 is_included: 被标记为0的学生成绩只做记录
 -- 绝对不纳入班级/层级的均分、及格率、Z值计算的分子与分母中
@@ -153,7 +260,7 @@ CREATE TABLE `biz_scores` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='成绩明细表-宽表设计';
 
 -- ============================================
--- 8. 自定义班级分层主表 (横向对比层级)
+-- 9. 自定义班级分层主表 (横向对比层级)
 -- ============================================
 -- 支持在每次统测时自定义"对比层级"
 -- 如: A层=701-710班, B层=701-712班
@@ -170,7 +277,7 @@ CREATE TABLE `biz_class_layers` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='班级分层主表-横向对比层级';
 
 -- ============================================
--- 9. 自定义班级分层明细表
+-- 10. 自定义班级分层明细表
 -- ============================================
 CREATE TABLE `biz_class_layer_details` (
   `id` BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '明细ID',
@@ -183,7 +290,7 @@ CREATE TABLE `biz_class_layer_details` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='班级分层明细表';
 
 -- ============================================
--- 10. 班级Z值计算结果缓存表 (提升查询性能)
+-- 11. 班级Z值计算结果缓存表 (提升查询性能)
 -- ============================================
 CREATE TABLE `biz_class_z_values` (
   `id` BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '记录ID',
@@ -206,7 +313,7 @@ CREATE TABLE `biz_class_z_values` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='班级Z值计算结果缓存表';
 
 -- ============================================
--- 11. 学科有效分/下限分计算结果表
+-- 12. 学科有效分/下限分计算结果表
 -- ============================================
 CREATE TABLE `biz_subject_thresholds` (
   `id` BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '记录ID',
@@ -227,7 +334,7 @@ CREATE TABLE `biz_subject_thresholds` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='学科有效分/下限分计算结果表';
 
 -- ============================================
--- 12. 学生历史成绩趋势表 (用于进退步分析)
+-- 13. 学生历史成绩趋势表 (用于进退步分析)
 -- ============================================
 CREATE TABLE `biz_student_trends` (
   `id` BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '记录ID',
@@ -245,5 +352,37 @@ CREATE TABLE `biz_student_trends` (
   UNIQUE KEY `uk_student_exam` (`student_id`, `exam_id`),
   INDEX `idx_student_term` (`student_id`, `term`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='学生历史成绩趋势表';
+
+-- ============================================
+-- 14. 成绩分析结果包缓存表
+-- ============================================
+CREATE TABLE `biz_score_analysis_bundles` (
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '内部ID',
+  `bundle_id` VARCHAR(80) NOT NULL UNIQUE COMMENT '结果包ID',
+  `exam_id` BIGINT NOT NULL COMMENT '考试ID',
+  `exam_name` VARCHAR(120) NOT NULL COMMENT '考试名称',
+  `grade_level` VARCHAR(20) NOT NULL COMMENT '年级',
+  `status` VARCHAR(20) DEFAULT 'ready' COMMENT '结果包状态',
+  `result_json` LONGTEXT NOT NULL COMMENT '结果包JSON',
+  `source_hash` VARCHAR(80) DEFAULT NULL COMMENT '来源数据版本',
+  `generated_by` BIGINT DEFAULT NULL COMMENT '生成人',
+  `generated_by_name` VARCHAR(80) DEFAULT NULL COMMENT '生成人姓名',
+  `generated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '生成时间',
+  `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  UNIQUE KEY `uk_exam_grade_bundle` (`exam_id`, `grade_level`),
+  INDEX `idx_grade_generated_at` (`grade_level`, `generated_at`),
+  FOREIGN KEY (`exam_id`) REFERENCES `biz_exams`(`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='成绩分析结果包缓存表';
+
+-- ============================================
+-- 15. 成绩排名与分析可见性设置表
+-- ============================================
+CREATE TABLE `sys_score_visibility_settings` (
+  `role_code` VARCHAR(50) PRIMARY KEY COMMENT '权限角色代码',
+  `settings_json` TEXT NOT NULL COMMENT '成绩可见性JSON',
+  `updated_by` BIGINT DEFAULT NULL COMMENT '最后修改人',
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='成绩排名与分析可见性设置';
 
 SET FOREIGN_KEY_CHECKS = 1;

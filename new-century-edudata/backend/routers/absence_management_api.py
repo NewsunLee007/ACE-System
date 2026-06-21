@@ -14,10 +14,13 @@ import json
 import logging
 
 from core.database import get_db
-from core.security import get_current_user, require_permission
+from core.security import get_current_user, has_permission_code, require_permission
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/absence", tags=["缺考管理"])
+
+ABSENCE_MANAGE_PERMISSION_CODES = ("exam_admin",)
+ABSENCE_CLASS_SCOPE_PERMISSION_CODES = {"headmaster"}
 
 
 # ============ Pydantic模型定义 ============
@@ -130,6 +133,106 @@ def log_absence_action(db: Session, absence_id: int, action: str,
         logger.error(f"记录缺考操作日志失败: {e}")
 
 
+def _get_exam_term(db: Session, exam_id: Optional[int]) -> Optional[str]:
+    if not exam_id:
+        return None
+    result = db.execute(
+        text("SELECT term FROM biz_exams WHERE id = :exam_id"),
+        {"exam_id": exam_id}
+    ).fetchone()
+    return result.term if result else None
+
+
+def _headmaster_class_scope_condition(
+    current_user: dict,
+    params: dict,
+    db: Optional[Session] = None,
+    exam_id: Optional[int] = None,
+    class_field: str = "a.class_name"
+) -> str:
+    params["scope_teacher_id"] = current_user.get("id")
+    exam_term = _get_exam_term(db, exam_id) if db else None
+    if exam_term:
+        params["scope_term"] = exam_term
+        term_clause = "AND term = :scope_term"
+    else:
+        term_clause = ""
+
+    return f"""
+        {class_field} IN (
+            SELECT class_name
+            FROM biz_teacher_class_rel
+            WHERE teacher_id = :scope_teacher_id
+              AND is_headmaster = 1
+              {term_clause}
+        )
+    """
+
+
+def ensure_can_access_absence_class(
+    current_user: dict,
+    class_name: str,
+    db: Session,
+    exam_id: Optional[int] = None
+) -> None:
+    if has_permission_code(current_user, ABSENCE_MANAGE_PERMISSION_CODES):
+        return
+
+    if current_user.get("permission_code") not in ABSENCE_CLASS_SCOPE_PERMISSION_CODES:
+        raise HTTPException(status_code=403, detail="权限不足，无法访问缺考记录")
+
+    params = {
+        "teacher_id": current_user.get("id"),
+        "class_name": class_name,
+    }
+    exam_term = _get_exam_term(db, exam_id)
+    term_clause = ""
+    if exam_term:
+        params["term"] = exam_term
+        term_clause = "AND term = :term"
+
+    result = db.execute(
+        text(f"""
+            SELECT 1
+            FROM biz_teacher_class_rel
+            WHERE teacher_id = :teacher_id
+              AND class_name = :class_name
+              AND is_headmaster = 1
+              {term_clause}
+            LIMIT 1
+        """),
+        params
+    ).fetchone()
+
+    if not result:
+        raise HTTPException(status_code=403, detail="权限不足，无法访问该班缺考记录")
+
+
+def add_absence_scope_condition(
+    conditions: List[str],
+    params: dict,
+    current_user: dict,
+    db: Session,
+    exam_id: Optional[int] = None,
+    class_field: str = "a.class_name"
+) -> None:
+    if has_permission_code(current_user, ABSENCE_MANAGE_PERMISSION_CODES):
+        return
+
+    if current_user.get("permission_code") not in ABSENCE_CLASS_SCOPE_PERMISSION_CODES:
+        raise HTTPException(status_code=403, detail="权限不足，无法访问缺考记录")
+
+    conditions.append(
+        _headmaster_class_scope_condition(
+            current_user,
+            params,
+            db=db,
+            exam_id=exam_id,
+            class_field=class_field
+        )
+    )
+
+
 # ============ API路由 ============
 
 @router.post("/create")
@@ -144,6 +247,13 @@ def create_absence(
     教务处可直接创建，班主任上报需审核
     """
     try:
+        ensure_can_access_absence_class(
+            current_user,
+            request.class_name,
+            db,
+            exam_id=request.exam_id
+        )
+
         # 检查是否已存在该学生的缺考记录
         check_sql = """
             SELECT id FROM biz_absence_records 
@@ -163,8 +273,9 @@ def create_absence(
         # 获取考试名称
         exam_name = get_exam_name(db, request.exam_id)
         
-        # 如果是教务处录入，自动通过审核
-        status = "已通过" if request.report_source == "教务处" else "待审核"
+        is_exam_manager = has_permission_code(current_user, ABSENCE_MANAGE_PERMISSION_CODES)
+        report_source = request.report_source if is_exam_manager else "班主任"
+        status = "已通过" if is_exam_manager and report_source == "教务处" else "待审核"
         
         # 创建缺考记录
         subjects_json = json.dumps(request.absent_subjects, ensure_ascii=False)
@@ -190,7 +301,7 @@ def create_absence(
             "absent_subjects": subjects_json,
             "reason_type": request.reason_type,
             "reason_detail": request.reason_detail,
-            "report_source": request.report_source,
+            "report_source": report_source,
             "reported_by": current_user["id"],
             "reported_by_name": current_user.get("real_name", current_user["username"]),
             "status": status,
@@ -219,7 +330,7 @@ def create_absence(
         log_absence_action(
             db, absence_id, "创建", current_user["id"],
             current_user.get("real_name", current_user["username"]),
-            None, request.dict(), f"由{request.report_source}录入"
+            None, request.dict(), f"由{report_source}录入"
         )
         
         logger.info(f"创建缺考记录成功: exam_id={request.exam_id}, student={request.student_name}, 操作人={current_user['username']}")
@@ -231,6 +342,8 @@ def create_absence(
             "status": status
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"创建缺考记录失败: {e}")
         raise HTTPException(status_code=500, detail="创建缺考记录失败")
@@ -266,6 +379,7 @@ def get_absence_list(
             params["exam_id"] = exam_id
         
         if class_name:
+            ensure_can_access_absence_class(current_user, class_name, db, exam_id=exam_id)
             conditions.append("a.class_name = :class_name")
             params["class_name"] = class_name
             
@@ -284,6 +398,15 @@ def get_absence_list(
         if keyword:
             conditions.append("(a.student_name LIKE :keyword OR a.student_code LIKE :keyword)")
             params["keyword"] = f"%{keyword}%"
+
+        add_absence_scope_condition(
+            conditions,
+            params,
+            current_user,
+            db,
+            exam_id=exam_id,
+            class_field="class_name"
+        )
         
         where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
         
@@ -349,6 +472,8 @@ def get_absence_list(
             "records": records
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取缺考列表失败: {e}")
         raise HTTPException(status_code=500, detail="获取缺考列表失败")
@@ -373,6 +498,13 @@ def update_absence(
         
         if not existing:
             raise HTTPException(status_code=404, detail="缺考记录不存在")
+
+        ensure_can_access_absence_class(
+            current_user,
+            existing.class_name,
+            db,
+            exam_id=existing.exam_id
+        )
         
         # 检查状态
         if existing.status != "待审核":
@@ -567,6 +699,11 @@ def get_absence_statistics(
         # 获取考试名称
         exam_name = get_exam_name(db, exam_id)
         
+        conditions = ["exam_id = :exam_id"]
+        params = {"exam_id": exam_id}
+        add_absence_scope_condition(conditions, params, current_user, db, exam_id=exam_id)
+        where_clause = "WHERE " + " AND ".join(conditions)
+
         # 总体统计
         total_sql = """
             SELECT 
@@ -575,29 +712,29 @@ def get_absence_statistics(
                 SUM(CASE WHEN status = '已通过' THEN 1 ELSE 0 END) as approved_count,
                 SUM(CASE WHEN status = '已驳回' THEN 1 ELSE 0 END) as rejected_count
             FROM biz_absence_records
-            WHERE exam_id = :exam_id
+            {where_clause}
         """
-        total_stats = db.execute(text(total_sql), {"exam_id": exam_id}).fetchone()
+        total_stats = db.execute(text(total_sql.format(where_clause=where_clause)), params).fetchone()
         
         # 按原因类型统计
         reason_sql = """
             SELECT reason_type, COUNT(*) as count
             FROM biz_absence_records
-            WHERE exam_id = :exam_id
+            {where_clause}
             GROUP BY reason_type
         """
-        reason_results = db.execute(text(reason_sql), {"exam_id": exam_id}).fetchall()
+        reason_results = db.execute(text(reason_sql.format(where_clause=where_clause)), params).fetchall()
         by_reason_type = {r.reason_type: r.count for r in reason_results}
         
         # 按班级统计
         class_sql = """
             SELECT class_name, COUNT(*) as count
             FROM biz_absence_records
-            WHERE exam_id = :exam_id
+            {where_clause}
             GROUP BY class_name
             ORDER BY class_name
         """
-        class_results = db.execute(text(class_sql), {"exam_id": exam_id}).fetchall()
+        class_results = db.execute(text(class_sql.format(where_clause=where_clause)), params).fetchall()
         by_class = {r.class_name: r.count for r in class_results}
         
         return {
@@ -612,6 +749,8 @@ def get_absence_statistics(
             "by_class": by_class
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取缺考统计失败: {e}")
         raise HTTPException(status_code=500, detail="获取缺考统计失败")
@@ -628,14 +767,26 @@ def get_pending_count(
     用于首页提醒
     """
     try:
-        sql = "SELECT COUNT(*) as count FROM biz_absence_records WHERE status = '待审核'"
-        result = db.execute(text(sql)).fetchone()
+        conditions = ["status = '待审核'"]
+        params = {}
+        add_absence_scope_condition(
+            conditions,
+            params,
+            current_user,
+            db,
+            class_field="class_name"
+        )
+        where_clause = "WHERE " + " AND ".join(conditions)
+        sql = f"SELECT COUNT(*) as count FROM biz_absence_records {where_clause}"
+        result = db.execute(text(sql), params).fetchone()
         
         return {
             "success": True,
             "pending_count": result.count if result else 0
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取待审核数量失败: {e}")
         raise HTTPException(status_code=500, detail="获取待审核数量失败")

@@ -4,6 +4,8 @@
  */
 
 import React, { useState, useEffect } from 'react';
+import { API_BASE_URL } from '../lib/api';
+import { notify } from '../lib/notify';
 import {
   BarChart,
   Bar,
@@ -48,8 +50,6 @@ import {
   Shield,
   Layers
 } from 'lucide-react';
-
-const API_BASE_URL = 'http://localhost:8000/api/v1';
 
 const LayeredScoreAnalysis = ({ currentUser: propUser }) => {
   // 状态管理
@@ -163,7 +163,7 @@ const LayeredScoreAnalysis = ({ currentUser: propUser }) => {
   // 执行全年级范围分析
   const handleGradeRangeAnalysis = async () => {
     if (!selectedExam) {
-      alert('请先选择考试');
+      notify('请先选择考试');
       return;
     }
 
@@ -184,13 +184,13 @@ const LayeredScoreAnalysis = ({ currentUser: propUser }) => {
       const data = await response.json();
       if (data.success) {
         setAnalysisResult(data.data);
-        alert('全年级分析完成！');
+        notify('全年级分析完成！');
       } else {
-        alert(data.message || '分析失败');
+        notify(data.message || '分析失败');
       }
     } catch (error) {
       console.error('分析失败:', error);
-      alert('分析失败：' + error.message);
+      notify('分析失败：' + error.message);
     } finally {
       setLoading(false);
     }
@@ -199,7 +199,7 @@ const LayeredScoreAnalysis = ({ currentUser: propUser }) => {
   // 获取层次对比数据
   const fetchLayerComparison = async () => {
     if (!selectedExam) {
-      alert('请先选择考试');
+      notify('请先选择考试');
       return;
     }
 
@@ -218,7 +218,7 @@ const LayeredScoreAnalysis = ({ currentUser: propUser }) => {
       if (data.success) {
         setLayerComparison(data.data);
       } else {
-        alert(data.message || '获取对比数据失败');
+        notify(data.message || '获取对比数据失败');
       }
     } catch (error) {
       console.error('获取对比数据失败:', error);
@@ -230,7 +230,7 @@ const LayeredScoreAnalysis = ({ currentUser: propUser }) => {
   // 计算分层临界分
   const handleCalculateThresholds = async () => {
     if (!selectedExam) {
-      alert('请先选择考试');
+      notify('请先选择考试');
       return;
     }
 
@@ -252,13 +252,13 @@ const LayeredScoreAnalysis = ({ currentUser: propUser }) => {
       const data = await response.json();
       if (data.success) {
         setThresholds(data.data);
-        alert('临界分计算完成！');
+        notify('临界分计算完成！');
       } else {
-        alert(data.message || '计算失败');
+        notify(data.message || '计算失败');
       }
     } catch (error) {
       console.error('计算失败:', error);
-      alert('计算失败：' + error.message);
+      notify('计算失败：' + error.message);
     } finally {
       setLoading(false);
     }
@@ -298,12 +298,12 @@ const LayeredScoreAnalysis = ({ currentUser: propUser }) => {
   // 创建分层推送
   const handleCreatePush = async () => {
     if (!selectedExam) {
-      alert('请先选择考试');
+      notify('请先选择考试');
       return;
     }
 
     if (!pushForm.title || !pushForm.content) {
-      alert('请填写推送标题和内容');
+      notify('请填写推送标题和内容');
       return;
     }
 
@@ -327,15 +327,15 @@ const LayeredScoreAnalysis = ({ currentUser: propUser }) => {
 
       const data = await response.json();
       if (data.success) {
-        alert('分层推送已发送！');
+        notify('分层推送已发送！');
         setPushForm({ title: '', content: '', notification_type: 'teacher', target_role: 'all' });
         fetchPushHistory();
       } else {
-        alert(data.message || '推送失败');
+        notify(data.message || '推送失败');
       }
     } catch (error) {
       console.error('推送失败:', error);
-      alert('推送失败：' + error.message);
+      notify('推送失败：' + error.message);
     } finally {
       setLoading(false);
     }

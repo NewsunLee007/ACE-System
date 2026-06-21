@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useState, useEffect } from 'react';
 import {
   Plus,
   Search,
@@ -14,15 +14,49 @@ import {
   Square,
   CheckSquare,
   Calendar,
-  MapPin,
-  AlertCircle,
-  RefreshCw
+  MapPin
 } from 'lucide-react';
 import schoolData from '../data/schoolData';
+import { notify } from '../lib/notify';
+import { useConfirm } from './ui/confirm';
 import SmartImportModal from './SmartImportModal';
+import {
+  allocateClassId,
+  buildClassImport,
+  commitClassImport,
+  findExistingClass,
+  normalizeClassNo,
+  parseClassImportText,
+} from '../lib/classImport';
+import {
+  buildClassPayload,
+  createClassRecord,
+  deactivateClassRecord,
+  fetchClassList,
+  updateClassRecord,
+} from '../lib/classApi';
+import { hasBackendAuthToken } from '../lib/sessionToken';
+
+const hasBackendSession = hasBackendAuthToken;
+
+const shouldFallbackToLocalClassImport = (error) => {
+  const status = Number(error?.status);
+  if ([404, 502, 503, 504].includes(status)) return true;
+
+  const message = String(error?.message || '');
+  return error instanceof TypeError ||
+    message.includes('Failed to fetch') ||
+    message.includes('请求失败(404)');
+};
 
 const ClassManagement = () => {
+  const { confirm: confirmAction } = useConfirm();
   const [classes, setClasses] = useState([]);
+  const [classSyncSource, setClassSyncSource] = useState('local');
+  const [classListLoading, setClassListLoading] = useState(false);
+  const [classListError, setClassListError] = useState('');
+  const [classSaving, setClassSaving] = useState(false);
+  const [classImporting, setClassImporting] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [filterGrade, setFilterGrade] = useState('');
   const [showAddModal, setShowAddModal] = useState(false);
@@ -45,16 +79,83 @@ const ClassManagement = () => {
   // 智能导入相关状态
   const [showSmartImport, setShowSmartImport] = useState(false);
   const [importPreviewData, setImportPreviewData] = useState([]);
-  const [importStats, setImportStats] = useState({ new: 0, update: 0, total: 0 });
+  const skipInitialClassSync = React.useRef(true);
+  const localClassCacheRef = React.useRef([]);
+  const backendSessionActive = hasBackendSession();
 
   useEffect(() => {
-    setClasses(schoolData.classes || []);
+    const localClasses = schoolData.classes || [];
+    localClassCacheRef.current = localClasses;
+    setClasses(localClasses);
   }, []);
+
+  const refreshClasses = useCallback(async () => {
+    if (!hasBackendSession()) {
+      setClassSyncSource('local');
+      return null;
+    }
+
+    setClassListLoading(true);
+    try {
+      const payload = await fetchClassList({ pageSize: 200 });
+      const remoteClasses = payload.classes || [];
+      if (remoteClasses.length === 0 && localClassCacheRef.current.length > 0) {
+        setClasses(localClassCacheRef.current);
+        setClassSyncSource('local');
+        setClassListError('后端班级库暂无班级记录，当前显示本地真实导入数据。');
+        return {
+          ...payload,
+          classes: localClassCacheRef.current,
+          source: 'local-fallback',
+        };
+      }
+
+      setClasses(remoteClasses);
+      if (remoteClasses.length > 0) {
+        localClassCacheRef.current = remoteClasses;
+      }
+      setClassSyncSource('backend');
+      setClassListError('');
+      return payload;
+    } catch (error) {
+      setClassSyncSource('local');
+      setClassListError(`后端班级库暂不可用，当前显示本地缓存：${error.message || '连接失败'}`);
+      return null;
+    } finally {
+      setClassListLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshClasses();
+  }, [refreshClasses]);
+
+  useEffect(() => {
+    if (skipInitialClassSync.current) {
+      skipInitialClassSync.current = false;
+      return;
+    }
+    schoolData.classes = classes;
+    if (classes.length > 0) {
+      localClassCacheRef.current = classes;
+    }
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new Event('schoolData:changed'));
+    }
+  }, [classes]);
 
   // 获取当前学年显示
   const getCurrentAcademicYearDisplay = () => {
     return schoolData.getCurrentAcademicYearDisplay();
   };
+
+  const getClassGradeInfo = (cls) => (
+    schoolData.calculateGradeLevel(Number(cls.enrollment_year))
+  );
+
+  const formatClassDisplayName = (cls) => (
+    cls.name || `${cls.enrollment_year}级${normalizeClassNo(cls.class_no || cls.id)}班`
+  );
 
   // 下载导入模板 - 纯粹的班级信息
   const downloadTemplate = () => {
@@ -93,9 +194,9 @@ const ClassManagement = () => {
   const exportData = () => {
     const headers = ['班级编号', '班级名称', '入学年份', '当前年级', '教室位置', '状态'];
     const data = filteredClasses.map(c => {
-      const gradeInfo = schoolData.getClassGradeInfo(c.id);
+      const gradeInfo = getClassGradeInfo(c);
       return [
-        c.id, schoolData.formatClassName(c.id), c.enrollment_year, gradeInfo?.name || '未知',
+        c.id, formatClassDisplayName(c), c.enrollment_year, gradeInfo?.name || '未知',
         c.classroom_location || '', c.status === 'active' ? '在读' : '已毕业'
       ];
     });
@@ -111,142 +212,107 @@ const ClassManagement = () => {
   // 智能导入 - 解析文件并显示预览
   const handleImportPreview = () => {
     if (!importFile) {
-      alert('请先选择要导入的文件');
+      notify('请先选择要导入的文件');
       return;
     }
     
     const reader = new FileReader();
     reader.onload = (e) => {
-      const content = e.target.result;
-      const lines = content.split('\n').filter(line => {
-        const trimmed = line.trim();
-        return trimmed && !trimmed.startsWith('#');
-      });
-      
-      if (lines.length < 2) {
-        alert('文件格式错误：缺少表头或数据行');
-        return;
-      }
-      
-      const previewData = [];
-      
-      // 从第2行开始读取数据
-      for (let i = 1; i < lines.length; i++) {
-        const cols = lines[i].split(',');
-        if (cols.length >= 2) {
-          const classNo = cols[0]?.trim() || '';
-          const enrollmentYear = parseInt(cols[1]?.trim()) || schoolData.config.currentAcademicYear;
-          const classroomLocation = cols[2]?.trim() || '';
-          const status = cols[3]?.trim() === '已毕业' ? 'inactive' : 'active';
-          
-          // 查找是否已存在
-          const existingClass = schoolData.classes.find(c => 
-            c.class_no === classNo && c.enrollment_year === enrollmentYear
-          );
-          
-          if (existingClass) {
-            // 检查是否有变化
-            const changes = [];
-            if (classroomLocation && classroomLocation !== existingClass.classroom_location) {
-              changes.push('classroom_location');
-            }
-            if (status !== existingClass.status) {
-              changes.push('status');
-            }
-            
-            previewData.push({
-              type: changes.length > 0 ? 'update' : 'unchanged',
-              data: {
-                class_no: classNo,
-                enrollment_year: enrollmentYear,
-                classroom_location: classroomLocation,
-                status: status
-              },
-              existingData: existingClass,
-              changes: changes
-            });
-          } else {
-            // 新班级
-            previewData.push({
-              type: 'new',
-              data: {
-                class_no: classNo,
-                enrollment_year: enrollmentYear,
-                classroom_location: classroomLocation,
-                status: status
-              }
-            });
-          }
+      try {
+        const parsed = parseClassImportText(e.target.result || '');
+        const result = buildClassImport({
+          parsedRows: parsed.rows,
+          classes,
+          currentAcademicYear: schoolData.config.currentAcademicYear,
+          calculateGradeLevel: schoolData.calculateGradeLevel.bind(schoolData),
+        });
+
+        if (result.items.length === 0) {
+          notify(result.errors[0] || '没有可导入的班级数据');
+          return;
         }
+
+        setImportPreviewData(result.items);
+        setShowSmartImport(true);
+        setShowImportModal(false);
+
+        if (result.errors.length > 0) {
+          notify(`有 ${result.errors.length} 行未进入预览，请检查模板内容`, 'warning');
+        }
+      } catch (error) {
+        notify(error.message || '文件格式错误，请检查导入模板');
       }
-      
-      setImportPreviewData(previewData);
-      setImportStats({
-        new: previewData.filter(p => p.type === 'new').length,
-        update: previewData.filter(p => p.type === 'update').length,
-        unchanged: previewData.filter(p => p.type === 'unchanged').length,
-        total: previewData.length
-      });
-      setShowSmartImport(true);
-      setShowImportModal(false);
     };
     
     reader.readAsText(importFile);
   };
 
   // 确认智能导入
-  const handleConfirmImport = (selectedData) => {
-    let updatedCount = 0;
-    let addedCount = 0;
-    
-    selectedData.forEach(item => {
-      if (item.type === 'new') {
-        // 创建新班级
-        const gradeInfo = schoolData.calculateGradeLevel(item.data.enrollment_year);
-        const gradeNum = gradeInfo.grade;
-        const classNum = parseInt(item.data.class_no) || 1;
-        const classId = gradeNum * 100 + classNum;
-        
-        let finalClassId = classId;
-        let counter = 0;
-        while (schoolData.classes.some(c => c.id === finalClassId)) {
-          counter++;
-          finalClassId = classId * 10 + counter;
+  const handleConfirmImport = async (selectedData) => {
+    const addedCount = selectedData.filter(item => item.type === 'new').length;
+    const updatedCount = selectedData.filter(item => item.type === 'update').length;
+
+    if (addedCount === 0 && updatedCount === 0) {
+      notify('没有选择需要写入的班级变更');
+      return;
+    }
+
+    const commitSelectedImportLocally = (fallbackMessage = '') => {
+      const importResult = { items: selectedData };
+      const updatedClasses = commitClassImport({
+        classes,
+        importResult,
+        currentAcademicYear: schoolData.config.currentAcademicYear,
+        calculateGradeLevel: schoolData.calculateGradeLevel.bind(schoolData),
+      });
+
+      setClasses(updatedClasses);
+      setShowSmartImport(false);
+      setImportFile(null);
+
+      let message = '导入完成：';
+      if (addedCount > 0) message += `新增 ${addedCount} 个班级`;
+      if (updatedCount > 0) message += `${addedCount > 0 ? '，' : ''}更新 ${updatedCount} 个班级`;
+      notify(fallbackMessage ? `${fallbackMessage}${message}` : message, fallbackMessage ? 'warning' : 'success');
+    };
+
+    if (hasBackendSession() && classSyncSource === 'backend') {
+      setClassImporting(true);
+      try {
+        for (const item of selectedData) {
+          const payload = buildClassPayload({
+            form: item.type === 'update'
+              ? { ...item.existingData, ...item.data, id: item.existingData?.id }
+              : item.data,
+            classes,
+            currentAcademicYear: schoolData.config.currentAcademicYear,
+            calculateGradeLevel: schoolData.calculateGradeLevel.bind(schoolData),
+          });
+          const result = item.type === 'update' && !item.existingData?.derived_from_students
+            ? await updateClassRecord(item.existingData.class_code || item.existingData.id, payload)
+            : await createClassRecord(payload);
+          if (result?.success === false) {
+            throw new Error(result.message || `${payload.name} 写入失败`);
+          }
         }
-        
-        const isGraduated = gradeInfo.isGraduated || 
-                           (item.data.status === 'inactive') ||
-                           (item.data.enrollment_year <= schoolData.config.currentAcademicYear - 3);
-        
-        schoolData.classes.push({
-          id: finalClassId,
-          class_no: item.data.class_no,
-          enrollment_year: item.data.enrollment_year,
-          head_teacher_id: null,
-          classroom_location: item.data.classroom_location,
-          status: isGraduated ? 'inactive' : 'active',
-          created_at: new Date().toISOString().split('T')[0]
-        });
-        addedCount++;
-      } else if (item.type === 'update') {
-        // 更新现有班级
-        const existingClass = item.existingData;
-        if (item.data.classroom_location) {
-          existingClass.classroom_location = item.data.classroom_location;
+        await refreshClasses();
+        setShowSmartImport(false);
+        setImportFile(null);
+        notify(`导入完成：新增 ${addedCount} 个班级，更新 ${updatedCount} 个班级`, 'success');
+        return;
+      } catch (error) {
+        if (shouldFallbackToLocalClassImport(error)) {
+          commitSelectedImportLocally('后端班级库暂不可用，已先写入本地缓存。');
+          return;
         }
-        existingClass.status = item.data.status;
-        updatedCount++;
+        notify('班级导入失败：' + (error.message || '请稍后重试'), 'error');
+        return;
+      } finally {
+        setClassImporting(false);
       }
-    });
-    
-    setClasses([...schoolData.classes]);
-    setShowSmartImport(false);
-    setImportFile(null);
-    
-    let message = `导入完成：`;
-    if (addedCount > 0) message += `新增 ${addedCount} 个班级`;
-    if (updatedCount > 0) message += `${addedCount > 0 ? '，' : ''}更新 ${updatedCount} 个班级`;
-    alert(message);
+    }
+
+    commitSelectedImportLocally();
   };
 
   const handleAddClass = () => {
@@ -262,7 +328,7 @@ const ClassManagement = () => {
   const handleEditClass = (cls) => {
     setSelectedClass(cls);
     setFormData({
-      class_no: cls.class_no,
+      class_no: normalizeClassNo(cls.class_no || cls.id),
       enrollment_year: cls.enrollment_year,
       classroom_location: cls.classroom_location || '',
       status: cls.status
@@ -277,20 +343,60 @@ const ClassManagement = () => {
 
   const handleSaveAdd = (e) => {
     e.preventDefault();
-    
-    // 生成有意义的班级ID
+    const normalizedClassNo = normalizeClassNo(formData.class_no);
+    if (!normalizedClassNo) {
+      notify('请填写班级序号');
+      return;
+    }
+
+    const existingClass = findExistingClass({
+      classes,
+      classNo: normalizedClassNo,
+      enrollmentYear: formData.enrollment_year,
+      currentAcademicYear: schoolData.config.currentAcademicYear,
+      calculateGradeLevel: schoolData.calculateGradeLevel.bind(schoolData),
+    });
+    if (existingClass) {
+      notify(`${formData.enrollment_year}级${normalizedClassNo}班已存在，请直接编辑原班级`);
+      return;
+    }
+
     const gradeInfo = schoolData.calculateGradeLevel(formData.enrollment_year);
-    const gradeNum = gradeInfo.grade;
-    const classNum = parseInt(formData.class_no) || 1;
-    
-    // 生成班级ID: 年级(1位) + 班级序号(2位) = 如 701, 702
-    let classId = gradeNum * 100 + classNum;
-    
-    // 检查是否已存在相同ID
-    let counter = 0;
-    while (schoolData.classes.some(c => c.id === classId)) {
-      counter++;
-      classId = (gradeNum * 100 + classNum) * 10 + counter;
+    const classId = allocateClassId({
+      classNo: normalizedClassNo,
+      enrollmentYear: formData.enrollment_year,
+      classes,
+      currentAcademicYear: schoolData.config.currentAcademicYear,
+      calculateGradeLevel: schoolData.calculateGradeLevel.bind(schoolData),
+    });
+
+    const saveToBackend = async () => {
+      setClassSaving(true);
+      try {
+        const payload = buildClassPayload({
+          form: { ...formData, class_no: normalizedClassNo, id: classId },
+          classes,
+          currentAcademicYear: schoolData.config.currentAcademicYear,
+          calculateGradeLevel: schoolData.calculateGradeLevel.bind(schoolData),
+        });
+        const result = await createClassRecord(payload);
+        if (result?.success === false) {
+          notify(result.message || '班级创建失败', 'warning');
+          return;
+        }
+        await refreshClasses();
+        setShowAddModal(false);
+        notify(result?.message || '班级创建成功！', 'success');
+      } catch (error) {
+        notify('班级创建失败：' + (error.message || '请稍后重试'), 'error');
+      } finally {
+        setClassSaving(false);
+      }
+    };
+
+    if (hasBackendSession()) {
+      saveToBackend();
+      return;
     }
     
     // 判断是否已毕业
@@ -300,38 +406,103 @@ const ClassManagement = () => {
     const newClass = {
       id: classId,
       ...formData,
+      class_no: normalizedClassNo,
+      name: `${formData.enrollment_year}级${normalizedClassNo}班`,
       status: isGraduated ? 'inactive' : 'active',
       head_teacher_id: null,
       created_at: new Date().toISOString().split('T')[0]
     };
     const updatedClasses = [...classes, newClass];
     setClasses(updatedClasses);
-    schoolData.classes = updatedClasses;
     setShowAddModal(false);
-    alert('班级添加成功！');
+    notify('班级添加成功！');
   };
 
-  const handleSaveEdit = (e) => {
+  const handleSaveEdit = async (e) => {
     e.preventDefault();
     if (selectedClass) {
+      const normalizedClassNo = normalizeClassNo(formData.class_no || selectedClass.class_no || selectedClass.id);
+
+      if (hasBackendSession()) {
+        setClassSaving(true);
+        try {
+          const payload = buildClassPayload({
+            form: {
+              ...selectedClass,
+              ...formData,
+              class_no: normalizedClassNo,
+              id: selectedClass.id,
+              class_code: selectedClass.class_code || selectedClass.id,
+            },
+            classes,
+            currentAcademicYear: schoolData.config.currentAcademicYear,
+            calculateGradeLevel: schoolData.calculateGradeLevel.bind(schoolData),
+          });
+          const result = selectedClass.derived_from_students
+            ? await createClassRecord(payload)
+            : await updateClassRecord(selectedClass.class_code || selectedClass.id, payload);
+          if (result?.success === false) {
+            notify(result.message || '班级信息保存失败', 'warning');
+            return;
+          }
+          await refreshClasses();
+          setShowEditModal(false);
+          notify(result?.message || '班级信息更新成功！', 'success');
+        } catch (error) {
+          notify('班级信息保存失败：' + (error.message || '请稍后重试'), 'error');
+        } finally {
+          setClassSaving(false);
+        }
+        return;
+      }
+
       const updatedClasses = classes.map(c => 
         c.id === selectedClass.id 
-          ? { ...c, ...formData }
+          ? { ...c, ...formData, class_no: normalizedClassNo, name: `${formData.enrollment_year}级${normalizedClassNo}班` }
           : c
       );
       setClasses(updatedClasses);
-      schoolData.classes = updatedClasses;
       setShowEditModal(false);
-      alert('班级信息更新成功！');
+      notify('班级信息更新成功！');
     }
   };
 
-  const handleDeleteClass = (id) => {
-    if (window.confirm('确定要删除这个班级吗？')) {
-      const updatedClasses = classes.filter(c => c.id !== id);
-      setClasses(updatedClasses);
-      schoolData.classes = updatedClasses;
+  const handleDeleteClass = async (classOrId) => {
+    const targetClass = typeof classOrId === 'object'
+      ? classOrId
+      : classes.find(item => item.id === classOrId);
+    if (!targetClass) return;
+
+    const confirmed = await confirmAction({
+      title: hasBackendSession() ? '标记班级为已毕业' : '删除班级',
+      message: hasBackendSession()
+        ? '确定要将这个班级标记为已毕业吗？历史学生、教师和成绩数据会保留。'
+        : '确定要删除这个班级吗？',
+      confirmText: hasBackendSession() ? '标记已毕业' : '删除'
+    });
+    if (!confirmed) return;
+
+    if (hasBackendSession()) {
+      if (targetClass.derived_from_students) {
+        notify('该班级来自学生档案派生，请先编辑保存为正式班级，或先调整学生班级。', 'warning');
+        return;
+      }
+      try {
+        const result = await deactivateClassRecord(targetClass.class_code || targetClass.id);
+        if (result?.success === false) {
+          notify(result.message || '班级状态更新失败', 'warning');
+          return;
+        }
+        await refreshClasses();
+        notify(result?.message || '班级已标记为已毕业', 'success');
+      } catch (error) {
+        notify('班级状态更新失败：' + (error.message || '请稍后重试'), 'error');
+      }
+      return;
     }
+
+    const updatedClasses = classes.filter(c => c.id !== targetClass.id);
+    setClasses(updatedClasses);
   };
 
   // 批量选择相关函数
@@ -351,18 +522,39 @@ const ClassManagement = () => {
     }
   };
 
-  const handleBatchDelete = () => {
+  const handleBatchDelete = async () => {
     if (selectedIds.length === 0) {
-      alert('请先选择要删除的班级');
+      notify('请先选择要删除的班级');
       return;
     }
-    if (window.confirm(`确定要删除选中的 ${selectedIds.length} 个班级吗？`)) {
-      const updatedClasses = classes.filter(c => !selectedIds.includes(c.id));
-      setClasses(updatedClasses);
-      schoolData.classes = updatedClasses;
-      setSelectedIds([]);
-      alert('批量删除成功！');
+    const confirmed = await confirmAction({
+      title: hasBackendSession() ? '批量标记已毕业' : '批量删除班级',
+      message: hasBackendSession()
+        ? `确定要将选中的 ${selectedIds.length} 个班级标记为已毕业吗？历史数据会保留。`
+        : `确定要删除选中的 ${selectedIds.length} 个班级吗？`,
+      confirmText: hasBackendSession() ? '批量标记' : '批量删除'
+    });
+    if (!confirmed) return;
+
+    if (hasBackendSession()) {
+      const targets = classes.filter(c => selectedIds.includes(c.id) && !c.derived_from_students);
+      try {
+        for (const cls of targets) {
+          await deactivateClassRecord(cls.class_code || cls.id);
+        }
+        await refreshClasses();
+        setSelectedIds([]);
+        notify(`已标记 ${targets.length} 个班级为已毕业。`, 'success');
+      } catch (error) {
+        notify('批量更新失败：' + (error.message || '请稍后重试'), 'error');
+      }
+      return;
     }
+
+    const updatedClasses = classes.filter(c => !selectedIds.includes(c.id));
+    setClasses(updatedClasses);
+    setSelectedIds([]);
+    notify('批量删除成功！');
   };
 
   const getStatusBadge = (status) => {
@@ -382,9 +574,10 @@ const ClassManagement = () => {
   };
 
   const filteredClasses = classes.filter(cls => {
-    const gradeInfo = schoolData.getClassGradeInfo(cls.id);
-    const matchSearch = cls.class_no.includes(searchTerm) || 
-                       schoolData.formatClassName(cls.id).includes(searchTerm);
+    const gradeInfo = getClassGradeInfo(cls);
+    const classNo = normalizeClassNo(cls.class_no || cls.id);
+    const matchSearch = classNo.includes(searchTerm) ||
+                       formatClassDisplayName(cls).includes(searchTerm);
     const matchGrade = !filterGrade || gradeInfo?.grade === parseInt(filterGrade);
     return matchSearch && matchGrade;
   });
@@ -404,6 +597,21 @@ const ClassManagement = () => {
           管理学校班级基础信息（班级是教务系统的核心基础数据）
         </p>
       </div>
+
+      {(classListLoading || classListError || classSyncSource === 'backend') && (
+        <div className={`mb-4 flex items-center gap-2 rounded-lg border p-3 text-sm ${
+          classListError
+            ? 'border-amber-100 bg-amber-50 text-amber-700'
+            : 'border-emerald-100 bg-emerald-50 text-emerald-700'
+        }`}>
+          {classListError ? <X className="h-4 w-4" /> : <CheckCircle className="h-4 w-4" />}
+          <span>
+            {classListLoading
+              ? '正在同步后端班级库...'
+              : classListError || '已连接后端班级库，班级基础数据来自数据库。'}
+          </span>
+        </div>
+      )}
 
       {/* 统计卡片 */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
@@ -479,7 +687,7 @@ const ClassManagement = () => {
                 className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700"
               >
                 <Trash2 className="w-4 h-4" />
-                批量删除 ({selectedIds.length})
+                {backendSessionActive ? '批量标记已毕业' : '批量删除'} ({selectedIds.length})
               </button>
             )}
             <button 
@@ -536,7 +744,7 @@ const ClassManagement = () => {
           </thead>
           <tbody className="divide-y divide-gray-200">
             {filteredClasses.map((cls) => {
-              const gradeInfo = schoolData.getClassGradeInfo(cls.id);
+              const gradeInfo = getClassGradeInfo(cls);
               return (
                 <tr key={cls.id} className="hover:bg-gray-50">
                   <td className="px-6 py-4 whitespace-nowrap">
@@ -553,7 +761,12 @@ const ClassManagement = () => {
                   </td>
                   <td className="px-6 py-4 text-sm text-gray-900">{cls.id}</td>
                   <td className="px-6 py-4 text-sm font-bold text-blue-600">
-                    {schoolData.formatClassName(cls.id)}
+                    {formatClassDisplayName(cls)}
+                    {cls.derived_from_students && (
+                      <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-700">
+                        学生档案派生
+                      </span>
+                    )}
                   </td>
                   <td className="px-6 py-4 text-sm text-gray-500">{cls.enrollment_year}</td>
                   <td className="px-6 py-4 text-sm text-gray-500">
@@ -589,7 +802,7 @@ const ClassManagement = () => {
                         onClick={(e) => {
                           e.preventDefault();
                           e.stopPropagation();
-                          handleDeleteClass(cls.id);
+                          handleDeleteClass(cls);
                         }}
                         className="text-red-600 hover:text-red-900"
                         title="删除"
@@ -663,9 +876,14 @@ const ClassManagement = () => {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                  disabled={classSaving}
+                  className={`px-4 py-2 rounded-lg ${
+                    classSaving
+                      ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                      : 'bg-blue-600 text-white hover:bg-blue-700'
+                  }`}
                 >
-                  保存
+                  {classSaving ? '保存中...' : '保存'}
                 </button>
               </div>
             </form>
@@ -738,9 +956,14 @@ const ClassManagement = () => {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                  disabled={classSaving}
+                  className={`px-4 py-2 rounded-lg ${
+                    classSaving
+                      ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                      : 'bg-blue-600 text-white hover:bg-blue-700'
+                  }`}
                 >
-                  保存
+                  {classSaving ? '保存中...' : '保存'}
                 </button>
               </div>
             </form>
@@ -754,7 +977,7 @@ const ClassManagement = () => {
           <div className="bg-white rounded-lg w-full max-w-md p-6">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-xl font-bold text-gray-800">
-                {schoolData.formatClassName(selectedClass.id)}
+                {formatClassDisplayName(selectedClass)}
               </h2>
               <button onClick={() => setShowDetailModal(false)}>
                 <X className="w-6 h-6 text-gray-400 hover:text-gray-600" />
@@ -762,13 +985,13 @@ const ClassManagement = () => {
             </div>
             
             {(() => {
-              const gradeInfo = schoolData.getClassGradeInfo(selectedClass.id);
+              const gradeInfo = getClassGradeInfo(selectedClass);
               return (
                 <div className="space-y-4">
                   <div className="grid grid-cols-2 gap-4 p-4 bg-gray-50 rounded-lg">
                     <div>
                       <p className="text-sm text-gray-500">班级名称</p>
-                      <p className="font-bold text-blue-600">{schoolData.formatClassName(selectedClass.id)}</p>
+                      <p className="font-bold text-blue-600">{formatClassDisplayName(selectedClass)}</p>
                     </div>
                     <div>
                       <p className="text-sm text-gray-500">入学年份</p>
@@ -828,7 +1051,7 @@ const ClassManagement = () => {
                   <div>
                     <p className="text-sm font-medium text-blue-900">下载导入模板</p>
                     <p className="text-xs text-blue-700 mt-1">请使用标准模板格式导入班级基础信息</p>
-                    <button 
+                    <button
                       onClick={downloadTemplate}
                       className="mt-2 text-xs bg-blue-600 text-white px-3 py-1.5 rounded hover:bg-blue-700 flex items-center gap-1"
                     >
@@ -838,7 +1061,7 @@ const ClassManagement = () => {
                   </div>
                 </div>
               </div>
-              <div 
+              <div
                 className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center cursor-pointer hover:border-blue-400 hover:bg-blue-50 transition-colors"
                 onClick={() => fileInputRef.current?.click()}
               >
@@ -846,23 +1069,27 @@ const ClassManagement = () => {
                 <p className="text-sm text-gray-600">
                   {importFile ? importFile.name : '点击或拖拽文件到此处上传'}
                 </p>
-                <p className="text-xs text-gray-400 mt-1">支持 CSV、Excel 格式</p>
-                <input 
+                <p className="text-xs text-gray-400 mt-1">支持 CSV、TSV 文本格式</p>
+                <input
                   ref={fileInputRef}
-                  type="file" 
-                  accept=".csv,.xlsx,.xls" 
-                  className="hidden" 
+                  type="file"
+                  accept=".csv,.tsv,.txt"
+                  className="hidden"
                   onChange={(e) => setImportFile(e.target.files[0])}
                 />
               </div>
               <div className="flex justify-end gap-3">
                 <button onClick={() => {setShowImportModal(false); setImportFile(null);}} className="px-4 py-2 border border-gray-300 rounded-lg">取消</button>
-                <button 
+                <button
                   onClick={handleImportPreview}
-                  disabled={!importFile}
-                  className={`px-4 py-2 rounded-lg ${importFile ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-gray-300 text-gray-500 cursor-not-allowed'}`}
+                  disabled={classImporting}
+                  className={`px-4 py-2 rounded-lg ${
+                    classImporting
+                      ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                      : 'bg-blue-600 text-white hover:bg-blue-700'
+                  }`}
                 >
-                  预览导入
+                  {classImporting ? '处理中...' : '预览导入'}
                 </button>
               </div>
             </div>
@@ -881,7 +1108,11 @@ const ClassManagement = () => {
           { key: 'class_no', label: '班级序号' },
           { key: 'enrollment_year', label: '入学年份' },
           { key: 'classroom_location', label: '教室位置' },
-          { key: 'status', label: '状态' }
+          {
+            key: 'status',
+            label: '状态',
+            render: value => value === 'inactive' ? '已毕业' : '在读'
+          }
         ]}
       />
     </div>

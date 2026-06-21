@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useState, useEffect } from 'react';
 import {
   Plus,
   Search,
@@ -9,13 +9,25 @@ import {
   CheckCircle,
   Download,
   Upload,
-  FileSpreadsheet,
   Square,
   CheckSquare,
-  GraduationCap,
-  RefreshCw
+  GraduationCap
 } from 'lucide-react';
-import schoolData from '../data/schoolData';
+import {
+  addLocalSubject,
+  createSubject,
+  deleteLocalSubjects,
+  deleteSubject,
+  deleteSubjects,
+  getLocalSubjectRows,
+  loadSubjectCatalog,
+  normalizeSubjectList,
+  shouldUseLocalSubjectFallback,
+  syncSubjectRowsToSchoolData,
+  updateLocalSubject,
+  updateSubject
+} from '../lib/subjectCatalog';
+import { notify, notifyError, notifySuccess, notifyWarning } from '../lib/notify';
 import SmartImportModal from './SmartImportModal';
 import ConfirmDialog from './ConfirmDialog';
 
@@ -29,6 +41,9 @@ const SubjectManagement = () => {
   const [formData, setFormData] = useState({ name: '', code: '', description: '' });
   const [selectedIds, setSelectedIds] = useState([]);
   const [importFile, setImportFile] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [dataSource, setDataSource] = useState('local');
   const fileInputRef = React.useRef(null);
   
   // 智能导入相关状态
@@ -36,15 +51,72 @@ const SubjectManagement = () => {
   const [importPreviewData, setImportPreviewData] = useState([]);
   const [confirmState, setConfirmState] = useState({ open: false, title: '', message: '', onConfirm: null });
 
-  useEffect(() => {
-    // 从schoolData加载学科列表
-    setSubjects(schoolData.subjects.map((name, index) => ({
-      id: index + 1,
-      name: name,
-      code: name.substring(0, 2).toUpperCase(),
-      description: ''
-    })));
+  const loadSubjects = useCallback(async ({ silent = false } = {}) => {
+    if (!silent) setLoading(true);
+    try {
+      const result = await loadSubjectCatalog();
+      setSubjects(result.subjects);
+      setDataSource(result.source);
+      if (result.source === 'local' && !silent) {
+        notifyWarning('后端学科接口暂不可用，当前使用本地数据');
+      }
+    } catch (error) {
+      setSubjects(getLocalSubjectRows());
+      setDataSource('local');
+      if (!silent) notifyError(error.message || '学科数据加载失败');
+    } finally {
+      if (!silent) setLoading(false);
+    }
   }, []);
+
+  useEffect(() => {
+    loadSubjects();
+  }, [loadSubjects]);
+
+  useEffect(() => {
+    setSelectedIds(prev => prev.filter(id => subjects.some(subject => Number(subject.id) === Number(id))));
+  }, [subjects]);
+
+  const getPayloadFromForm = () => ({
+    name: formData.name.trim(),
+    code: formData.code.trim(),
+    description: formData.description.trim()
+  });
+
+  const hasDuplicateSubjectName = (name, ignoreId = null, list = subjects) => (
+    list.some(subject => (
+      subject.name === name && (ignoreId === null || Number(subject.id) !== Number(ignoreId))
+    ))
+  );
+
+  const applyApiSubjects = (nextSubjects) => {
+    const normalized = normalizeSubjectList(nextSubjects);
+    syncSubjectRowsToSchoolData(normalized);
+    setSubjects(normalized);
+    setDataSource('api');
+    return normalized;
+  };
+
+  const applyLocalSubjects = (nextSubjects) => {
+    const normalized = normalizeSubjectList(nextSubjects);
+    syncSubjectRowsToSchoolData(normalized);
+    setSubjects(normalized);
+    setDataSource('local');
+    return normalized;
+  };
+
+  const runWithLocalFallback = async ({ apiAction, localAction }) => {
+    try {
+      return { value: await apiAction(), localOnly: false };
+    } catch (error) {
+      if (!shouldUseLocalSubjectFallback(error)) {
+        notifyError(error.message || '操作失败');
+        return null;
+      }
+      notifyWarning('后端暂不可用，已保存到本地数据');
+      return { value: localAction(), localOnly: true };
+    }
+  };
 
   // 下载导入模板
   const downloadTemplate = () => {
@@ -96,7 +168,7 @@ const SubjectManagement = () => {
     });
 
     if (lines.length < 2) {
-      alert('文件格式错误');
+      notify('文件格式错误');
       return;
     }
 
@@ -111,14 +183,7 @@ const SubjectManagement = () => {
 
         if (!name) continue;
 
-        // 查找是否已存在
-        const existingIndex = schoolData.subjects.indexOf(name);
-        const existingSubject = existingIndex !== -1 ? {
-          id: existingIndex + 1,
-          name: name,
-          code: name.substring(0, 2).toUpperCase(),
-          description: ''
-        } : null;
+        const existingSubject = subjects.find(subject => subject.name === name);
 
         if (existingSubject) {
           // 检查是否有变化（学科管理主要检查名称是否存在）
@@ -142,38 +207,61 @@ const SubjectManagement = () => {
   };
 
   // 确认智能导入
-  const handleConfirmImport = (selectedData) => {
+  const handleConfirmImport = async (selectedData) => {
     let addedCount = 0;
     let skippedCount = 0;
+    let failedCount = 0;
+    let forceLocal = dataSource === 'local';
+    let nextSubjects = subjects;
 
-    selectedData.forEach(item => {
-      if (item.type === 'new') {
-        // 检查是否已存在（再次检查避免重复）
-        if (!schoolData.subjects.includes(item.data.name)) {
-          schoolData.subjects.push(item.data.name);
+    setSaving(true);
+    for (const item of selectedData) {
+      if (item.type !== 'new') {
+        skippedCount++;
+        continue;
+      }
+
+      if (hasDuplicateSubjectName(item.data.name, null, nextSubjects)) {
+        skippedCount++;
+        continue;
+      }
+
+      if (forceLocal) {
+        nextSubjects = addLocalSubject(nextSubjects, item.data);
+        addedCount++;
+        continue;
+      }
+
+      try {
+        const created = await createSubject(item.data);
+        nextSubjects = normalizeSubjectList([...nextSubjects, created]);
+        addedCount++;
+      } catch (error) {
+        if (shouldUseLocalSubjectFallback(error)) {
+          forceLocal = true;
+          nextSubjects = addLocalSubject(nextSubjects, item.data);
           addedCount++;
         } else {
-          skippedCount++;
+          failedCount++;
+          notifyError(error.message || `导入 ${item.data.name} 失败`);
         }
-      } else {
-        skippedCount++;
       }
-    });
+    }
+    setSaving(false);
 
-    // 刷新列表
-    setSubjects(schoolData.subjects.map((name, index) => ({
-      id: index + 1,
-      name: name,
-      code: name.substring(0, 2).toUpperCase(),
-      description: ''
-    })));
-
+    if (forceLocal) {
+      applyLocalSubjects(nextSubjects);
+    } else {
+      applyApiSubjects(nextSubjects);
+    }
     setShowSmartImport(false);
     setImportFile(null);
 
     let message = `导入完成：新增 ${addedCount} 个学科`;
     if (skippedCount > 0) message += `，跳过 ${skippedCount} 个（已存在）`;
-    alert(message);
+    if (failedCount > 0) message += `，失败 ${failedCount} 个`;
+    if (forceLocal) message += '，当前为本地兜底保存';
+    notify(message);
   };
 
   const handleAddSubject = () => {
@@ -187,48 +275,67 @@ const SubjectManagement = () => {
     setShowEditModal(true);
   };
 
-  const handleSaveAdd = (e) => {
+  const handleSaveAdd = async (e) => {
     e.preventDefault();
-    if (!formData.name.trim()) {
-      alert('学科名称不能为空');
+    const payload = getPayloadFromForm();
+    if (!payload.name) {
+      notify('学科名称不能为空');
       return;
     }
 
-    // 检查是否已存在
-    if (schoolData.subjects.includes(formData.name)) {
-      alert('该学科已存在');
+    if (hasDuplicateSubjectName(payload.name)) {
+      notify('该学科已存在');
       return;
     }
 
-    schoolData.subjects.push(formData.name);
-    setSubjects([...subjects, {
-      id: subjects.length + 1,
-      name: formData.name,
-      code: formData.code || formData.name.substring(0, 2).toUpperCase(),
-      description: formData.description
-    }]);
+    setSaving(true);
+    const result = await runWithLocalFallback({
+      apiAction: () => createSubject(payload),
+      localAction: () => addLocalSubject(subjects, payload)
+    });
+    setSaving(false);
+    if (!result) return;
+
+    if (result.localOnly) {
+      applyLocalSubjects(result.value);
+    } else {
+      applyApiSubjects([...subjects, result.value]);
+    }
     setShowAddModal(false);
-    alert('学科添加成功！');
+    notifySuccess(result.localOnly ? '学科已保存到本地' : '学科添加成功');
   };
 
-  const handleSaveEdit = (e) => {
+  const handleSaveEdit = async (e) => {
     e.preventDefault();
-    if (selectedSubject) {
-      // 更新schoolData中的学科名称
-      const index = schoolData.subjects.indexOf(selectedSubject.name);
-      if (index !== -1) {
-        schoolData.subjects[index] = formData.name;
-      }
+    if (!selectedSubject) return;
 
-      const updatedSubjects = subjects.map(s => 
-        s.id === selectedSubject.id 
-          ? { ...s, name: formData.name, code: formData.code, description: formData.description }
-          : s
-      );
-      setSubjects(updatedSubjects);
-      setShowEditModal(false);
-      alert('学科信息更新成功！');
+    const payload = getPayloadFromForm();
+    if (!payload.name) {
+      notify('学科名称不能为空');
+      return;
     }
+    if (hasDuplicateSubjectName(payload.name, selectedSubject.id)) {
+      notify('该学科已存在');
+      return;
+    }
+
+    setSaving(true);
+    const result = await runWithLocalFallback({
+      apiAction: () => updateSubject(selectedSubject.id, payload),
+      localAction: () => updateLocalSubject(subjects, selectedSubject.id, payload)
+    });
+    setSaving(false);
+    if (!result) return;
+
+    if (result.localOnly) {
+      applyLocalSubjects(result.value);
+    } else {
+      applyApiSubjects(subjects.map(subject => (
+        Number(subject.id) === Number(selectedSubject.id) ? result.value : subject
+      )));
+    }
+    setShowEditModal(false);
+    notifySuccess(result.localOnly ? '学科已保存到本地' : '学科信息更新成功');
   };
 
   const closeConfirm = () => {
@@ -239,15 +346,22 @@ const SubjectManagement = () => {
     setConfirmState({ open: true, title, message, onConfirm });
   };
 
-  const deleteSubjectById = (id) => {
-    const subject = subjects.find(s => s.id === id);
-    if (subject) {
-      const index = schoolData.subjects.indexOf(subject.name);
-      if (index !== -1) {
-        schoolData.subjects.splice(index, 1);
-      }
+  const deleteSubjectById = async (id) => {
+    setSaving(true);
+    const result = await runWithLocalFallback({
+      apiAction: () => deleteSubject(id),
+      localAction: () => deleteLocalSubjects(subjects, [id])
+    });
+    setSaving(false);
+    if (!result) return;
+
+    if (result.localOnly) {
+      applyLocalSubjects(result.value);
+    } else {
+      const nextSubjects = subjects.filter(s => Number(s.id) !== Number(id));
+      applyApiSubjects(nextSubjects);
     }
-    setSubjects(subjects.filter(s => s.id !== id));
+    notifySuccess(result.localOnly ? '学科已从本地删除' : '学科删除成功');
   };
 
   const handleDeleteSubject = (id) => {
@@ -277,40 +391,59 @@ const SubjectManagement = () => {
 
   const handleBatchDelete = () => {
     if (selectedIds.length === 0) {
-      alert('请先选择要删除的学科');
+      notify('请先选择要删除的学科');
       return;
     }
     openConfirm({
       title: '批量删除学科',
       message: `确定要删除选中的 ${selectedIds.length} 个学科吗？`,
-      onConfirm: () => {
-        selectedIds.forEach(id => {
-          const subject = subjects.find(s => s.id === id);
-          if (subject) {
-            const index = schoolData.subjects.indexOf(subject.name);
-            if (index !== -1) {
-              schoolData.subjects.splice(index, 1);
-            }
-          }
+      onConfirm: async () => {
+        setSaving(true);
+        const ids = [...selectedIds];
+        const result = await runWithLocalFallback({
+          apiAction: () => deleteSubjects(ids),
+          localAction: () => deleteLocalSubjects(subjects, ids)
         });
-        setSubjects(subjects.filter(s => !selectedIds.includes(s.id)));
+        setSaving(false);
+        if (!result) return;
+
+        if (result.localOnly) {
+          applyLocalSubjects(result.value);
+        } else {
+          const idSet = new Set(ids.map(id => Number(id)));
+          applyApiSubjects(subjects.filter(subject => !idSet.has(Number(subject.id))));
+        }
         setSelectedIds([]);
-        alert('批量删除成功！');
+        notifySuccess(result.localOnly ? '已从本地批量删除' : '批量删除成功');
       }
     });
   };
 
-  const filteredSubjects = subjects.filter(s => 
-    s.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    s.code.toLowerCase().includes(searchTerm.toLowerCase())
+  const searchKeyword = searchTerm.trim().toLowerCase();
+  const filteredSubjects = subjects.filter(s =>
+    s.name.toLowerCase().includes(searchKeyword) ||
+    s.code.toLowerCase().includes(searchKeyword)
   );
 
   return (
     <div className="min-h-screen bg-gray-50 p-6">
       {/* 页面标题 */}
-      <div className="mb-6">
-        <h1 className="text-2xl font-bold text-gray-800">学科管理</h1>
-        <p className="text-gray-500 mt-1">管理系统学科信息，用于教师任教科目和课程设置</p>
+      <div className="mb-6 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-800">学科管理</h1>
+          <p className="text-gray-500 mt-1">管理系统学科信息，用于教师任教科目和课程设置</p>
+        </div>
+        <div className="flex items-center gap-2 text-xs">
+          <span className={`rounded-full border px-3 py-1 font-medium ${
+            dataSource === 'api'
+              ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+              : 'border-amber-200 bg-amber-50 text-amber-700'
+          }`}>
+            {dataSource === 'api' ? '后端同步' : '本地兜底'}
+          </span>
+          {loading ? <span className="text-gray-500">加载中...</span> : null}
+          {saving ? <span className="text-blue-600">保存中...</span> : null}
+        </div>
       </div>
 
       {/* 统计卡片 */}
@@ -373,34 +506,41 @@ const SubjectManagement = () => {
             {selectedIds.length > 0 && (
               <button 
                 type="button"
+                disabled={saving || loading}
                 onClick={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
                   handleBatchDelete();
                 }}
-                className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700"
+                className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 <Trash2 className="w-4 h-4" />
                 批量删除 ({selectedIds.length})
               </button>
             )}
             <button 
+              type="button"
+              disabled={saving || loading}
               onClick={() => setShowImportModal(true)}
-              className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50"
+              className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              <Upload className="w-4 h-4" />
+              <Download className="w-4 h-4" />
               导入
             </button>
             <button 
+              type="button"
+              disabled={saving || loading || filteredSubjects.length === 0}
               onClick={exportData}
-              className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50"
+              className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              <Download className="w-4 h-4" />
+              <Upload className="w-4 h-4" />
               导出
             </button>
             <button 
+              type="button"
+              disabled={saving || loading}
               onClick={handleAddSubject} 
-              className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700"
+              className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
             >
               <Plus className="w-4 h-4" />
               添加学科
@@ -416,8 +556,10 @@ const SubjectManagement = () => {
             <tr>
               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">
                 <button 
+                  type="button"
+                  disabled={loading || filteredSubjects.length === 0}
                   onClick={toggleSelectAll}
-                  className="flex items-center gap-2 hover:text-blue-600"
+                  className="flex items-center gap-2 hover:text-blue-600 disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   {selectedIds.length === filteredSubjects.length && filteredSubjects.length > 0 ? (
                     <CheckSquare className="w-4 h-4" />
@@ -435,12 +577,26 @@ const SubjectManagement = () => {
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-200">
-            {filteredSubjects.map((subject) => (
+            {loading ? (
+              <tr>
+                <td colSpan={6} className="px-6 py-10 text-center text-sm text-gray-500">
+                  正在加载学科目录...
+                </td>
+              </tr>
+            ) : filteredSubjects.length === 0 ? (
+              <tr>
+                <td colSpan={6} className="px-6 py-10 text-center text-sm text-gray-500">
+                  没有符合条件的学科
+                </td>
+              </tr>
+            ) : filteredSubjects.map((subject) => (
               <tr key={subject.id} className="hover:bg-gray-50">
                 <td className="px-6 py-4 whitespace-nowrap">
                   <button 
+                    type="button"
+                    disabled={saving}
                     onClick={() => toggleSelect(subject.id)}
-                    className="text-gray-400 hover:text-blue-600"
+                    className="text-gray-400 hover:text-blue-600 disabled:cursor-not-allowed disabled:opacity-60"
                   >
                     {selectedIds.includes(subject.id) ? (
                       <CheckSquare className="w-5 h-5 text-blue-600" />
@@ -456,23 +612,26 @@ const SubjectManagement = () => {
                 <td className="px-6 py-4">
                   <div className="flex items-center gap-2">
                     <button 
+                      type="button"
+                      disabled={saving}
                       onClick={(e) => {
                         e.stopPropagation();
                         handleEditSubject(subject);
                       }}
-                      className="text-gray-600 hover:text-gray-900"
+                      className="text-gray-600 hover:text-gray-900 disabled:cursor-not-allowed disabled:opacity-60"
                       title="编辑"
                     >
                       <Edit className="w-4 h-4" />
                     </button>
                     <button 
                       type="button"
+                      disabled={saving}
                       onClick={(e) => {
                         e.preventDefault();
                         e.stopPropagation();
                         handleDeleteSubject(subject.id);
                       }}
-                      className="text-red-600 hover:text-red-900"
+                      className="text-red-600 hover:text-red-900 disabled:cursor-not-allowed disabled:opacity-60"
                       title="删除"
                     >
                       <Trash2 className="w-4 h-4" />
@@ -530,16 +689,18 @@ const SubjectManagement = () => {
               <div className="flex justify-end gap-3 mt-6">
                 <button
                   type="button"
+                  disabled={saving}
                   onClick={() => setShowAddModal(false)}
-                  className="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50"
+                  className="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   取消
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                  disabled={saving}
+                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  保存
+                  {saving ? '保存中...' : '保存'}
                 </button>
               </div>
             </form>
@@ -589,16 +750,18 @@ const SubjectManagement = () => {
               <div className="flex justify-end gap-3 mt-6">
                 <button
                   type="button"
+                  disabled={saving}
                   onClick={() => setShowEditModal(false)}
-                  className="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50"
+                  className="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   取消
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                  disabled={saving}
+                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  保存
+                  {saving ? '保存中...' : '保存'}
                 </button>
               </div>
             </form>
@@ -649,31 +812,36 @@ const SubjectManagement = () => {
               </div>
               <div className="flex justify-between items-center">
                 <button
+                  type="button"
+                  disabled={saving}
                   onClick={downloadTemplate}
-                  className="flex items-center gap-2 text-blue-600 hover:text-blue-800 text-sm"
+                  className="flex items-center gap-2 text-blue-600 hover:text-blue-800 text-sm disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   <Download className="w-4 h-4" />
                   下载模板
                 </button>
                 <div className="flex gap-3">
                   <button
+                    type="button"
+                    disabled={saving || !importFile}
                     onClick={() => {setShowImportModal(false); setImportFile(null);}}
-                    className="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50"
+                    className="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60"
                   >
                     取消
                   </button>
                   <button
+                    type="button"
+                    disabled={saving}
                     onClick={() => {
                       if (importFile) {
                         const reader = new FileReader();
                         reader.onload = (ev) => handleImportPreview(ev.target.result);
                         reader.readAsText(importFile);
                       } else {
-                        alert('请先选择文件');
+                        notify('请先选择文件');
                       }
                     }}
-                    disabled={!importFile}
-                    className={`px-4 py-2 rounded-lg ${importFile ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-gray-300 text-gray-500 cursor-not-allowed'}`}
+                    className="px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-gray-300 disabled:text-gray-500 disabled:opacity-100"
                   >
                     预览导入
                   </button>

@@ -7,7 +7,7 @@ import {
   GraduationCap,
   School,
   Calendar,
-  Download,
+  Upload,
   X,
   Filter,
   ChevronLeft,
@@ -16,8 +16,11 @@ import {
   Building2
 } from 'lucide-react';
 import schoolData from '../data/schoolData';
+import { notify } from '../lib/notify';
+import { useConfirm } from './ui/confirm';
 
 const EarlyAdmissionManagement = () => {
+  const { confirm: confirmAction } = useConfirm();
   const [students, setStudents] = useState([]);
   const [earlyAdmissions, setEarlyAdmissions] = useState([]);
   const [schools, setSchools] = useState([]);
@@ -55,31 +58,36 @@ const EarlyAdmissionManagement = () => {
   // 添加学校
   const handleAddSchool = () => {
     if (!newSchoolName.trim()) {
-      alert('请输入学校名称');
+      notify('请输入学校名称');
       return;
     }
     if (schools.includes(newSchoolName.trim())) {
-      alert('该学校已存在');
+      notify('该学校已存在');
       return;
     }
     const updatedSchools = [...schools, newSchoolName.trim()];
     saveSchools(updatedSchools);
     setNewSchoolName('');
-    alert('添加成功');
+    notify('添加成功');
   };
 
   // 删除学校
-  const handleDeleteSchool = (schoolName) => {
+  const handleDeleteSchool = async (schoolName) => {
     // 检查是否有学生被该学校录取
     const hasStudents = earlyAdmissions.some(a => a.school_name === schoolName);
     if (hasStudents) {
-      alert('无法删除，已有学生被该学校录取');
+      notify('无法删除，已有学生被该学校录取');
       return;
     }
-    if (window.confirm(`确定要删除学校 "${schoolName}" 吗？`)) {
-      const updatedSchools = schools.filter(s => s !== schoolName);
-      saveSchools(updatedSchools);
-    }
+    const confirmed = await confirmAction({
+      title: '删除录取学校',
+      message: `确定要删除学校 "${schoolName}" 吗？`,
+      confirmText: '删除'
+    });
+    if (!confirmed) return;
+
+    const updatedSchools = schools.filter(s => s !== schoolName);
+    saveSchools(updatedSchools);
   };
 
   // 获取已提前招生的学生ID列表
@@ -176,11 +184,11 @@ const EarlyAdmissionManagement = () => {
   // 保存记录
   const handleSave = () => {
     if (!formData.student_id) {
-      alert('请选择学生');
+      notify('请选择学生');
       return;
     }
     if (!formData.school_name) {
-      alert('请选择录取学校');
+      notify('请选择录取学校');
       return;
     }
 
@@ -190,7 +198,7 @@ const EarlyAdmissionManagement = () => {
     );
     if (existingAdmission) {
       const student = getStudentInfo(parseInt(formData.student_id));
-      alert(`学生 "${student?.name}" 已被 "${existingAdmission.school_name}" 录取，不能重复添加`);
+      notify(`学生 "${student?.name}" 已被 "${existingAdmission.school_name}" 录取，不能重复添加`);
       return;
     }
 
@@ -217,16 +225,21 @@ const EarlyAdmissionManagement = () => {
     }
 
     setShowModal(false);
-    alert(editingRecord ? '更新成功' : '添加成功');
+    notify(editingRecord ? '更新成功' : '添加成功');
   };
 
   // 删除记录
-  const handleDelete = (id) => {
-    if (window.confirm('确定要删除这条提前招生记录吗？')) {
-      const updatedAdmissions = earlyAdmissions.filter(a => a.id !== id);
-      setEarlyAdmissions(updatedAdmissions);
-      schoolData.earlyAdmissions = updatedAdmissions;
-    }
+  const handleDelete = async (id) => {
+    const confirmed = await confirmAction({
+      title: '删除提前招生记录',
+      message: '确定要删除这条提前招生记录吗？',
+      confirmText: '删除'
+    });
+    if (!confirmed) return;
+
+    const updatedAdmissions = earlyAdmissions.filter(a => a.id !== id);
+    setEarlyAdmissions(updatedAdmissions);
+    schoolData.earlyAdmissions = updatedAdmissions;
   };
 
   // 导出提前招生名单
@@ -364,7 +377,7 @@ const EarlyAdmissionManagement = () => {
               onClick={exportEarlyAdmissions}
               className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50"
             >
-              <Download className="w-4 h-4" />
+              <Upload className="w-4 h-4" />
               导出名单
             </button>
             <button

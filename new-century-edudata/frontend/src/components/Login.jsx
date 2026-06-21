@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { School, User, Lock, Eye, EyeOff, Loader2 } from 'lucide-react';
+import { loginUser } from '../lib/auth';
+import { getDefaultPathForRole, getUserRole } from '../lib/navigation';
 
 const Login = () => {
   const navigate = useNavigate();
@@ -16,25 +18,15 @@ const Login = () => {
     setError('');
 
     try {
-      // 模拟登录请求
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      
-      // 模拟成功登录
-      if (username && password) {
-        const userData = {
-          username,
-          real_name: '李主任',
-          role_name: '教务处主任',
-          permission_code: 'edu_admin'
-        };
-        localStorage.setItem('user', JSON.stringify(userData));
-        localStorage.setItem('token', 'mock_token_' + Date.now());
-        navigate('/dashboard');
-      } else {
+      if (!username.trim() || !password) {
         setError('请输入用户名和密码');
+        return;
       }
+
+      const userData = await loginUser({ username, password });
+      navigate(getDefaultPathForRole(getUserRole(userData)));
     } catch (err) {
-      setError('登录失败，请检查用户名和密码');
+      setError(err?.message || '登录失败，请检查用户名和密码');
     } finally {
       setLoading(false);
     }

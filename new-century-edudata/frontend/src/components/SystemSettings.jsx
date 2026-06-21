@@ -1,14 +1,26 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useState, useEffect } from 'react';
 import { 
-  Settings, Shield, Users, Database, Bell, Mail, 
-  Save, RefreshCw, CheckCircle, AlertTriangle, 
-  Key, Lock, Eye, EyeOff, ChevronRight, Server,
-  FileText, Download, Upload, Trash2, Plus, X,
-  GraduationCap, Calendar, ArrowUpCircle, AlertCircle
+  Settings, Shield, Users, Database, Bell,
+  Save, RefreshCw, CheckCircle,
+  Download, Upload, Trash2, X,
+  Calendar, ArrowUpCircle, AlertCircle
 } from 'lucide-react';
 import schoolData from '../data/schoolData';
+import { notify } from '../lib/notify';
+import {
+  DEFAULT_ROLE_SETTINGS,
+  ROLE_COLOR_CLASSES,
+  ROLE_PERMISSION_OPTIONS,
+  buildRoleImport,
+  downloadRoleImportTemplate,
+  mergeRoleSettings,
+  parseRoleImportText,
+  sortRoleSettings,
+} from '../lib/roleImport';
+import { useConfirm } from './ui/confirm';
 
 const SystemSettings = () => {
+  const { confirm: confirmAction } = useConfirm();
   const [activeTab, setActiveTab] = useState('general');
   const [loading, setLoading] = useState(false);
   const [saveStatus, setSaveStatus] = useState(null);
@@ -69,22 +81,10 @@ const SystemSettings = () => {
 
   // 从schoolData加载角色
   const [roles, setRoles] = useState([]);
+  const [roleImporting, setRoleImporting] = useState(false);
   
-  useEffect(() => {
-    // 转换schoolData中的角色定义
-    const teacherRoles = schoolData.teacherRoles.map(role => ({
-      id: role.id,
-      name: role.name,
-      color: getRoleColor(role.id),
-      level: role.level,
-      permissions: role.permissions,
-      userCount: schoolData.teachers.filter(t => t.roles?.includes(role.id)).length
-    }));
-    setRoles(teacherRoles);
-  }, []);
-
   // 获取角色对应的颜色
-  const getRoleColor = (roleId) => {
+  const getRoleColor = useCallback((roleId) => {
     const colorMap = {
       'subject_teacher': 'cyan',
       'head_teacher': 'green',
@@ -99,7 +99,31 @@ const SystemSettings = () => {
       'admin': 'slate'
     };
     return colorMap[roleId] || 'gray';
-  };
+  }, []);
+
+  const toRoleRows = useCallback((sourceRoles) => mergeRoleSettings({
+    existingRoles: sourceRoles,
+    includeDefaults: true,
+  }).map(role => ({
+    ...role,
+    color: role.color || getRoleColor(role.id),
+    permissions: role.permissions || [],
+    userCount: schoolData.teachers.filter(t => t.roles?.includes(role.id)).length
+  })), [getRoleColor]);
+
+  const persistRoles = useCallback((nextRoles) => {
+    const persistedRoles = mergeRoleSettings({
+      existingRoles: nextRoles,
+      includeDefaults: true,
+    }).map(({ userCount, ...role }) => role);
+    schoolData.teacherRoles = persistedRoles;
+    setRoles(toRoleRows(persistedRoles));
+    return persistedRoles;
+  }, [toRoleRows]);
+
+  useEffect(() => {
+    persistRoles(Array.isArray(schoolData.teacherRoles) ? schoolData.teacherRoles : []);
+  }, [persistRoles]);
 
   const [showRoleModal, setShowRoleModal] = useState(false);
   const [editingRole, setEditingRole] = useState(null);
@@ -173,7 +197,7 @@ const SystemSettings = () => {
     }));
     
     setShowUpgradeModal(false);
-    alert(result.message);
+    notify(result.message);
   };
 
   // 切换学期
@@ -193,20 +217,61 @@ const SystemSettings = () => {
       currentSemester: schoolData.config.currentSemester === 1 ? '第一学期' : '第二学期'
     }));
     
-    alert(result.message);
+    notify(result.message);
   };
 
-  const handleBackupNow = async () => {
-    if (window.confirm('确定要立即执行数据备份吗？')) {
-      setLoading(true);
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      setBackupSettings({
-        ...backupSettings,
-        lastBackup: new Date().toLocaleString('zh-CN')
-      });
-      setLoading(false);
-      window.alert('备份完成！');
-    }
+  const handleImportDataFile = (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = async (readerEvent) => {
+      try {
+        const data = JSON.parse(readerEvent.target.result);
+        const confirmed = await confirmAction({
+          title: '导入并覆盖数据',
+          message: '确定要导入数据吗？这将覆盖当前所有数据！',
+          confirmText: '导入覆盖'
+        });
+        if (!confirmed) return;
+
+        Object.assign(schoolData, data);
+        setSaveStatus({ type: 'success', message: '数据导入成功！请刷新页面。' });
+        setTimeout(() => {
+          window.location.reload();
+        }, 2000);
+      } catch (error) {
+        setSaveStatus({ type: 'error', message: '数据格式错误：' + error.message });
+      } finally {
+        event.target.value = '';
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const handleClearAllData = async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    const firstConfirmed = await confirmAction({
+      title: '清除所有数据',
+      message: '确定要清除所有数据吗？此操作无法撤销！',
+      confirmText: '继续'
+    });
+    if (!firstConfirmed) return;
+
+    const secondConfirmed = await confirmAction({
+      title: '再次确认清除',
+      message: '再次确认：您真的要删除所有数据吗？',
+      confirmText: '删除全部'
+    });
+    if (!secondConfirmed) return;
+
+    localStorage.removeItem('new_century_school_data');
+    setSaveStatus({ type: 'success', message: '数据已清除，页面将刷新...' });
+    setTimeout(() => {
+      window.location.reload();
+    }, 2000);
   };
 
   const colorOptions = [
@@ -223,31 +288,83 @@ const SystemSettings = () => {
     { value: 'slate', label: '石板色', class: 'bg-slate-500' }
   ];
 
-  const permissionOptions = [
-    { id: 'all_permissions', label: '所有权限' },
-    { id: 'system_config', label: '系统配置' },
-    { id: 'view_own_class', label: '查看任教班级' },
-    { id: 'view_own_students', label: '查看任教学生' },
-    { id: 'input_scores', label: '成绩录入' },
-    { id: 'manage_class_students', label: '管理班级学生' },
-    { id: 'view_class_reports', label: '查看班级报告' },
-    { id: 'view_subject_classes', label: '查看学科班级' },
-    { id: 'view_subject_scores', label: '查看学科成绩' },
-    { id: 'manage_subject_materials', label: '管理学科资料' },
-    { id: 'view_grade_subject', label: '查看年级学科' },
-    { id: 'manage_subject_teachers', label: '管理学科教师' },
-    { id: 'approve_subject_activities', label: '审批学科活动' },
-    { id: 'view_grade_all', label: '查看年级全部' },
-    { id: 'manage_grade_teachers', label: '管理年级教师' },
-    { id: 'approve_grade_activities', label: '审批年级活动' },
-    { id: 'view_grade_reports', label: '查看年级报告' },
-    { id: 'view_dept_all', label: '查看科室全部' },
-    { id: 'manage_dept_staff', label: '管理科室人员' },
-    { id: 'approve_dept_activities', label: '审批科室活动' },
-    { id: 'view_school_all', label: '查看全校数据' },
-    { id: 'manage_departments', label: '管理各部门' },
-    { id: 'approve_school_activities', label: '审批学校活动' }
-  ];
+  const permissionOptions = ROLE_PERMISSION_OPTIONS;
+
+  const handleDownloadRoleTemplate = () => {
+    downloadRoleImportTemplate(mergeRoleSettings({
+      existingRoles: roles.length > 0 ? roles : DEFAULT_ROLE_SETTINGS,
+      includeDefaults: true,
+    }));
+  };
+
+  const handleRestoreDefaultRoles = async () => {
+    const confirmed = await confirmAction({
+      title: '恢复内置角色',
+      message: '确定要恢复系统内置角色吗？系统会保留已有自定义角色，并补齐缺失的内置角色。',
+      confirmText: '恢复'
+    });
+    if (!confirmed) return;
+
+    persistRoles(roles);
+    notify('已恢复系统内置角色', 'success');
+  };
+
+  const handleImportRoleFile = (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    if (/\.xlsx$/i.test(file.name || '')) {
+      notify('当前模板为Excel 97-2003工作簿（.xls）。请下载模板填写后导入，或另存为CSV后导入。', 'warning');
+      event.target.value = '';
+      return;
+    }
+
+    setRoleImporting(true);
+    const reader = new FileReader();
+    reader.onload = async (readerEvent) => {
+      try {
+        const parsed = parseRoleImportText(readerEvent.target.result);
+        const result = buildRoleImport({
+          parsedRows: parsed.rows,
+          existingRoles: roles,
+        });
+
+        if (result.errors.length > 0) {
+          notify(`导入文件有 ${result.errors.length} 行需要修正：${result.errors[0]}`, 'warning');
+          return;
+        }
+        if (result.roles.length === 0) {
+          notify('导入文件没有可写入的角色数据', 'warning');
+          return;
+        }
+
+        const confirmed = await confirmAction({
+          title: '批量导入角色权限',
+          message: `将按角色ID覆盖/新增 ${result.roles.length} 个角色，并自动补齐系统内置角色。确定导入吗？`,
+          confirmText: '导入'
+        });
+        if (!confirmed) return;
+
+        persistRoles(mergeRoleSettings({
+          existingRoles: roles,
+          importedRoles: result.roles,
+          includeDefaults: true,
+        }));
+        notify(`角色权限导入完成：写入 ${result.roles.length} 个角色`, 'success');
+      } catch (error) {
+        notify('角色权限导入失败：' + (error.message || '文件格式错误'), 'error');
+      } finally {
+        setRoleImporting(false);
+        event.target.value = '';
+      }
+    };
+    reader.onerror = () => {
+      setRoleImporting(false);
+      event.target.value = '';
+      notify('读取角色权限文件失败', 'error');
+    };
+    reader.readAsText(file, 'UTF-8');
+  };
 
   const renderGeneralSettings = () => (
     <div className="space-y-6">
@@ -740,7 +857,7 @@ const SystemSettings = () => {
             }}
             className="flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
           >
-            <Download className="h-5 w-5 mr-2" />
+            <Upload className="h-5 w-5 mr-2" />
             导出所有数据
           </button>
         </div>
@@ -757,27 +874,7 @@ const SystemSettings = () => {
             <input
               type="file"
               accept=".json"
-              onChange={(e) => {
-                const file = e.target.files[0];
-                if (file) {
-                  const reader = new FileReader();
-                  reader.onload = (event) => {
-                    try {
-                      const data = JSON.parse(event.target.result);
-                      if (window.confirm('确定要导入数据吗？这将覆盖当前所有数据！')) {
-                        Object.assign(schoolData, data);
-                        setSaveStatus({ type: 'success', message: '数据导入成功！请刷新页面。' });
-                        setTimeout(() => {
-                          window.location.reload();
-                        }, 2000);
-                      }
-                    } catch (error) {
-                      setSaveStatus({ type: 'error', message: '数据格式错误：' + error.message });
-                    }
-                  };
-                  reader.readAsText(file);
-                }
-              }}
+              onChange={handleImportDataFile}
               className="hidden"
               id="data-import"
             />
@@ -785,7 +882,7 @@ const SystemSettings = () => {
               htmlFor="data-import"
               className="flex items-center px-4 py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700 transition-colors cursor-pointer"
             >
-              <Upload className="h-5 w-5 mr-2" />
+              <Download className="h-5 w-5 mr-2" />
               选择备份文件
             </label>
           </div>
@@ -801,19 +898,7 @@ const SystemSettings = () => {
           </p>
           <button
             type="button"
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              if (window.confirm('确定要清除所有数据吗？此操作无法撤销！')) {
-                if (window.confirm('再次确认：您真的要删除所有数据吗？')) {
-                  localStorage.removeItem('new_century_school_data');
-                  setSaveStatus({ type: 'success', message: '数据已清除，页面将刷新...' });
-                  setTimeout(() => {
-                    window.location.reload();
-                  }, 2000);
-                }
-              }
-            }}
+            onClick={handleClearAllData}
             className="flex items-center px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
           >
             <Trash2 className="h-5 w-5 mr-2" />
@@ -832,6 +917,39 @@ const SystemSettings = () => {
             <h3 className="text-lg font-medium text-gray-900">教师角色权限管理</h3>
             <p className="text-sm text-gray-500 mt-1">系统预定义角色，级别越高权限越大</p>
           </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleRestoreDefaultRoles}
+              className="inline-flex items-center px-3 py-2 border border-gray-300 text-sm font-medium rounded-lg text-gray-700 bg-white hover:bg-gray-50"
+            >
+              <RefreshCw className="h-4 w-4 mr-2" />
+              恢复内置角色
+            </button>
+            <button
+              type="button"
+              onClick={handleDownloadRoleTemplate}
+              className="inline-flex items-center px-3 py-2 border border-blue-200 text-sm font-medium rounded-lg text-blue-700 bg-blue-50 hover:bg-blue-100"
+            >
+              <Download className="h-4 w-4 mr-2" />
+              下载Excel模板
+            </button>
+            <label className={`inline-flex items-center px-3 py-2 text-sm font-medium rounded-lg ${
+              roleImporting
+                ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                : 'bg-blue-600 text-white hover:bg-blue-700 cursor-pointer'
+            }`}>
+              <Upload className="h-4 w-4 mr-2" />
+              {roleImporting ? '导入中...' : '批量导入'}
+              <input
+                type="file"
+                accept=".xls,.csv,.tsv,.txt,.html"
+                className="hidden"
+                disabled={roleImporting}
+                onChange={handleImportRoleFile}
+              />
+            </label>
+          </div>
         </div>
         <div className="overflow-x-auto">
           <table className="min-w-full divide-y divide-gray-200">
@@ -846,40 +964,44 @@ const SystemSettings = () => {
               </tr>
             </thead>
             <tbody className="bg-white divide-y divide-gray-200">
-              {roles.sort((a, b) => b.level - a.level).map((role) => (
-                <tr key={role.id} className="hover:bg-gray-50">
-                  <td className="px-6 py-4 whitespace-nowrap">
-                    <div className="flex items-center">
-                      <div className={`h-3 w-3 rounded-full bg-${role.color}-500 mr-2`}></div>
-                      <span className="text-sm font-medium text-gray-900">{role.name}</span>
-                    </div>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap">
-                    <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-800">
-                      L{role.level}
-                    </span>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap">
-                    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-${role.color}-100 text-${role.color}-800`}>
-                      {colorOptions.find(c => c.value === role.color)?.label || role.color}
-                    </span>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                    {role.userCount} 人
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                    {role.permissions.length} 项
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-                    <button 
-                      onClick={() => { setEditingRole(role); setShowRoleModal(true); }}
-                      className="text-blue-600 hover:text-blue-900"
-                    >
-                      查看权限
-                    </button>
-                  </td>
-                </tr>
-              ))}
+              {sortRoleSettings(roles).map((role) => {
+                const colorClasses = ROLE_COLOR_CLASSES[role.color] || ROLE_COLOR_CLASSES.gray;
+                return (
+                  <tr key={role.id} className="hover:bg-gray-50">
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <div className="flex items-center">
+                        <div className={`h-3 w-3 rounded-full ${colorClasses.dot} mr-2`}></div>
+                        <span className="text-sm font-medium text-gray-900">{role.name}</span>
+                      </div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-800">
+                        L{role.level}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${colorClasses.badge}`}>
+                        {colorOptions.find(c => c.value === role.color)?.label || role.color}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      {role.userCount || 0} 人
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      {role.permissions?.length || 0} 项
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                      <button
+                        type="button"
+                        onClick={() => { setEditingRole(role); setShowRoleModal(true); }}
+                        className="text-blue-600 hover:text-blue-900"
+                      >
+                        查看权限
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -890,9 +1012,9 @@ const SystemSettings = () => {
         <h4 className="text-sm font-medium text-blue-900 mb-2">角色级别说明</h4>
         <div className="grid grid-cols-2 md:grid-cols-3 gap-2 text-xs text-blue-700">
           <div>L9: 系统管理员 - 最高权限</div>
-          <div>L8: 校长 - 全校管理</div>
+          <div>L8: 校长/教务主任 - 全校管理</div>
           <div>L7: 副校长 - 分管管理</div>
-          <div>L6: 科室主任/副主任 - 科室管理</div>
+          <div>L6: 科室主任/考务管理员 - 科室与考务管理</div>
           <div>L5: 年段长/副段长 - 年级管理</div>
           <div>L4: 教研组长 - 学科管理</div>
           <div>L3: 备课组长 - 备课组管理</div>
@@ -916,7 +1038,7 @@ const SystemSettings = () => {
             </div>
             <div className="p-6">
               <div className="grid grid-cols-2 gap-3">
-                {editingRole.permissions.map((perm, index) => {
+                {(editingRole.permissions || []).map((perm, index) => {
                   const permInfo = permissionOptions.find(p => p.id === perm);
                   return (
                     <div key={index} className="flex items-center p-2 bg-gray-50 rounded">

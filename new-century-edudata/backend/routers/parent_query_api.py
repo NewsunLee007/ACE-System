@@ -4,18 +4,56 @@
 采用双重鉴权机制确保成绩隐私
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from typing import Dict, Any, Optional, List
 from pydantic import BaseModel
-from datetime import datetime
 import logging
 
 from core.database import get_db
+from core.security import (
+    create_parent_student_access_token,
+    decode_token,
+    is_parent_student_token_valid,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/parents", tags=["家长端H5查询"])
+
+
+def require_parent_student_access(
+    student_id: int,
+    authorization: Optional[str] = Header(None),
+    parent_token: Optional[str] = Query(None, alias="token")
+) -> Dict[str, Any]:
+    """
+    Validate that the parent token is scoped to the requested student.
+    """
+    raw_token = parent_token
+    if authorization and authorization.lower().startswith("bearer "):
+        raw_token = authorization[7:].strip()
+
+    if not raw_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="请先完成家长身份验证"
+        )
+
+    payload = decode_token(raw_token)
+    if payload is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="家长身份验证已失效，请重新登录"
+        )
+
+    if not is_parent_student_token_valid(payload, student_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="无权查看该学生成绩"
+        )
+
+    return payload
 
 
 # ============ Pydantic模型定义 ============
@@ -137,8 +175,7 @@ class ParentQueryService:
                 "message": "鉴权码错误，请输入学籍辅号或身份证号后6位"
             }
         
-        # 生成简单token(实际项目中应使用JWT)
-        token = f"parent_token_{result.id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        token = create_parent_student_access_token(result.id)
         
         return {
             "success": True,
@@ -159,6 +196,14 @@ class ParentQueryService:
         """
         # 获取最近一次考试
         sql = """
+            WITH ranked_scores AS (
+                SELECT
+                    s.*,
+                    RANK() OVER (PARTITION BY s.exam_id, s.class_name ORDER BY s.total_score DESC) as class_rank,
+                    RANK() OVER (PARTITION BY s.exam_id ORDER BY s.total_score DESC) as grade_rank
+                FROM biz_scores s
+                WHERE s.is_included = 1
+            )
             SELECT 
                 s.id as score_id,
                 s.exam_id,
@@ -172,11 +217,11 @@ class ParentQueryService:
                 s.score_science,
                 s.score_society,
                 s.class_name,
-                RANK() OVER (PARTITION BY s.exam_id, s.class_name ORDER BY s.total_score DESC) as class_rank
-            FROM biz_scores s
+                s.class_rank,
+                s.grade_rank
+            FROM ranked_scores s
             JOIN biz_exams e ON s.exam_id = e.id
             WHERE s.student_id = :student_id
-              AND s.is_included = 1
             ORDER BY e.exam_date DESC
             LIMIT 1
         """
@@ -226,7 +271,7 @@ class ParentQueryService:
                 ))
         
         # 计算分层排名(简化版)
-        layer_rank = result.class_rank  # 实际应基于分层计算
+        layer_rank = result.grade_rank
         
         # 计算超越百分比
         total_students_sql = """
@@ -239,7 +284,7 @@ class ParentQueryService:
         ).fetchone()
         
         total_students = total_result.total if total_result else 1
-        percentage = (1 - (layer_rank / total_students)) * 100
+        percentage = (1 - (layer_rank / total_students)) * 100 if layer_rank else 0
         layer_status = f"超越年级 {percentage:.0f}% 同学"
         
         return ExamResult(
@@ -267,15 +312,21 @@ class ParentQueryService:
             List[HistoricalTrend]: 历史趋势列表
         """
         sql = """
+            WITH ranked_scores AS (
+                SELECT
+                    s.*,
+                    RANK() OVER (PARTITION BY s.exam_id, s.class_name ORDER BY s.total_score DESC) as class_rank
+                FROM biz_scores s
+                WHERE s.is_included = 1
+            )
             SELECT 
                 e.exam_name,
                 e.exam_date,
                 s.total_score,
-                RANK() OVER (PARTITION BY s.exam_id, s.class_name ORDER BY s.total_score DESC) as class_rank
-            FROM biz_scores s
+                s.class_rank
+            FROM ranked_scores s
             JOIN biz_exams e ON s.exam_id = e.id
             WHERE s.student_id = :student_id
-              AND s.is_included = 1
             ORDER BY e.exam_date DESC
             LIMIT :limit
         """
@@ -393,6 +444,7 @@ def parent_login_auth(request: AuthRequest, db: Session = Depends(get_db)):
 @router.get("/student/{student_id}/report", response_model=StudentReportResponse)
 def get_student_report(
     student_id: int,
+    parent_payload: dict = Depends(require_parent_student_access),
     db: Session = Depends(get_db)
 ):
     """
@@ -466,6 +518,7 @@ def get_student_report(
 def get_student_all_exams(
     student_id: int,
     limit: int = Query(10, description="返回最近几次考试"),
+    parent_payload: dict = Depends(require_parent_student_access),
     db: Session = Depends(get_db)
 ):
     """
@@ -473,6 +526,13 @@ def get_student_all_exams(
     """
     try:
         sql = """
+            WITH ranked_scores AS (
+                SELECT
+                    s.*,
+                    RANK() OVER (PARTITION BY s.exam_id, s.class_name ORDER BY s.total_score DESC) as class_rank
+                FROM biz_scores s
+                WHERE s.is_included = 1
+            )
             SELECT 
                 s.exam_id,
                 e.exam_name,
@@ -484,11 +544,10 @@ def get_student_all_exams(
                 s.score_english,
                 s.score_science,
                 s.score_society,
-                RANK() OVER (PARTITION BY s.exam_id, s.class_name ORDER BY s.total_score DESC) as class_rank
-            FROM biz_scores s
+                s.class_rank
+            FROM ranked_scores s
             JOIN biz_exams e ON s.exam_id = e.id
             WHERE s.student_id = :student_id
-              AND s.is_included = 1
             ORDER BY e.exam_date DESC
             LIMIT :limit
         """
@@ -532,6 +591,7 @@ def get_student_subject_trend(
     student_id: int,
     subject_name: str,
     limit: int = Query(5, description="返回最近几次考试"),
+    parent_payload: dict = Depends(require_parent_student_access),
     db: Session = Depends(get_db)
 ):
     """

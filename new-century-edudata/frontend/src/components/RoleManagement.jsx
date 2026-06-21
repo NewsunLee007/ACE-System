@@ -1,22 +1,33 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
-  Search,
-  X,
   Download,
   Upload,
-  FileSpreadsheet,
   UserCheck,
   Users,
   GraduationCap,
   BookOpen,
   Award,
   Briefcase,
-  ChevronRight,
   CheckCircle,
   AlertCircle,
-  Plus
+  Loader2,
+  RefreshCw
 } from 'lucide-react';
 import schoolData from '../data/schoolData';
+import { notify } from '../lib/notify';
+import { fetchClassList } from '../lib/classApi';
+import {
+  assignTeacherClass,
+  buildTeacherAssignmentPayload,
+  fetchTeacherListWithAssignments,
+  removeTeacherAssignment,
+} from '../lib/teacherApi';
+import {
+  assignTeacherDuty,
+  buildTeacherDutyPayload,
+  deactivateTeacherDuty,
+  fetchTeacherDuties,
+} from '../lib/teacherDutiesApi';
 
 // 权限优先级定义（数字越大权限越高）
 const ROLE_PRIORITY = {
@@ -46,19 +57,150 @@ const ROLE_PERMISSIONS = {
   'subject_teacher': ['view_own_classes', 'input_subject_scores']
 };
 
+const getCurrentTerm = () => (
+  schoolData.getCurrentSemesterDisplay?.() || `${schoolData.config?.currentAcademicYear || new Date().getFullYear()}-${schoolData.config?.currentSemester || 1}`
+);
+
+const normalizeClassKey = (value) => {
+  const match = String(value ?? '').match(/\d{3,4}/);
+  return match ? match[0] : String(value ?? '').trim();
+};
+
+const unique = (items) => [...new Set((items || []).filter(Boolean))];
+
+const mergeDutiesIntoTeachers = (teacherRows = [], duties = []) => {
+  const dutiesByTeacherId = new Map();
+  duties.forEach(duty => {
+    if (!duty.is_active) return;
+    const key = Number(duty.teacher_id);
+    if (!dutiesByTeacherId.has(key)) dutiesByTeacherId.set(key, []);
+    dutiesByTeacherId.get(key).push({
+      id: duty.id,
+      role_type: duty.role_type || duty.duty_type,
+      duty_type: duty.duty_type,
+      grade: duty.grade,
+      subject: duty.subject,
+      class_id: duty.class_id,
+      class_name: duty.class_name,
+      term: duty.term,
+      assigned_at: duty.assigned_at,
+      scope_label: duty.scope_label,
+      source: 'backend',
+    });
+  });
+
+  return teacherRows.map(teacher => {
+    const dutyDetails = dutiesByTeacherId.get(Number(teacher.id)) || [];
+    const dutyRoles = dutyDetails.map(detail => detail.role_type);
+    const merged = {
+      ...teacher,
+      roles: unique([...(teacher.roles || []), ...dutyRoles]),
+      role_details: [...(teacher.role_details || []), ...dutyDetails],
+    };
+    updateTeacherPermissionShape(merged);
+    return merged;
+  });
+};
+
+const applyHeadTeacherDutiesToClasses = (classRows = [], duties = []) => {
+  const headTeacherByClass = new Map();
+  duties
+    .filter(duty => duty.is_active && (duty.role_type || duty.duty_type) === 'head_teacher')
+    .forEach(duty => {
+      headTeacherByClass.set(normalizeClassKey(duty.class_name || duty.class_id), Number(duty.teacher_id));
+    });
+
+  return classRows.map(cls => {
+    const classKey = normalizeClassKey(cls.id || cls.class_code || cls.class_name || cls.name);
+    return {
+      ...cls,
+      head_teacher_id: headTeacherByClass.get(classKey) || cls.head_teacher_id || null,
+    };
+  });
+};
+
+const getGradeNameFromClassId = (classId) => {
+  const grade = Math.floor(Number(classId) / 100);
+  return Number.isFinite(grade) && grade > 0 ? `${grade}年级` : '';
+};
+
+const updateTeacherPermissionShape = (teacher) => {
+  if (!teacher.roles || teacher.roles.length === 0) {
+    teacher.permissions = ROLE_PERMISSIONS.subject_teacher;
+    teacher.primary_role = 'subject_teacher';
+    return teacher;
+  }
+
+  const highestRole = teacher.roles.reduce((highest, role) => {
+    const currentPriority = ROLE_PRIORITY[role] || 0;
+    const highestPriority = ROLE_PRIORITY[highest] || 0;
+    return currentPriority > highestPriority ? role : highest;
+  }, 'subject_teacher');
+
+  const allPermissions = new Set();
+  teacher.roles.forEach(role => {
+    const perms = ROLE_PERMISSIONS[role] || [];
+    perms.forEach(permission => allPermissions.add(permission));
+  });
+
+  teacher.permissions = Array.from(allPermissions);
+  teacher.primary_role = highestRole;
+  return teacher;
+};
+
 const RoleManagement = () => {
   const [activeTab, setActiveTab] = useState('headteacher'); // headteacher | middle | leadership
   const [teachers, setTeachers] = useState([]);
   const [classes, setClasses] = useState([]);
-  const [searchTerm, setSearchTerm] = useState('');
-  const [importFile, setImportFile] = useState(null);
-  const [showImportModal, setShowImportModal] = useState(false);
+  const [syncSource, setSyncSource] = useState('local');
+  const [syncMessage, setSyncMessage] = useState('正在使用本地数据');
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
   const fileInputRef = React.useRef(null);
+  const currentTerm = getCurrentTerm();
 
-  useEffect(() => {
+  const loadLocalData = useCallback(() => {
     setTeachers(schoolData.teachers || []);
     setClasses(schoolData.classes || []);
+    setSyncSource('local');
+    setSyncMessage('后端未同步时使用本地数据');
   }, []);
+
+  const refreshBackendData = useCallback(async () => {
+    if (!localStorage.getItem('token')) {
+      loadLocalData();
+      return false;
+    }
+
+    setLoading(true);
+    try {
+      const classPayload = await fetchClassList({ pageSize: 200 });
+      const backendClasses = classPayload.classes?.length ? classPayload.classes : (schoolData.classes || []);
+      const [teacherPayload, dutyPayload] = await Promise.all([
+        fetchTeacherListWithAssignments({ pageSize: 100, term: currentTerm }, backendClasses),
+        fetchTeacherDuties({ term: currentTerm }),
+      ]);
+
+      const duties = dutyPayload.duties || [];
+      setTeachers(mergeDutiesIntoTeachers(teacherPayload.teachers || [], duties));
+      setClasses(applyHeadTeacherDutiesToClasses(backendClasses, duties));
+      setSyncSource('backend');
+      setSyncMessage(`已同步后端职务数据 · ${currentTerm}`);
+      return true;
+    } catch (error) {
+      console.warn('职务管理后端同步失败:', error);
+      loadLocalData();
+      setSyncMessage('后端暂不可用，当前使用本地数据');
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  }, [currentTerm, loadLocalData]);
+
+  useEffect(() => {
+    loadLocalData();
+    refreshBackendData();
+  }, [loadLocalData, refreshBackendData]);
 
   // 自动分配角色和权限
   const assignRoleToTeacher = (teacherCode, roleType, additionalData = {}) => {
@@ -90,27 +232,7 @@ const RoleManagement = () => {
 
   // 更新教师权限（权限就高不就低）
   const updateTeacherPermissions = (teacher) => {
-    if (!teacher.roles || teacher.roles.length === 0) {
-      teacher.permissions = ROLE_PERMISSIONS['subject_teacher'];
-      return;
-    }
-
-    // 找出最高优先级的角色
-    const highestRole = teacher.roles.reduce((highest, role) => {
-      const currentPriority = ROLE_PRIORITY[role] || 0;
-      const highestPriority = ROLE_PRIORITY[highest] || 0;
-      return currentPriority > highestPriority ? role : highest;
-    }, 'subject_teacher');
-
-    // 合并所有角色的权限（去重）
-    const allPermissions = new Set();
-    teacher.roles.forEach(role => {
-      const perms = ROLE_PERMISSIONS[role] || [];
-      perms.forEach(p => allPermissions.add(p));
-    });
-
-    teacher.permissions = Array.from(allPermissions);
-    teacher.primary_role = highestRole;
+    updateTeacherPermissionShape(teacher);
   };
 
   const getRoleName = (roleId) => {
@@ -128,56 +250,169 @@ const RoleManagement = () => {
     return roleNames[roleId] || roleId;
   };
 
+  const findTeacher = (teacherCodeOrName) => (
+    teachers.find(t => t.code === teacherCodeOrName || t.name === teacherCodeOrName) ||
+    schoolData.teachers.find(t => t.code === teacherCodeOrName || t.name === teacherCodeOrName)
+  );
+
+  const findClass = (classIdOrNo) => (
+    classes.find(c => Number(c.id) === Number(classIdOrNo) || c.class_no === String(classIdOrNo)) ||
+    schoolData.classes.find(c => Number(c.id) === Number(classIdOrNo) || c.class_no === String(classIdOrNo))
+  );
+
+  const assignDuty = async (teacher, roleType, detail = {}) => {
+    if (!teacher) return { success: false, message: '未找到教师' };
+
+    if (syncSource === 'backend') {
+      const payload = buildTeacherDutyPayload({
+        teacherId: teacher.id,
+        dutyType: roleType,
+        term: currentTerm,
+        gradeName: detail.grade_name || detail.grade,
+        subjectName: detail.subject_name || detail.subject,
+        className: detail.class_name || detail.class_id,
+        scopeLabel: detail.scope_label,
+      });
+      const result = await assignTeacherDuty(payload);
+      if (result?.success === false) return result;
+      await refreshBackendData();
+      return { success: true, message: `已为 ${teacher.name} 分配 ${getRoleName(roleType)} 角色` };
+    }
+
+    const result = assignRoleToTeacher(teacher.code || teacher.name, roleType, detail);
+    setTeachers([...(schoolData.teachers || [])]);
+    return result;
+  };
+
+  const deactivateDutyDetail = async (teacher, detail) => {
+    if (syncSource === 'backend' && detail?.id) {
+      const result = await deactivateTeacherDuty(detail.id);
+      if (result?.success === false) return result;
+      await refreshBackendData();
+      return { success: true, message: '职务已解除' };
+    }
+
+    if (teacher) {
+      teacher.roles = (teacher.roles || []).filter(r => r !== detail.role_type);
+      teacher.role_details = (teacher.role_details || []).filter(r => r !== detail);
+      updateTeacherPermissions(teacher);
+      setTeachers([...(schoolData.teachers || [])]);
+    }
+    return { success: true, message: '职务已解除' };
+  };
+
   // ============ 模块1: 班主任管理 ============
   const HeadTeacherModule = () => {
     const [selectedClass, setSelectedClass] = useState('');
     const [selectedTeacher, setSelectedTeacher] = useState('');
 
-    const handleAssignHeadTeacher = () => {
+    const handleAssignHeadTeacher = async () => {
       if (!selectedClass || !selectedTeacher) {
-        alert('请选择班级和教师');
+        notify('请选择班级和教师');
         return;
       }
 
-      const teacher = schoolData.teachers.find(t => t.code === selectedTeacher);
-      const cls = schoolData.classes.find(c => c.id === parseInt(selectedClass));
+      const teacher = findTeacher(selectedTeacher);
+      const cls = findClass(selectedClass);
 
       if (!teacher || !cls) {
-        alert('选择的数据有误');
+        notify('选择的数据有误');
         return;
       }
 
-      // 更新班级的班主任
-      cls.head_teacher_id = teacher.id;
+      setSaving(true);
+      try {
+        if (syncSource === 'backend') {
+          const className = String(cls.id || cls.class_code || selectedClass);
+          const dutyResult = await assignDuty(teacher, 'head_teacher', {
+            grade_name: getGradeNameFromClassId(className),
+            class_id: className,
+            class_name: className,
+            scope_label: schoolData.formatClassName?.(className) || cls.name || className,
+          });
+          if (dutyResult?.success === false) {
+            notify(dutyResult.message || '班主任分配失败', 'warning');
+            return;
+          }
 
-      // 分配班主任角色
-      const result = assignRoleToTeacher(teacher.code, 'head_teacher', {
-        class_id: cls.id,
-        class_name: schoolData.formatClassName(cls.id)
-      });
+          const assignmentPayload = buildTeacherAssignmentPayload({
+            teacherId: teacher.id,
+            teachingClass: {
+              class_id: className,
+              class_name: className,
+              subject: '',
+              is_headmaster: true,
+            },
+            classes,
+            term: currentTerm,
+          });
+          const assignmentResult = await assignTeacherClass(assignmentPayload);
+          if (assignmentResult?.success === false && !String(assignmentResult.message || '').includes('已有')) {
+            notify(assignmentResult.message || '班主任任课关系同步失败', 'warning');
+          }
+          await refreshBackendData();
+        } else {
+          cls.head_teacher_id = teacher.id;
+          const result = await assignDuty(teacher, 'head_teacher', {
+            class_id: cls.id,
+            class_name: schoolData.formatClassName(cls.id)
+          });
+          if (result?.success === false) {
+            notify(result.message || '班主任分配失败', 'warning');
+            return;
+          }
+        }
 
-      if (result.success) {
-        alert(result.message);
+        notify(`已为 ${teacher.name} 分配班主任职务`);
         setSelectedClass('');
         setSelectedTeacher('');
+      } catch (error) {
+        console.error('分配班主任失败:', error);
+        notify(error.message || '分配班主任失败', 'error');
+      } finally {
+        setSaving(false);
       }
     };
 
-    const handleRemoveHeadTeacher = (classId) => {
-      const cls = schoolData.classes.find(c => c.id === classId);
+    const handleRemoveHeadTeacher = async (classId) => {
+      const cls = findClass(classId);
       if (!cls || !cls.head_teacher_id) return;
 
-      const teacher = schoolData.teachers.find(t => t.id === cls.head_teacher_id);
-      if (teacher) {
-        // 移除班主任角色
-        teacher.roles = teacher.roles.filter(r => r !== 'head_teacher');
-        teacher.role_details = teacher.role_details.filter(r => r.role_type !== 'head_teacher');
-        updateTeacherPermissions(teacher);
-      }
+      const teacher = teachers.find(t => Number(t.id) === Number(cls.head_teacher_id)) ||
+        schoolData.teachers.find(t => Number(t.id) === Number(cls.head_teacher_id));
+      const detail = teacher?.role_details?.find(r => (
+        r.role_type === 'head_teacher' &&
+        normalizeClassKey(r.class_name || r.class_id) === normalizeClassKey(classId)
+      ));
 
-      cls.head_teacher_id = null;
-      setTeachers([...schoolData.teachers]);
-      alert('已解除班主任职务');
+      setSaving(true);
+      try {
+        const result = await deactivateDutyDetail(teacher, detail || { role_type: 'head_teacher' });
+        if (result?.success === false) {
+          notify(result.message || '解除班主任失败', 'warning');
+          return;
+        }
+
+        if (syncSource === 'backend' && teacher) {
+          const assignment = teacher.teaching_classes?.find(item => (
+            item.is_headmaster && normalizeClassKey(item.class_id || item.class_name) === normalizeClassKey(classId)
+          ));
+          if (assignment?.assignment_id) {
+            await removeTeacherAssignment(assignment.assignment_id);
+          }
+          await refreshBackendData();
+        } else {
+          cls.head_teacher_id = null;
+          setClasses([...(schoolData.classes || [])]);
+        }
+
+        notify('已解除班主任职务');
+      } catch (error) {
+        console.error('解除班主任失败:', error);
+        notify(error.message || '解除班主任失败', 'error');
+      } finally {
+        setSaving(false);
+      }
     };
 
     // 下载班主任导入模板
@@ -210,14 +445,14 @@ const RoleManagement = () => {
     };
 
     // 导入班主任数据
-    const handleImportHeadTeachers = (content) => {
+    const handleImportHeadTeachers = async (content) => {
       const lines = content.split('\n').filter(line => {
         const trimmed = line.trim();
         return trimmed && !trimmed.startsWith('#');
       });
 
       if (lines.length < 2) {
-        alert('文件格式错误');
+        notify('文件格式错误');
         return;
       }
 
@@ -231,9 +466,9 @@ const RoleManagement = () => {
           const classNo = cols[1]?.trim();
 
           // 查找班级
-          let cls = schoolData.classes.find(c => c.id === parseInt(classNo));
+          let cls = findClass(classNo);
           if (!cls) {
-            cls = schoolData.classes.find(c => c.class_no === classNo);
+            cls = classes.find(c => c.class_no === classNo);
           }
 
           if (!cls) {
@@ -242,30 +477,56 @@ const RoleManagement = () => {
           }
 
           // 查找教师
-          const teacher = schoolData.teachers.find(t => t.name === teacherName);
+          const teacher = findTeacher(teacherName);
           if (!teacher) {
             errorMessages.push(`第${i + 1}行: 未找到教师 ${teacherName}`);
             continue;
           }
 
-          // 分配班主任
-          cls.head_teacher_id = teacher.id;
-          const result = assignRoleToTeacher(teacher.code, 'head_teacher', {
-            class_id: cls.id,
-            class_name: schoolData.formatClassName(cls.id)
+          const className = String(cls.id || cls.class_code || classNo);
+          const result = await assignDuty(teacher, 'head_teacher', {
+            grade_name: getGradeNameFromClassId(className),
+            class_id: className,
+            class_name: className,
+            scope_label: schoolData.formatClassName?.(className) || cls.name || className,
           });
+
+          if (syncSource === 'backend' && result.success) {
+            const assignmentPayload = buildTeacherAssignmentPayload({
+              teacherId: teacher.id,
+              teachingClass: {
+                class_id: className,
+                class_name: className,
+                subject: '',
+                is_headmaster: true,
+              },
+              classes,
+              term: currentTerm,
+            });
+            const assignmentResult = await assignTeacherClass(assignmentPayload);
+            if (assignmentResult?.success === false && !String(assignmentResult.message || '').includes('已有')) {
+              errorMessages.push(`第${i + 1}行: ${assignmentResult.message || '任课关系同步失败'}`);
+            }
+          } else if (result.success) {
+            cls.head_teacher_id = teacher.id;
+          }
 
           if (result.success) successCount++;
         }
       }
 
-      setTeachers([...schoolData.teachers]);
+      if (syncSource === 'backend') {
+        await refreshBackendData();
+      } else {
+        setTeachers([...schoolData.teachers]);
+        setClasses([...schoolData.classes]);
+      }
       let message = `成功导入 ${successCount} 位班主任`;
       if (errorMessages.length > 0) {
         message += `\n\n错误信息:\n${errorMessages.slice(0, 5).join('\n')}`;
         if (errorMessages.length > 5) message += `\n...还有${errorMessages.length - 5}条错误`;
       }
-      alert(message);
+      notify(message);
     };
 
     const classesWithHeadTeacher = classes.filter(c => c.head_teacher_id);
@@ -348,10 +609,10 @@ const RoleManagement = () => {
             </div>
             <button
               onClick={handleAssignHeadTeacher}
-              disabled={!selectedClass || !selectedTeacher}
+              disabled={!selectedClass || !selectedTeacher || saving}
               className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
             >
-              确认分配
+              {saving ? '保存中' : '确认分配'}
             </button>
           </div>
         </div>
@@ -422,6 +683,7 @@ const RoleManagement = () => {
                     <td className="px-6 py-4">
                       <button
                         onClick={() => handleRemoveHeadTeacher(cls.id)}
+                        disabled={saving}
                         className="text-red-600 hover:text-red-900 text-sm"
                       >
                         解除职务
@@ -473,22 +735,35 @@ const RoleManagement = () => {
       { value: '9', label: '九年级' },
     ];
 
-    const handleAssignRole = () => {
+    const handleAssignRole = async () => {
       if (!selectedTeacher || !selectedRole || !selectedGrade) {
-        alert('请完整填写所有字段');
+        notify('请完整填写所有字段');
         return;
       }
 
-      const result = assignRoleToTeacher(selectedTeacher, selectedRole, {
-        grade: selectedGrade,
-        assigned_date: new Date().toISOString()
-      });
+      const teacher = findTeacher(selectedTeacher);
+      setSaving(true);
+      try {
+        const gradeLabel = `${selectedGrade}年级`;
+        const result = await assignDuty(teacher, selectedRole, {
+          grade: gradeLabel,
+          grade_name: gradeLabel,
+          assigned_date: new Date().toISOString(),
+        });
 
-      if (result.success) {
-        alert(result.message);
+        if (result?.success === false) {
+          notify(result.message || '职务分配失败', 'warning');
+          return;
+        }
+        notify(result.message);
         setSelectedTeacher('');
         setSelectedRole('');
         setSelectedGrade('');
+      } catch (error) {
+        console.error('分配职务失败:', error);
+        notify(error.message || '职务分配失败', 'error');
+      } finally {
+        setSaving(false);
       }
     };
 
@@ -539,14 +814,14 @@ const RoleManagement = () => {
     };
 
     // 导入中间管理层数据
-    const handleImportMiddleManagement = (content) => {
+    const handleImportMiddleManagement = async (content) => {
       const lines = content.split('\n').filter(line => {
         const trimmed = line.trim();
         return trimmed && !trimmed.startsWith('#');
       });
 
       if (lines.length < 2) {
-        alert('文件格式错误');
+        notify('文件格式错误');
         return;
       }
 
@@ -578,7 +853,7 @@ const RoleManagement = () => {
           const gradeName = cols[3]?.trim();
 
           // 查找教师
-          const teacher = schoolData.teachers.find(t => t.name === teacherName);
+          const teacher = findTeacher(teacherName);
           if (!teacher) {
             errorMessages.push(`第${i + 1}行: 未找到教师 ${teacherName}`);
             continue;
@@ -601,27 +876,36 @@ const RoleManagement = () => {
             continue;
           }
 
-          // 转换年级
-          const grade = gradeMap[gradeName] || gradeName;
-
           // 分配角色
-          const result = assignRoleToTeacher(teacher.code, roleType, {
+          const grade = gradeMap[gradeName] || gradeName;
+          const gradeLabel = grade
+            ? (String(grade).includes('年级') ? String(grade) : `${grade}年级`)
+            : undefined;
+
+          const result = await assignDuty(teacher, roleType, {
             subject: subject || undefined,
-            grade: grade || undefined,
-            assigned_date: new Date().toISOString()
+            subject_name: subject || undefined,
+            grade: gradeLabel,
+            grade_name: gradeLabel,
+            assigned_date: new Date().toISOString(),
+            scope_label: subject && gradeLabel ? `${subject} / ${gradeLabel}` : (subject || gradeLabel)
           });
 
           if (result.success) successCount++;
         }
       }
 
-      setTeachers([...schoolData.teachers]);
+      if (syncSource === 'backend') {
+        await refreshBackendData();
+      } else {
+        setTeachers([...schoolData.teachers]);
+      }
       let message = `成功导入 ${successCount} 条职务记录`;
       if (errorMessages.length > 0) {
         message += `\n\n错误信息:\n${errorMessages.slice(0, 5).join('\n')}`;
         if (errorMessages.length > 5) message += `\n...还有${errorMessages.length - 5}条错误`;
       }
-      alert(message);
+      notify(message);
     };
 
     return (
@@ -693,10 +977,10 @@ const RoleManagement = () => {
             </div>
             <button
               onClick={handleAssignRole}
-              disabled={!selectedTeacher || !selectedRole || !selectedGrade}
+              disabled={!selectedTeacher || !selectedRole || !selectedGrade || saving}
               className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-300"
             >
-              确认分配
+              {saving ? '保存中' : '确认分配'}
             </button>
           </div>
         </div>
@@ -788,14 +1072,23 @@ const RoleManagement = () => {
                           <td className="px-6 py-4 text-sm text-gray-500">{teacher.phone || '-'}</td>
                           <td className="px-6 py-4">
                             <button
-                              onClick={() => {
-                                // 移除该职务
-                                teacher.roles = teacher.roles.filter(r => r !== detail.role_type);
-                                teacher.role_details = teacher.role_details.filter(r => r !== detail);
-                                updateTeacherPermissions(teacher);
-                                setTeachers([...schoolData.teachers]);
-                                alert(`已解除 ${teacher.name} 的 ${roleName} 职务`);
+                              onClick={async () => {
+                                setSaving(true);
+                                try {
+                                  const result = await deactivateDutyDetail(teacher, detail);
+                                  if (result?.success === false) {
+                                    notify(result.message || '解除职务失败', 'warning');
+                                    return;
+                                  }
+                                  notify(`已解除 ${teacher.name} 的 ${roleName} 职务`);
+                                } catch (error) {
+                                  console.error('解除职务失败:', error);
+                                  notify(error.message || '解除职务失败', 'error');
+                                } finally {
+                                  setSaving(false);
+                                }
                               }}
+                              disabled={saving}
                               className="text-red-600 hover:text-red-900 text-sm"
                             >
                               解除职务
@@ -825,20 +1118,31 @@ const RoleManagement = () => {
       { id: 'principal', name: '校长', icon: Award },
     ];
 
-    const handleAssignRole = () => {
+    const handleAssignRole = async () => {
       if (!selectedTeacher || !selectedRole) {
-        alert('请选择教师和职务');
+        notify('请选择教师和职务');
         return;
       }
 
-      const result = assignRoleToTeacher(selectedTeacher, selectedRole, {
-        assigned_date: new Date().toISOString()
-      });
+      const teacher = findTeacher(selectedTeacher);
+      setSaving(true);
+      try {
+        const result = await assignDuty(teacher, selectedRole, {
+          assigned_date: new Date().toISOString()
+        });
 
-      if (result.success) {
-        alert(result.message);
+        if (result?.success === false) {
+          notify(result.message || '职务分配失败', 'warning');
+          return;
+        }
+        notify(result.message);
         setSelectedTeacher('');
         setSelectedRole('');
+      } catch (error) {
+        console.error('分配校级职务失败:', error);
+        notify(error.message || '职务分配失败', 'error');
+      } finally {
+        setSaving(false);
       }
     };
 
@@ -872,14 +1176,14 @@ const RoleManagement = () => {
     };
 
     // 导入校级领导数据
-    const handleImportLeadership = (content) => {
+    const handleImportLeadership = async (content) => {
       const lines = content.split('\n').filter(line => {
         const trimmed = line.trim();
         return trimmed && !trimmed.startsWith('#');
       });
 
       if (lines.length < 2) {
-        alert('文件格式错误');
+        notify('文件格式错误');
         return;
       }
 
@@ -901,7 +1205,7 @@ const RoleManagement = () => {
           const roleName = cols[1]?.trim();
 
           // 查找教师
-          const teacher = schoolData.teachers.find(t => t.name === teacherName);
+          const teacher = findTeacher(teacherName);
           if (!teacher) {
             errorMessages.push(`第${i + 1}行: 未找到教师 ${teacherName}`);
             continue;
@@ -915,7 +1219,7 @@ const RoleManagement = () => {
           }
 
           // 分配角色
-          const result = assignRoleToTeacher(teacher.code, roleType, {
+          const result = await assignDuty(teacher, roleType, {
             assigned_date: new Date().toISOString()
           });
 
@@ -923,13 +1227,17 @@ const RoleManagement = () => {
         }
       }
 
-      setTeachers([...schoolData.teachers]);
+      if (syncSource === 'backend') {
+        await refreshBackendData();
+      } else {
+        setTeachers([...schoolData.teachers]);
+      }
       let message = `成功导入 ${successCount} 条职务记录`;
       if (errorMessages.length > 0) {
         message += `\n\n错误信息:\n${errorMessages.slice(0, 5).join('\n')}`;
         if (errorMessages.length > 5) message += `\n...还有${errorMessages.length - 5}条错误`;
       }
-      alert(message);
+      notify(message);
     };
 
     return (
@@ -987,10 +1295,10 @@ const RoleManagement = () => {
             </div>
             <button
               onClick={handleAssignRole}
-              disabled={!selectedTeacher || !selectedRole}
+              disabled={!selectedTeacher || !selectedRole || saving}
               className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:bg-gray-300"
             >
-              确认分配
+              {saving ? '保存中' : '确认分配'}
             </button>
           </div>
         </div>
@@ -1064,14 +1372,23 @@ const RoleManagement = () => {
                       <td className="px-6 py-4 text-sm text-gray-500">{teacher.phone || '-'}</td>
                       <td className="px-6 py-4">
                         <button
-                          onClick={() => {
-                            // 移除该职务
-                            teacher.roles = teacher.roles.filter(r => r !== detail.role_type);
-                            teacher.role_details = teacher.role_details.filter(r => r !== detail);
-                            updateTeacherPermissions(teacher);
-                            setTeachers([...schoolData.teachers]);
-                            alert(`已解除 ${teacher.name} 的 ${roleName} 职务`);
+                          onClick={async () => {
+                            setSaving(true);
+                            try {
+                              const result = await deactivateDutyDetail(teacher, detail);
+                              if (result?.success === false) {
+                                notify(result.message || '解除职务失败', 'warning');
+                                return;
+                              }
+                              notify(`已解除 ${teacher.name} 的 ${roleName} 职务`);
+                            } catch (error) {
+                              console.error('解除职务失败:', error);
+                              notify(error.message || '解除职务失败', 'error');
+                            } finally {
+                              setSaving(false);
+                            }
                           }}
+                          disabled={saving}
                           className="text-red-600 hover:text-red-900 text-sm"
                         >
                           解除职务
@@ -1095,6 +1412,28 @@ const RoleManagement = () => {
       <div className="mb-6">
         <h1 className="text-2xl font-bold text-gray-800">职务管理</h1>
         <p className="text-gray-500 mt-1">管理教师职务分配，支持多角色和权限自动分配</p>
+      </div>
+
+      <div className={`mb-6 rounded-lg border px-4 py-3 text-sm ${
+        syncSource === 'backend'
+          ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+          : 'border-amber-200 bg-amber-50 text-amber-800'
+      }`}>
+        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div className="flex items-center gap-2">
+            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle className="h-4 w-4" />}
+            <span>{syncMessage}</span>
+          </div>
+          <button
+            type="button"
+            onClick={refreshBackendData}
+            disabled={loading || saving}
+            className="inline-flex items-center justify-center gap-2 rounded-lg border border-current/20 bg-white/70 px-3 py-1.5 text-sm hover:bg-white disabled:opacity-50"
+          >
+            <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
+            同步
+          </button>
+        </div>
       </div>
 
       {/* 标签页导航 */}

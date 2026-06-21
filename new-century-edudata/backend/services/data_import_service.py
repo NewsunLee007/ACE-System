@@ -11,6 +11,8 @@ import logging
 from io import BytesIO
 import re
 
+from core.database import is_postgresql, is_sqlite
+
 logger = logging.getLogger(__name__)
 
 
@@ -178,28 +180,52 @@ class DataImportService:
                         score_data["total_score"] = sum(valid_scores)
                 
                 # 插入或更新成绩
-                sql = """
-                    INSERT INTO biz_scores 
-                    (exam_id, student_id, exam_number, class_name, 
-                     score_chinese, score_math, score_english, score_science, score_society,
-                     total_score, is_included, remarks, created_at, updated_at)
-                    VALUES 
-                    (:exam_id, :student_id, :exam_number, :class_name,
-                     :score_chinese, :score_math, :score_english, :score_science, :score_society,
-                     :total_score, :is_included, :remarks, NOW(), NOW())
-                    ON DUPLICATE KEY UPDATE
-                    exam_number = VALUES(exam_number),
-                    class_name = VALUES(class_name),
-                    score_chinese = VALUES(score_chinese),
-                    score_math = VALUES(score_math),
-                    score_english = VALUES(score_english),
-                    score_science = VALUES(score_science),
-                    score_society = VALUES(score_society),
-                    total_score = VALUES(total_score),
-                    is_included = VALUES(is_included),
-                    remarks = VALUES(remarks),
-                    updated_at = NOW()
-                """
+                if is_postgresql(self.db) or is_sqlite(self.db):
+                    sql = """
+                        INSERT INTO biz_scores
+                        (exam_id, student_id, exam_number, class_name,
+                         score_chinese, score_math, score_english, score_science, score_society,
+                         total_score, is_included, remarks, created_at, updated_at)
+                        VALUES
+                        (:exam_id, :student_id, :exam_number, :class_name,
+                         :score_chinese, :score_math, :score_english, :score_science, :score_society,
+                         :total_score, :is_included, :remarks, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        ON CONFLICT (exam_id, student_id) DO UPDATE SET
+                        exam_number = excluded.exam_number,
+                        class_name = excluded.class_name,
+                        score_chinese = excluded.score_chinese,
+                        score_math = excluded.score_math,
+                        score_english = excluded.score_english,
+                        score_science = excluded.score_science,
+                        score_society = excluded.score_society,
+                        total_score = excluded.total_score,
+                        is_included = excluded.is_included,
+                        remarks = excluded.remarks,
+                        updated_at = CURRENT_TIMESTAMP
+                    """
+                else:
+                    sql = """
+                        INSERT INTO biz_scores
+                        (exam_id, student_id, exam_number, class_name,
+                         score_chinese, score_math, score_english, score_science, score_society,
+                         total_score, is_included, remarks, created_at, updated_at)
+                        VALUES
+                        (:exam_id, :student_id, :exam_number, :class_name,
+                         :score_chinese, :score_math, :score_english, :score_science, :score_society,
+                         :total_score, :is_included, :remarks, NOW(), NOW())
+                        ON DUPLICATE KEY UPDATE
+                        exam_number = VALUES(exam_number),
+                        class_name = VALUES(class_name),
+                        score_chinese = VALUES(score_chinese),
+                        score_math = VALUES(score_math),
+                        score_english = VALUES(score_english),
+                        score_science = VALUES(score_science),
+                        score_society = VALUES(score_society),
+                        total_score = VALUES(total_score),
+                        is_included = VALUES(is_included),
+                        remarks = VALUES(remarks),
+                        updated_at = NOW()
+                    """
                 
                 self.db.execute(text(sql), score_data)
                 stats["success"] += 1
@@ -247,6 +273,11 @@ class DataImportService:
             '入学年份': 'enrollment_year',
             '当前年级': 'current_grade',
             '当前班级': 'current_class',
+            '班级编号': 'current_class',
+            '班级': 'current_class',
+            '班级ID': 'current_class',
+            '状态': 'status',
+            '状态(在读/休学/转学/退学)': 'status',
             '身份证号后6位': 'id_card_last6'
         }
         
@@ -269,6 +300,7 @@ class DataImportService:
                     "enrollment_year": int(row['enrollment_year']),
                     "current_grade": str(row['current_grade']).strip() if 'current_grade' in row and pd.notna(row['current_grade']) else None,
                     "current_class": str(row['current_class']).strip() if 'current_class' in row and pd.notna(row['current_class']) else None,
+                    "status": str(row['status']).strip() if 'status' in row and pd.notna(row['status']) else "在读",
                     "id_card_last6": str(row['id_card_last6']).strip() if 'id_card_last6' in row and pd.notna(row['id_card_last6']) else None
                 }
                 
@@ -287,6 +319,7 @@ class DataImportService:
                             enrollment_year = :enrollment_year,
                             current_grade = :current_grade,
                             current_class = :current_class,
+                            status = :status,
                             id_card_last6 = :id_card_last6,
                             updated_at = NOW()
                         WHERE student_code = :student_code
@@ -297,9 +330,9 @@ class DataImportService:
                     # 插入
                     sql = """
                         INSERT INTO biz_students 
-                        (student_code, name, gender, enrollment_year, current_grade, current_class, id_card_last6, created_at, updated_at)
+                        (student_code, name, gender, enrollment_year, current_grade, current_class, status, id_card_last6, created_at, updated_at)
                         VALUES 
-                        (:student_code, :name, :gender, :enrollment_year, :current_grade, :current_class, :id_card_last6, NOW(), NOW())
+                        (:student_code, :name, :gender, :enrollment_year, :current_grade, :current_class, :status, :id_card_last6, NOW(), NOW())
                     """
                     self.db.execute(text(sql), student_data)
                     stats["success"] += 1

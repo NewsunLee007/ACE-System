@@ -1,19 +1,12 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import {
   ChevronLeft,
   User,
-  School,
   Calendar,
-  TrendingUp,
-  TrendingDown,
-  Award,
-  BookOpen,
-  Phone,
   MessageSquare,
   BarChart3,
   ChevronRight,
-  LogOut,
-  Lock
+  LogOut
 } from 'lucide-react';
 import {
   RadarChart,
@@ -29,6 +22,89 @@ import {
   CartesianGrid,
   Tooltip
 } from 'recharts';
+import {
+  authenticateParentStudent,
+  fetchParentStudentExams,
+  fetchParentStudentReport
+} from '../lib/parentPortalApi';
+import {
+  getLocalScoreVisibilitySettings,
+  maskRankValue,
+  resolveScoreVisibility,
+} from '../lib/scoreVisibility';
+
+const formatDisplayNumber = (value, digits = 1) => (
+  Number.isFinite(Number(value)) ? Number(value).toFixed(digits).replace(/\.0$/, '') : '-'
+);
+
+const inferSubjectFullScore = (score) => {
+  const numericScore = Number(score);
+  if (!Number.isFinite(numericScore)) return 100;
+  if (numericScore > 120) return Math.ceil(numericScore / 10) * 10;
+  if (numericScore > 100) return 120;
+  return 100;
+};
+
+const buildH5Student = ({ report, session, loginForm }) => ({
+  id: session.studentId,
+  name: report?.student_name || loginForm.studentName.trim(),
+  student_code: report?.student_code || '',
+  class_name: report?.class_name || loginForm.className.trim()
+});
+
+const buildReportSubjectMap = (report) => (
+  (report?.latest_exam?.subjects || []).reduce((result, item) => {
+    result[item.subject] = item;
+    return result;
+  }, {})
+);
+
+const buildH5ExamScores = (examPayload, report) => {
+  const reportSubjects = buildReportSubjectMap(report);
+  const latestExamId = report?.latest_exam?.exam_id;
+
+  return (examPayload?.exams || []).map((exam) => {
+    const isLatest = Number(exam.exam_id) === Number(latestExamId);
+    const subjects = Object.entries(exam.subjects || {}).reduce((result, [subject, rawScore]) => {
+      if (rawScore === null || rawScore === undefined || rawScore === '') {
+        return result;
+      }
+
+      const score = Number(rawScore);
+      const reportSubject = isLatest ? reportSubjects[subject] : null;
+      result[subject] = {
+        score: Number.isFinite(score) ? score : null,
+        class_rank: reportSubject?.rank_in_class || '-',
+        grade_rank: '-',
+        full_score: inferSubjectFullScore(score),
+        class_avg: formatDisplayNumber(reportSubject?.class_avg)
+      };
+      return result;
+    }, {});
+    const totalScore = Number(exam.total_score);
+    const totalFullScore = Object.values(subjects).reduce((sum, subject) => (
+      sum + (Number(subject.full_score) || 0)
+    ), 0);
+    const latestReportExam = isLatest ? report?.latest_exam : null;
+
+    return {
+      exam_id: exam.exam_id,
+      exam_name: exam.exam_name || `考试${exam.exam_id || ''}`,
+      exam_date: exam.exam_date || '',
+      exam_type: exam.term || latestReportExam?.term || '考试',
+      subjects,
+      total: {
+        score: Number.isFinite(totalScore) ? totalScore : 0,
+        class_rank: exam.class_rank || latestReportExam?.class_rank || '-',
+        grade_rank: latestReportExam?.layer_rank || '-',
+        full_score: totalFullScore || inferSubjectFullScore(totalScore),
+        class_avg: '-',
+      },
+      layer_status: latestReportExam?.layer_status || '',
+      teacher_comment: isLatest ? (report?.diagnosis || '暂无学情诊断。') : '暂无教师评语。',
+    };
+  });
+};
 
 /**
  * 家长H5查询端口
@@ -38,142 +114,92 @@ const ParentH5Portal = () => {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [loading, setLoading] = useState(false);
   const [activeTab, setActiveTab] = useState('scores');
+  const [parentLabel, setParentLabel] = useState('家长');
+  const [boundChildren, setBoundChildren] = useState([]);
+  const [examScores, setExamScores] = useState([]);
   const [selectedChild, setSelectedChild] = useState(null);
   const [selectedExam, setSelectedExam] = useState(null);
   const [showExamDetail, setShowExamDetail] = useState(false);
+  const [loginError, setLoginError] = useState('');
 
   // 登录表单
   const [loginForm, setLoginForm] = useState({
-    phone: '',
-    code: ''
+    studentName: '',
+    className: '',
+    authCode: ''
   });
-  const [countdown, setCountdown] = useState(0);
 
-  // 模拟家长数据
-  const parentData = {
-    id: 1,
-    name: '张大明',
-    phone: '13800138001',
-    children: [
-      {
-        id: 1,
-        name: '张小明',
-        student_code: '20240701001',
-        gender: '男',
-        grade_level: '7年级',
-        class_no: '3',
-        class_name: '7年级(3)班',
-        head_teacher: '李老师',
-        school: '瑞安市新纪元实验学校'
-      }
-    ]
-  };
-
-  // 模拟成绩数据
-  const examScores = [
-    {
-      exam_id: 1,
-      exam_name: '2025-1期末',
-      exam_date: '2025-01-15',
-      exam_type: '期末',
-      subjects: {
-        语文: { score: 85, class_rank: 12, grade_rank: 45, full_score: 100, class_avg: 78.5 },
-        数学: { score: 92, class_rank: 5, grade_rank: 18, full_score: 100, class_avg: 76.2 },
-        英语: { score: 88, class_rank: 8, grade_rank: 32, full_score: 100, class_avg: 79.8 },
-        科学: { score: 90, class_rank: 6, grade_rank: 22, full_score: 100, class_avg: 80.5 },
-        社会: { score: 87, class_rank: 10, grade_rank: 38, full_score: 100, class_avg: 81.2 }
-      },
-      total: { score: 442, class_rank: 7, grade_rank: 28, full_score: 500, class_avg: 396 },
-      z_value: 0.65,
-      teacher_comment: '张小明同学本学期表现良好，数学成绩突出，但语文阅读理解还需加强。希望下学期能继续保持优势科目，同时提升薄弱科目。'
-    },
-    {
-      exam_id: 2,
-      exam_name: '2024-2期末',
-      exam_date: '2024-07-10',
-      exam_type: '期末',
-      subjects: {
-        语文: { score: 82, class_rank: 15, grade_rank: 52, full_score: 100, class_avg: 77.8 },
-        数学: { score: 89, class_rank: 8, grade_rank: 25, full_score: 100, class_avg: 75.5 },
-        英语: { score: 85, class_rank: 12, grade_rank: 41, full_score: 100, class_avg: 78.2 },
-        科学: { score: 87, class_rank: 9, grade_rank: 35, full_score: 100, class_avg: 79.5 },
-        社会: { score: 84, class_rank: 14, grade_rank: 48, full_score: 100, class_avg: 80.8 }
-      },
-      total: { score: 427, class_rank: 10, grade_rank: 42, full_score: 500, class_avg: 392 },
-      z_value: 0.42,
-      teacher_comment: '整体表现稳定，需要加强语文和社会学科的学习。'
-    },
-    {
-      exam_id: 3,
-      exam_name: '2024-2期中',
-      exam_date: '2024-11-15',
-      exam_type: '期中',
-      subjects: {
-        语文: { score: 80, class_rank: 18, grade_rank: 58, full_score: 100, class_avg: 76.5 },
-        数学: { score: 87, class_rank: 10, grade_rank: 32, full_score: 100, class_avg: 74.8 },
-        英语: { score: 83, class_rank: 14, grade_rank: 46, full_score: 100, class_avg: 77.5 },
-        科学: { score: 85, class_rank: 11, grade_rank: 39, full_score: 100, class_avg: 78.8 },
-        社会: { score: 82, class_rank: 16, grade_rank: 52, full_score: 100, class_avg: 79.5 }
-      },
-      total: { score: 417, class_rank: 13, grade_rank: 48, full_score: 500, class_avg: 387 },
-      z_value: 0.28,
-      teacher_comment: '期中考试表现中等，需要继续努力。'
-    }
-  ];
+  const latestExam = examScores[0] || null;
+  const parentVisibility = resolveScoreVisibility('parent', getLocalScoreVisibilitySettings());
 
   // 趋势数据
-  const trendData = examScores.map(exam => ({
-    exam: exam.exam_name.replace('202', ''),
+  const trendData = examScores.slice().reverse().map(exam => ({
+    exam: exam.exam_name,
     total: exam.total.score,
     avg: exam.total.class_avg
-  })).reverse();
+  }));
+  const trendMax = Math.max(500, ...trendData.map(item => Number(item.total) || 0));
 
   // 雷达图数据
-  const radarData = examScores[0] ? [
-    { subject: '语文', score: examScores[0].subjects.语文.score, fullMark: 100 },
-    { subject: '数学', score: examScores[0].subjects.数学.score, fullMark: 100 },
-    { subject: '英语', score: examScores[0].subjects.英语.score, fullMark: 100 },
-    { subject: '科学', score: examScores[0].subjects.科学.score, fullMark: 100 },
-    { subject: '社会', score: examScores[0].subjects.社会.score, fullMark: 100 }
-  ] : [];
+  const radarSource = selectedExam || latestExam;
+  const radarData = Object.entries(radarSource?.subjects || {}).map(([subject, data]) => ({
+    subject,
+    score: data.score || 0,
+    scoreRate: data.full_score ? Math.round(((data.score || 0) / data.full_score) * 100) : 0,
+    fullMark: data.full_score || 100,
+  }));
 
-  useEffect(() => {
-    if (parentData.children.length > 0) {
-      setSelectedChild(parentData.children[0]);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (countdown > 0) {
-      const timer = setTimeout(() => setCountdown(countdown - 1), 1000);
-      return () => clearTimeout(timer);
-    }
-  }, [countdown]);
-
-  const handleSendCode = () => {
-    if (loginForm.phone && countdown === 0) {
-      setCountdown(60);
-      alert('验证码已发送：123456');
-    }
-  };
-
-  const handleLogin = (e) => {
+  const handleLogin = async (e) => {
     e.preventDefault();
-    if (loginForm.phone && loginForm.code) {
-      setLoading(true);
-      setTimeout(() => {
-        setIsLoggedIn(true);
-        setLoading(false);
-      }, 1000);
+    setLoginError('');
+
+    if (!loginForm.studentName.trim() || !loginForm.className.trim() || !loginForm.authCode.trim()) {
+      setLoginError('请输入学生姓名、班级和鉴权码');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const session = await authenticateParentStudent(loginForm);
+      const [reportResult, examsResult] = await Promise.allSettled([
+        fetchParentStudentReport(session.studentId, session.token),
+        fetchParentStudentExams(session.studentId, session.token)
+      ]);
+
+      if (examsResult.status === 'rejected') {
+        throw examsResult.reason;
+      }
+
+      const report = reportResult.status === 'fulfilled' ? reportResult.value : null;
+      const child = buildH5Student({ report, session, loginForm });
+
+      setParentLabel(`${child.name}家长`);
+      setBoundChildren([child]);
+      setSelectedChild(child);
+      setExamScores(buildH5ExamScores(examsResult.value, report));
+      setIsLoggedIn(true);
+    } catch (error) {
+      setLoginError(error?.message || '家长身份验证失败');
+    } finally {
+      setLoading(false);
     }
   };
 
   const handleLogout = () => {
     setIsLoggedIn(false);
-    setLoginForm({ phone: '', code: '' });
+    setParentLabel('家长');
+    setBoundChildren([]);
+    setExamScores([]);
+    setSelectedChild(null);
+    setSelectedExam(null);
+    setShowExamDetail(false);
+    setLoginForm({ studentName: '', className: '', authCode: '' });
   };
 
   const getScoreColor = (score, fullScore = 100) => {
+    if (!Number.isFinite(Number(score)) || !Number.isFinite(Number(fullScore)) || Number(fullScore) <= 0) {
+      return 'text-gray-500';
+    }
     const rate = score / fullScore;
     if (rate >= 0.9) return 'text-green-600';
     if (rate >= 0.8) return 'text-blue-600';
@@ -182,6 +208,9 @@ const ParentH5Portal = () => {
   };
 
   const getScoreBg = (score, fullScore = 100) => {
+    if (!Number.isFinite(Number(score)) || !Number.isFinite(Number(fullScore)) || Number(fullScore) <= 0) {
+      return 'bg-gray-50';
+    }
     const rate = score / fullScore;
     if (rate >= 0.9) return 'bg-green-50';
     if (rate >= 0.8) return 'bg-blue-50';
@@ -203,40 +232,44 @@ const ParentH5Portal = () => {
         <div className="flex-1 px-4 -mt-6">
           <div className="bg-white rounded-xl shadow-lg p-6">
             <h2 className="text-lg font-semibold text-gray-800 mb-6">家长登录</h2>
+            {loginError && (
+              <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-600">
+                {loginError}
+              </div>
+            )}
             <form onSubmit={handleLogin} className="space-y-4">
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">手机号</label>
+                <label className="block text-sm font-medium text-gray-700 mb-1">学生姓名</label>
                 <input
-                  type="tel"
-                  value={loginForm.phone}
-                  onChange={(e) => setLoginForm({...loginForm, phone: e.target.value})}
-                  placeholder="请输入手机号"
+                  type="text"
+                  value={loginForm.studentName}
+                  onChange={(e) => setLoginForm({...loginForm, studentName: e.target.value})}
+                  placeholder="请输入学生姓名"
+                  disabled={loading}
                   className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">验证码</label>
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={loginForm.code}
-                    onChange={(e) => setLoginForm({...loginForm, code: e.target.value})}
-                    placeholder="请输入验证码"
-                    className="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
-                  />
-                  <button
-                    type="button"
-                    onClick={handleSendCode}
-                    disabled={countdown > 0}
-                    className={`px-4 py-3 rounded-lg font-medium ${
-                      countdown > 0
-                        ? 'bg-gray-300 text-gray-500'
-                        : 'bg-blue-600 text-white hover:bg-blue-700'
-                    }`}
-                  >
-                    {countdown > 0 ? `${countdown}s` : '获取验证码'}
-                  </button>
-                </div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">班级</label>
+                <input
+                  type="text"
+                  value={loginForm.className}
+                  onChange={(e) => setLoginForm({...loginForm, className: e.target.value})}
+                  placeholder="如 701"
+                  disabled={loading}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">鉴权码</label>
+                <input
+                  type="password"
+                  value={loginForm.authCode}
+                  onChange={(e) => setLoginForm({...loginForm, authCode: e.target.value})}
+                  placeholder="学籍辅号或身份证号后6位"
+                  disabled={loading}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
+                />
               </div>
               <button
                 type="submit"
@@ -247,7 +280,7 @@ const ParentH5Portal = () => {
               </button>
             </form>
             <p className="text-xs text-gray-500 text-center mt-4">
-              首次登录将自动注册账号
+              仅验证并展示该学生本人的成绩数据
             </p>
           </div>
         </div>
@@ -297,9 +330,15 @@ const ParentH5Portal = () => {
                   <p className="text-xs text-gray-500">满分{selectedExam.total.full_score}</p>
                 </div>
                 <div className="text-right">
-                  <p className="text-sm text-gray-600">班级排名</p>
-                  <p className="text-xl font-bold text-gray-800">{selectedExam.total.class_rank}</p>
-                  <p className="text-xs text-gray-500">年级{selectedExam.total.grade_rank}名</p>
+                  <p className="text-sm text-gray-600">年级位置</p>
+                  <p className="text-sm font-semibold text-gray-800">
+                    {parentVisibility.show_grade_rank
+                      ? (selectedExam.layer_status || (selectedExam.total.grade_rank !== '-' ? `年级${selectedExam.total.grade_rank}名` : '-'))
+                      : '排名暂未开放'}
+                  </p>
+                  <p className="text-xs text-gray-500">
+                    班级第 {maskRankValue(selectedExam.total.class_rank, parentVisibility.show_class_rank)} 名
+                  </p>
                 </div>
               </div>
             </div>
@@ -319,8 +358,8 @@ const ParentH5Portal = () => {
                       </p>
                     </div>
                     <div className="text-right text-sm">
-                      <p className="text-gray-600">班排 {data.class_rank}</p>
-                      <p className="text-gray-500">年排 {data.grade_rank}</p>
+                      <p className="text-gray-600">班排 {maskRankValue(data.class_rank, parentVisibility.show_class_rank)}</p>
+                      <p className="text-gray-500">年排 {maskRankValue(data.grade_rank, parentVisibility.show_grade_rank)}</p>
                       <p className="text-gray-400">班均 {data.class_avg}</p>
                     </div>
                   </div>
@@ -338,8 +377,8 @@ const ParentH5Portal = () => {
                 <PolarAngleAxis dataKey="subject" tick={{ fontSize: 12 }} />
                 <PolarRadiusAxis angle={90} domain={[0, 100]} tick={{ fontSize: 10 }} />
                 <Radar
-                  name="成绩"
-                  dataKey="score"
+                  name="得分率"
+                  dataKey="scoreRate"
                   stroke="#3B82F6"
                   fill="#3B82F6"
                   fillOpacity={0.3}
@@ -369,7 +408,7 @@ const ParentH5Portal = () => {
       <div className="bg-blue-600 text-white p-4">
         <div className="flex items-center justify-between">
           <div>
-            <p className="text-blue-200 text-sm">您好，{parentData.name}</p>
+            <p className="text-blue-200 text-sm">您好，{parentLabel}</p>
             <h1 className="text-lg font-semibold">学生成绩查询</h1>
           </div>
           <button onClick={handleLogout} className="text-white">
@@ -387,40 +426,67 @@ const ParentH5Portal = () => {
                 <User className="w-6 h-6 text-blue-600" />
               </div>
               <div className="flex-1">
-                <h2 className="font-semibold text-gray-800">{selectedChild.name}</h2>
-                <p className="text-sm text-gray-500">{selectedChild.class_name}</p>
+                <h2 className="font-semibold text-gray-800">{selectedChild.name || selectedChild.student_name}</h2>
+                <p className="text-sm text-gray-500">{selectedChild.class_name || '未分配班级'}</p>
               </div>
               <div className="text-right text-sm text-gray-500">
                 <p>学号</p>
-                <p className="font-medium text-gray-800">{selectedChild.student_code}</p>
+                <p className="font-medium text-gray-800">{selectedChild.student_code || selectedChild.student_no || selectedChild.id}</p>
               </div>
             </div>
+            {boundChildren.length > 1 && (
+              <select
+                value={selectedChild.id}
+                onChange={(event) => {
+                  const nextChild = boundChildren.find(child => String(child.id) === String(event.target.value));
+                  setSelectedChild(nextChild || null);
+                  setSelectedExam(null);
+                  setShowExamDetail(false);
+                }}
+                className="mt-4 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+              >
+                {boundChildren.map(child => (
+                  <option key={child.id} value={child.id}>{child.name || child.student_name}</option>
+                ))}
+              </select>
+            )}
+          </div>
+        </div>
+      )}
+
+      {boundChildren.length === 0 && (
+        <div className="p-4">
+          <div className="bg-white rounded-xl shadow p-5">
+            <h3 className="font-semibold text-gray-800">暂无绑定学生</h3>
+            <p className="text-sm text-gray-500 mt-2">当前家长档案还没有绑定学生。完成家长管理中的绑定后，这里才会展示学生成绩。</p>
           </div>
         </div>
       )}
 
       {/* 最新成绩 */}
-      {examScores[0] && (
+      {latestExam ? (
         <div className="p-4">
           <div className="bg-white rounded-xl shadow p-4">
             <div className="flex items-center justify-between mb-3">
               <h3 className="font-semibold text-gray-800">最新成绩</h3>
-              <span className="text-sm text-gray-500">{examScores[0].exam_name}</span>
+              <span className="text-sm text-gray-500">{latestExam.exam_name}</span>
             </div>
 
-            <div className={`rounded-lg p-4 ${getScoreBg(examScores[0].total.score, examScores[0].total.full_score)}`}>
+            <div className={`rounded-lg p-4 ${getScoreBg(latestExam.total.score, latestExam.total.full_score)}`}>
               <div className="flex items-center justify-between">
                 <div>
                   <p className="text-sm text-gray-600">总分</p>
-                  <p className={`text-3xl font-bold ${getScoreColor(examScores[0].total.score, examScores[0].total.full_score)}`}>
-                    {examScores[0].total.score}
+                  <p className={`text-3xl font-bold ${getScoreColor(latestExam.total.score, latestExam.total.full_score)}`}>
+                    {latestExam.total.score}
                   </p>
-                  <p className="text-xs text-gray-500">班级第 {examScores[0].total.class_rank} 名</p>
+                  <p className="text-xs text-gray-500">
+                    班级第 {maskRankValue(latestExam.total.class_rank, parentVisibility.show_class_rank)} 名
+                  </p>
                 </div>
                 <div className="text-right">
-                  <p className="text-sm text-gray-600">Z值</p>
-                  <p className={`text-xl font-bold ${examScores[0].z_value >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                    {examScores[0].z_value > 0 ? '+' : ''}{examScores[0].z_value}
+                  <p className="text-sm text-gray-600">年级位置</p>
+                  <p className="max-w-32 text-sm font-semibold text-gray-800">
+                    {parentVisibility.show_grade_rank ? (latestExam.layer_status || '-') : '排名暂未开放'}
                   </p>
                 </div>
               </div>
@@ -428,7 +494,7 @@ const ParentH5Portal = () => {
 
             {/* 快捷查看各科 */}
             <div className="grid grid-cols-5 gap-2 mt-4">
-              {Object.entries(examScores[0].subjects).map(([subject, data]) => (
+              {Object.entries(latestExam.subjects).map(([subject, data]) => (
                 <div key={subject} className="text-center">
                   <p className="text-xs text-gray-500">{subject}</p>
                   <p className={`font-semibold ${getScoreColor(data.score, data.full_score)}`}>
@@ -440,7 +506,7 @@ const ParentH5Portal = () => {
 
             <button
               onClick={() => {
-                setSelectedExam(examScores[0]);
+                setSelectedExam(latestExam);
                 setShowExamDetail(true);
               }}
               className="w-full mt-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium"
@@ -449,9 +515,17 @@ const ParentH5Portal = () => {
             </button>
           </div>
         </div>
+      ) : boundChildren.length > 0 && (
+        <div className="p-4">
+          <div className="bg-white rounded-xl shadow p-5">
+            <h3 className="font-semibold text-gray-800">暂无有效成绩</h3>
+            <p className="text-sm text-gray-500 mt-2">成绩导入并确认有效后，将自动显示总分、班级排名、学科明细和趋势图。</p>
+          </div>
+        </div>
       )}
 
       {/* 成绩趋势 */}
+      {examScores.length > 0 && (
       <div className="px-4 pb-4">
         <div className="bg-white rounded-xl shadow p-4">
           <h3 className="font-semibold text-gray-800 mb-3">成绩趋势</h3>
@@ -459,7 +533,7 @@ const ParentH5Portal = () => {
             <LineChart data={trendData}>
               <CartesianGrid strokeDasharray="3 3" />
               <XAxis dataKey="exam" tick={{ fontSize: 10 }} />
-              <YAxis domain={[0, 500]} tick={{ fontSize: 10 }} />
+              <YAxis domain={[0, trendMax]} tick={{ fontSize: 10 }} />
               <Tooltip />
               <Line type="monotone" dataKey="total" name="总分" stroke="#3B82F6" strokeWidth={2} />
               <Line type="monotone" dataKey="avg" name="班均" stroke="#10B981" strokeWidth={2} />
@@ -467,8 +541,10 @@ const ParentH5Portal = () => {
           </ResponsiveContainer>
         </div>
       </div>
+      )}
 
       {/* 历史考试列表 */}
+      {examScores.length > 0 && (
       <div className="px-4 pb-20">
         <h3 className="font-semibold text-gray-800 mb-3">历史考试</h3>
         <div className="space-y-3">
@@ -491,7 +567,9 @@ const ParentH5Portal = () => {
                     <p className={`text-xl font-bold ${getScoreColor(exam.total.score, exam.total.full_score)}`}>
                       {exam.total.score}
                     </p>
-                    <p className="text-xs text-gray-500">班排{exam.total.class_rank}</p>
+                    <p className="text-xs text-gray-500">
+                      班排{maskRankValue(exam.total.class_rank, parentVisibility.show_class_rank)}
+                    </p>
                   </div>
                   <ChevronRight className="w-5 h-5 text-gray-400" />
                 </div>
@@ -500,6 +578,7 @@ const ParentH5Portal = () => {
           ))}
         </div>
       </div>
+      )}
 
       {/* 底部导航 */}
       <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 px-4 py-2">

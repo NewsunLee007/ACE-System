@@ -5,6 +5,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 import logging
@@ -15,9 +16,24 @@ from services.score_analysis_service import (
     ZValueResult
 )
 from core.database import get_db
+from core.security import require_permission_codes
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/analysis", tags=["教务处核心分析看板"])
+
+ANALYSIS_DASHBOARD_VIEW_CODES = (
+    "sys_admin",
+    "edu_admin",
+    "exam_admin",
+    "grade_leader",
+    "subject_leader",
+)
+
+ANALYSIS_DASHBOARD_MANAGE_CODES = (
+    "sys_admin",
+    "edu_admin",
+    "exam_admin",
+)
 
 
 # ============ Pydantic模型定义 ============
@@ -103,6 +119,7 @@ class WeakSubjectTrackResponse(BaseModel):
 def get_layer_dashboard(
     exam_id: int,
     layer_id: int,
+    current_user: dict = Depends(require_permission_codes(*ANALYSIS_DASHBOARD_VIEW_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -204,6 +221,7 @@ def get_layer_dashboard(
 def get_class_z_values(
     exam_id: int,
     layer_id: int,
+    current_user: dict = Depends(require_permission_codes(*ANALYSIS_DASHBOARD_VIEW_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -243,6 +261,7 @@ def get_single_class_z_value(
     exam_id: int,
     layer_id: int,
     class_name: str,
+    current_user: dict = Depends(require_permission_codes(*ANALYSIS_DASHBOARD_VIEW_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -278,6 +297,7 @@ def get_subject_thresholds(
     exam_id: int,
     layer_id: int,
     percentages: Optional[str] = Query(None, description="百分比列表，如: 0.2,0.4,0.6,0.8"),
+    current_user: dict = Depends(require_permission_codes(*ANALYSIS_DASHBOARD_VIEW_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -322,6 +342,7 @@ def get_layer_subject_means(
     exam_id: int,
     layer_id: int,
     class_name: Optional[str] = Query(None, description="指定班级，为空则返回所有班级"),
+    current_user: dict = Depends(require_permission_codes(*ANALYSIS_DASHBOARD_VIEW_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -346,6 +367,7 @@ def track_weak_subject(
     layer_id: int,
     subject: str = Query(..., description="学科名称: chinese/math/english/science/society"),
     class_name: Optional[str] = Query(None, description="指定班级，为空则返回所有班级"),
+    current_user: dict = Depends(require_permission_codes(*ANALYSIS_DASHBOARD_VIEW_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -376,6 +398,7 @@ def track_weak_subject(
 def recalculate_all_z_values(
     exam_id: int,
     layer_id: int,
+    current_user: dict = Depends(require_permission_codes(*ANALYSIS_DASHBOARD_MANAGE_CODES)),
     db: Session = Depends(get_db)
 ):
     """

@@ -12,10 +12,16 @@ from datetime import date
 import logging
 
 from core.database import get_db
-from core.security import get_current_user, require_permission
+from core.security import (
+    get_current_user,
+    has_own_resource_or_permission_code,
+    require_permission_codes
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/teachers", tags=["教师管理"])
+
+TEACHER_DIRECTORY_PERMISSION_CODES = ("edu_admin",)
 
 
 # ============ Pydantic模型定义 ============
@@ -60,6 +66,16 @@ class TeacherPerformance(BaseModel):
     z_value: float
 
 
+def ensure_can_view_teacher_record(current_user: dict, teacher_id: int) -> None:
+    if has_own_resource_or_permission_code(
+        current_user,
+        teacher_id,
+        TEACHER_DIRECTORY_PERMISSION_CODES
+    ):
+        return
+    raise HTTPException(status_code=403, detail="权限不足，无法查看其他教师数据")
+
+
 # ============ API路由 ============
 
 @router.get("/list")
@@ -69,7 +85,7 @@ def get_teacher_list(
     is_active: Optional[bool] = Query(True, description="是否在职"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(20, ge=1, le=100, description="每页数量"),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_permission_codes(*TEACHER_DIRECTORY_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -159,6 +175,8 @@ def get_teacher_assignments(
     获取教师任课安排
     """
     try:
+        ensure_can_view_teacher_record(current_user, teacher_id)
+
         # 查询教师基本信息
         teacher_sql = """
             SELECT u.id, u.real_name, r.role_name
@@ -225,7 +243,7 @@ def get_teacher_assignments(
 @router.post("/assign")
 def assign_teacher(
     request: TeacherAssignmentRequest,
-    current_user: dict = Depends(require_permission("edu_admin")),
+    current_user: dict = Depends(require_permission_codes(*TEACHER_DIRECTORY_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -299,7 +317,7 @@ def assign_teacher(
 @router.delete("/assignments/{assignment_id}")
 def remove_assignment(
     assignment_id: int,
-    current_user: dict = Depends(require_permission("edu_admin")),
+    current_user: dict = Depends(require_permission_codes(*TEACHER_DIRECTORY_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -345,6 +363,8 @@ def get_teacher_performance(
     查询教师所教班级的成绩表现
     """
     try:
+        ensure_can_view_teacher_record(current_user, teacher_id)
+
         # 查询教师任课信息
         assignment_sql = """
             SELECT tcr.class_name, tcr.subject_name, tcr.term,
@@ -421,6 +441,8 @@ def get_teacher_performance(
             "performance": performance_list
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取教师业绩失败: {e}")
         raise HTTPException(status_code=500, detail="获取教师业绩失败")
@@ -437,6 +459,8 @@ def get_teacher_classes(
     获取教师所教班级列表
     """
     try:
+        ensure_can_view_teacher_record(current_user, teacher_id)
+
         sql = """
             SELECT DISTINCT class_name, grade_name, subject_name, is_headmaster
             FROM biz_teacher_class_rel
@@ -469,6 +493,8 @@ def get_teacher_classes(
             "classes": classes
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取教师班级列表失败: {e}")
         raise HTTPException(status_code=500, detail="获取教师班级列表失败")
@@ -476,7 +502,7 @@ def get_teacher_classes(
 
 @router.get("/statistics/overview")
 def get_teacher_statistics(
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_permission_codes(*TEACHER_DIRECTORY_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """

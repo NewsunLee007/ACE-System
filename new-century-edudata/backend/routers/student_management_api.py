@@ -12,10 +12,12 @@ from datetime import date
 import logging
 
 from core.database import get_db
-from core.security import get_current_user, require_permission
+from core.security import require_permission_codes
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/students", tags=["学生管理"])
+
+STUDENT_MANAGEMENT_PERMISSION_CODES = ("exam_admin",)
 
 
 # ============ Pydantic模型定义 ============
@@ -90,7 +92,7 @@ def get_student_list(
     keyword: Optional[str] = Query(None, description="关键字搜索(姓名/学籍号)"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(20, ge=1, le=100, description="每页数量"),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_permission_codes(*STUDENT_MANAGEMENT_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -171,7 +173,7 @@ def get_student_list(
 @router.get("/{student_id}/detail")
 def get_student_detail(
     student_id: int,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_permission_codes(*STUDENT_MANAGEMENT_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -252,7 +254,7 @@ def get_student_detail(
 @router.post("/create")
 def create_student(
     request: StudentCreateRequest,
-    current_user: dict = Depends(require_permission("exam_admin")),
+    current_user: dict = Depends(require_permission_codes(*STUDENT_MANAGEMENT_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -309,7 +311,7 @@ def create_student(
 def update_student(
     student_id: int,
     request: StudentUpdateRequest,
-    current_user: dict = Depends(require_permission("exam_admin")),
+    current_user: dict = Depends(require_permission_codes(*STUDENT_MANAGEMENT_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -381,7 +383,7 @@ def update_student(
 @router.post("/status-change")
 def record_status_change(
     request: StatusChangeRequest,
-    current_user: dict = Depends(require_permission("exam_admin")),
+    current_user: dict = Depends(require_permission_codes(*STUDENT_MANAGEMENT_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -454,7 +456,7 @@ def record_status_change(
 def get_student_exams(
     student_id: int,
     limit: int = Query(10, description="返回最近几次考试"),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_permission_codes(*STUDENT_MANAGEMENT_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -519,7 +521,7 @@ def get_student_exams(
 @router.get("/statistics/overview")
 def get_student_statistics(
     grade: Optional[str] = Query(None, description="年级筛选"),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_permission_codes(*STUDENT_MANAGEMENT_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """

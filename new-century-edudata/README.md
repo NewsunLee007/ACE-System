@@ -18,7 +18,7 @@
 ## 技术栈
 
 - **后端**: Python 3.10+ / FastAPI / SQLAlchemy
-- **数据库**: MySQL 8.0
+- **数据库**: 本地支持 MySQL/MariaDB，生产支持 Neon PostgreSQL
 - **数据处理**: Pandas / NumPy
 - **前端**: React 18 / TailwindCSS / Recharts
 - **部署**: Docker / Nginx
@@ -76,7 +76,7 @@ Z_class = (Score_standard × 50%) + (Top20%_ratio × 20%) + (Top80%_ratio × 30%
 ### 1. 环境准备
 
 ```bash
-# 安装MySQL 8.0
+# 安装 MariaDB 11.x
 # 创建数据库
 create database new_century_edudata character set utf8mb4 collate utf8mb4_unicode_ci;
 ```
@@ -86,6 +86,20 @@ create database new_century_edudata character set utf8mb4 collate utf8mb4_unicod
 ```bash
 cd database
 mysql -u root -p new_century_edudata < new_century_schema.sql
+```
+
+生产部署到 Neon 时使用 PostgreSQL 初始化脚本：
+
+```bash
+psql "$DATABASE_URL" -f database/neon_postgres_schema.sql
+```
+
+如果要把当前系统内置的真实演示数据同步到 Neon：
+
+```bash
+export DATABASE_URL="postgresql://USER:PASSWORD@HOST/neondb?sslmode=require"
+export SEED_DEFAULT_PASSWORD="请改成临时强密码"
+python scripts/seed_neon_demo_data.py --with-schema
 ```
 
 ### 3. 后端部署
@@ -173,7 +187,11 @@ npm start
 
 ```bash
 # 数据库配置
+# 本地 MySQL/MariaDB
 DATABASE_URL=mysql+pymysql://user:password@host:port/database?charset=utf8mb4
+
+# Vercel + Neon PostgreSQL
+# DATABASE_URL=postgresql://USER:PASSWORD@HOST/neondb?sslmode=require
 
 # 应用配置
 APP_NAME=新纪元教务大数据平台
@@ -200,6 +218,32 @@ engine = create_engine(
 
 ## 部署指南
 
+### Vercel + Neon 部署
+
+1. 在 Neon 创建数据库，复制 `DATABASE_URL`，并先执行 `database/neon_postgres_schema.sql`。
+   - 需要导入当前真实演示数据时，可执行 `python scripts/seed_neon_demo_data.py --with-schema`。
+2. 在 Vercel 项目环境变量中配置：
+   - `DATABASE_URL`
+   - `SECRET_KEY`
+   - 可选 AI 配置：`DEEPSEEK_API_KEY`、`DEEPSEEK_API_BASE_URL`、`DEEPSEEK_MODEL`
+3. 仓库根目录已经提供 `vercel.json`，会把 `/api/*` 路由到 FastAPI，把其他页面路由到 React 构建产物。
+4. 通过 GitHub 集成或 `vercel deploy` 发布；本地 CLI 需要先执行 `vercel login`。
+
+已提供发布辅助脚本，适合在 GitHub 与 Vercel 都登录后执行：
+
+```bash
+cd "/Users/newsunsmac/Downloads/ACE System"
+VERCEL_SCOPE="newsun-lees-projects" \
+VERCEL_PROJECT="ace-system" \
+DATABASE_URL="postgresql://USER:PASSWORD@HOST/neondb?sslmode=require" \
+SEED_NEON=1 \
+CREATE_VERCEL_PROJECT=1 \
+DEPLOY_PROD=1 \
+./new-century-edudata/scripts/publish_github_vercel_neon.sh
+```
+
+当前后端已对核心教务链路的 PostgreSQL 方言做兼容：家长绑定、班级/学科/角色/教师职务管理、成绩导入、成绩分析结果包、分层统计缓存和排名可见性设置。
+
 ### Docker部署
 
 ```dockerfile
@@ -224,12 +268,12 @@ version: '3.8'
 
 services:
   db:
-    image: mysql:8.0
+    image: mariadb:11.4
     environment:
-      MYSQL_ROOT_PASSWORD: password
-      MYSQL_DATABASE: new_century_edudata
+      MARIADB_ROOT_PASSWORD: password
+      MARIADB_DATABASE: new_century_edudata
     volumes:
-      - mysql_data:/var/lib/mysql
+      - mariadb_data:/var/lib/mysql
       - ./database/new_century_schema.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
       - "3306:3306"
@@ -253,7 +297,7 @@ services:
       - backend
 
 volumes:
-  mysql_data:
+  mariadb_data:
 ```
 
 ### 生产环境部署步骤
@@ -330,7 +374,7 @@ backend/logs/app.log
 
 ### 数据库备份
 ```bash
-mysqldump -u root -p new_century_edudata > backup_$(date +%Y%m%d).sql
+mariadb-dump -u root -p new_century_edudata > backup_$(date +%Y%m%d).sql
 ```
 
 ### 性能优化建议

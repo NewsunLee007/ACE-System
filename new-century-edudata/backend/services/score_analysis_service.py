@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 import logging
 
+from core.database import is_postgresql, is_sqlite
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -523,24 +525,44 @@ class ScoreAnalysisService:
             bool: 保存是否成功
         """
         try:
-            sql = """
-                INSERT INTO biz_class_z_values 
-                (exam_id, layer_id, class_name, class_mean, layer_mean, layer_std,
-                 standard_score, top20_ratio, top80_ratio, final_z_value, class_count, calculated_at)
-                VALUES 
-                (:exam_id, :layer_id, :class_name, :class_mean, :layer_mean, :layer_std,
-                 :standard_score, :top20_ratio, :top80_ratio, :final_z_value, :class_count, NOW())
-                ON DUPLICATE KEY UPDATE
-                class_mean = VALUES(class_mean),
-                layer_mean = VALUES(layer_mean),
-                layer_std = VALUES(layer_std),
-                standard_score = VALUES(standard_score),
-                top20_ratio = VALUES(top20_ratio),
-                top80_ratio = VALUES(top80_ratio),
-                final_z_value = VALUES(final_z_value),
-                class_count = VALUES(class_count),
-                calculated_at = VALUES(calculated_at)
-            """
+            if is_postgresql(self.db) or is_sqlite(self.db):
+                sql = """
+                    INSERT INTO biz_class_z_values
+                    (exam_id, layer_id, class_name, class_mean, layer_mean, layer_std,
+                     standard_score, top20_ratio, top80_ratio, final_z_value, class_count, calculated_at)
+                    VALUES
+                    (:exam_id, :layer_id, :class_name, :class_mean, :layer_mean, :layer_std,
+                     :standard_score, :top20_ratio, :top80_ratio, :final_z_value, :class_count, CURRENT_TIMESTAMP)
+                    ON CONFLICT (exam_id, layer_id, class_name) DO UPDATE SET
+                    class_mean = excluded.class_mean,
+                    layer_mean = excluded.layer_mean,
+                    layer_std = excluded.layer_std,
+                    standard_score = excluded.standard_score,
+                    top20_ratio = excluded.top20_ratio,
+                    top80_ratio = excluded.top80_ratio,
+                    final_z_value = excluded.final_z_value,
+                    class_count = excluded.class_count,
+                    calculated_at = CURRENT_TIMESTAMP
+                """
+            else:
+                sql = """
+                    INSERT INTO biz_class_z_values
+                    (exam_id, layer_id, class_name, class_mean, layer_mean, layer_std,
+                     standard_score, top20_ratio, top80_ratio, final_z_value, class_count, calculated_at)
+                    VALUES
+                    (:exam_id, :layer_id, :class_name, :class_mean, :layer_mean, :layer_std,
+                     :standard_score, :top20_ratio, :top80_ratio, :final_z_value, :class_count, NOW())
+                    ON DUPLICATE KEY UPDATE
+                    class_mean = VALUES(class_mean),
+                    layer_mean = VALUES(layer_mean),
+                    layer_std = VALUES(layer_std),
+                    standard_score = VALUES(standard_score),
+                    top20_ratio = VALUES(top20_ratio),
+                    top80_ratio = VALUES(top80_ratio),
+                    final_z_value = VALUES(final_z_value),
+                    class_count = VALUES(class_count),
+                    calculated_at = VALUES(calculated_at)
+                """
             
             self.db.execute(
                 text(sql),

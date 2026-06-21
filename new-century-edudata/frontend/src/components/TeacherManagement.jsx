@@ -1,24 +1,51 @@
-import React, { useState, useEffect } from 'react';
-import { 
-  Users, Search, Plus, Filter, Edit2, Trash2, BookOpen, 
-  GraduationCap, Calendar, ChevronDown, X, Save, UserPlus,
-  Building2, Award, BarChart3, CheckCircle, AlertCircle,
+import React, { useCallback, useState, useEffect } from 'react';
+import {
+  Users, Search, Plus, Edit2, Trash2, BookOpen,
+  X, Award, CheckCircle,
   Download, Upload, FileSpreadsheet, Square, CheckSquare,
-  Shield, Key, RefreshCw
+  Shield, Key
 } from 'lucide-react';
 import schoolData from '../data/schoolData';
+import { notify } from '../lib/notify';
+import { useConfirm } from './ui/confirm';
 import SmartImportModal from './SmartImportModal';
+import {
+  buildTeacherImport,
+  commitTeacherImport,
+  parseTeacherImportText,
+} from '../lib/teacherImport';
+import {
+  createTeacherUser,
+  fetchAuthRoles,
+  fetchTeacherListWithAssignments,
+  syncTeacherAssignments,
+  toggleTeacherStatus,
+} from '../lib/teacherApi';
+import { hasBackendAuthToken } from '../lib/sessionToken';
+
+const hasBackendSession = hasBackendAuthToken;
+
+const getCurrentTerm = () => {
+  if (typeof schoolData.getCurrentSemesterDisplay === 'function') {
+    return schoolData.getCurrentSemesterDisplay();
+  }
+  return `${schoolData.config.currentAcademicYear}-${schoolData.config.currentSemester}`;
+};
 
 const TeacherManagement = () => {
+  const { confirm: confirmAction } = useConfirm();
   const [teachers, setTeachers] = useState([]);
-  const [classes, setClasses] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [teacherSyncSource, setTeacherSyncSource] = useState('local');
+  const [teacherListLoading, setTeacherListLoading] = useState(false);
+  const [teacherListError, setTeacherListError] = useState('');
+  const [teacherSaving, setTeacherSaving] = useState(false);
+  const [teacherImporting, setTeacherImporting] = useState(false);
+  const [backendRoles, setBackendRoles] = useState([]);
   const [searchTerm, setSearchTerm] = useState('');
   const [filterSubject, setFilterSubject] = useState('all');
   const [filterRole, setFilterRole] = useState('all');
   const [showAddModal, setShowAddModal] = useState(false);
   const [showEditModal, setShowEditModal] = useState(false);
-  const [showAssignModal, setShowAssignModal] = useState(false);
   const [showImportModal, setShowImportModal] = useState(false);
   const [showRoleModal, setShowRoleModal] = useState(false);
   const [showPermissionModal, setShowPermissionModal] = useState(false);
@@ -29,18 +56,12 @@ const TeacherManagement = () => {
     code: '',
     phone: '',
     email: '',
+    initial_password: '',
     subjects: [],
     roles: ['subject_teacher'],
     status: 'active',
     teaching_classes: [],
     custom_permissions: []
-  });
-  
-  const [assignData, setAssignData] = useState({
-    classId: '',
-    subjectId: '',
-    semester: schoolData.getCurrentSemesterDisplay(),
-    isHeadTeacher: false
   });
   
   const [importFile, setImportFile] = useState(null);
@@ -50,55 +71,131 @@ const TeacherManagement = () => {
   // 智能导入相关状态
   const [showSmartImport, setShowSmartImport] = useState(false);
   const [importPreviewData, setImportPreviewData] = useState([]);
+  const skipInitialTeacherSync = React.useRef(true);
+  const localTeacherCacheRef = React.useRef([]);
 
   const subjects = schoolData.subjects;
   const teacherRoles = schoolData.teacherRoles;
+  const backendSessionActive = hasBackendSession();
+  const resetTeacherForm = () => {
+    setFormData({
+      name: '',
+      code: '',
+      phone: '',
+      email: '',
+      initial_password: '',
+      subjects: [],
+      roles: ['subject_teacher'],
+      status: 'active',
+      teaching_classes: [],
+      custom_permissions: []
+    });
+  };
 
   useEffect(() => {
-    setTimeout(() => {
-      setTeachers(schoolData.teachers);
-      setClasses(schoolData.classes);
-      setLoading(false);
-    }, 500);
+    const localTeachers = schoolData.teachers || [];
+    localTeacherCacheRef.current = localTeachers;
+    setTeachers(localTeachers);
   }, []);
+
+  const refreshTeachers = useCallback(async () => {
+    if (!hasBackendSession()) {
+      setTeacherSyncSource('local');
+      return null;
+    }
+
+    setTeacherListLoading(true);
+    try {
+      const [roles, payload] = await Promise.all([
+        fetchAuthRoles(),
+        fetchTeacherListWithAssignments({
+          pageSize: 100,
+          term: getCurrentTerm(),
+        }, schoolData.classes || []),
+      ]);
+      setBackendRoles(roles);
+      const remoteTeachers = payload.teachers || [];
+      if (remoteTeachers.length === 0 && localTeacherCacheRef.current.length > 0) {
+        setTeachers(localTeacherCacheRef.current);
+        setTeacherSyncSource('local');
+        setTeacherListError('后端教师库暂无教师记录，当前显示本地真实导入数据。');
+        return {
+          ...payload,
+          teachers: localTeacherCacheRef.current,
+          source: 'local-fallback',
+        };
+      }
+
+      setTeachers(remoteTeachers);
+      if (remoteTeachers.length > 0) {
+        localTeacherCacheRef.current = remoteTeachers;
+      }
+      setTeacherSyncSource('backend');
+      setTeacherListError('');
+      return payload;
+    } catch (error) {
+      setTeacherSyncSource('local');
+      setTeacherListError(`后端教师库暂不可用，当前显示本地缓存：${error.message || '连接失败'}`);
+      return null;
+    } finally {
+      setTeacherListLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshTeachers();
+  }, [refreshTeachers]);
+
+  useEffect(() => {
+    if (skipInitialTeacherSync.current) {
+      skipInitialTeacherSync.current = false;
+      return;
+    }
+    schoolData.teachers = teachers;
+    if (teachers.length > 0) {
+      localTeacherCacheRef.current = teachers;
+    }
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new Event('schoolData:changed'));
+    }
+  }, [teachers]);
 
   // 获取教师的主角色
   const getTeacherPrimaryRole = (teacher) => {
-    return schoolData.getTeacherPrimaryRole(teacher.id);
-  };
-
-  // 获取教师的所有角色
-  const getTeacherRoles = (teacher) => {
-    return schoolData.getTeacherRoles(teacher.id);
+    const roles = teacher.roles || ['subject_teacher'];
+    return [...teacherRoles]
+      .filter(role => roles.includes(role.id))
+      .sort((a, b) => b.level - a.level)[0] || teacherRoles[0];
   };
 
   // 下载导入模板 - 支持两种方式：单行多班级 或 多行单班级
   const downloadTemplate = () => {
-    const headers = ['工号', '姓名', '电话', '邮箱', '任教科目', '任教班级'];
+    const headers = ['工号', '姓名', '电话', '邮箱', '初始密码', '任教科目', '任教班级'];
     
     const comments = [
       '# 教师导入模板说明：',
       '#',
       '# 【方式一】单行多班级（推荐）- 一个教师一行，多个班级用分号隔开',
-      '#   示例：T001,张老师,13800138001,zhang@school.com,语文,701;702;703',
+      '#   示例：T001,张老师,13800138001,zhang@school.com,ChangeMe123,语文,701;702;703',
       '#',
       '# 【方式二】多行单班级 - 一个教师多行，每行一个班级',
       '#   示例：',
-      '#   T001,张老师,13800138001,zhang@school.com,语文,701',
-      '#   T001,张老师,13800138001,zhang@school.com,语文,702',
+      '#   T001,张老师,13800138001,zhang@school.com,ChangeMe123,语文,701',
+      '#   T001,张老师,13800138001,zhang@school.com,,语文,702',
       '#',
       '# 注意：',
       '# - 相同工号的教师信息会自动合并',
+      '# - 登录后导入后端教师库时，新增教师必须填写初始密码',
       '# - 任教班级可以是班级编号（如701）或班级序号（如01）',
       '# - 多个班级用分号(;)或逗号(,)分隔',
       '#',
     ];
     
     const sampleData = [
-      ['T001', '林昕昕', '15957762377', '', '语文', '701'],
-      ['T002', '王江鹏', '18272194348', '', '语文', '703'],
-      ['T003', '周慧敏', '13616601785', '', '语文', '705;707'],
-      ['T004', '吴国平', '18257589139', '', '语文', '702;704;706'],
+      ['T001', '林昕昕', '15957762377', '', 'ChangeMe123', '语文', '701'],
+      ['T002', '王江鹏', '18272194348', '', 'ChangeMe123', '语文', '703'],
+      ['T003', '周慧敏', '13616601785', '', 'ChangeMe123', '语文', '705;707'],
+      ['T004', '吴国平', '18257589139', '', 'ChangeMe123', '语文', '702;704;706'],
     ];
     
     const csvContent = [
@@ -120,8 +217,17 @@ const TeacherManagement = () => {
     const data = filteredTeachers.map(t => {
       const primaryRole = getTeacherPrimaryRole(t);
       return [
-        t.code, t.name, t.phone, t.email || '', t.subjects.join(';'), 
-        t.teaching_classes.map(tc => schoolData.formatClassName(tc.class_id)).join(';'),
+        t.code || '',
+        t.name || '',
+        t.phone || '',
+        t.email || '',
+        (t.subjects || []).join(';'),
+        (t.teaching_classes || [])
+          .map(tc => schoolData.getClassById(tc.class_id)
+            ? schoolData.formatClassName(tc.class_id)
+            : tc.class_name || tc.class_id || '')
+          .filter(Boolean)
+          .join(';'),
         primaryRole?.name || '科任教师',
         t.status === 'active' ? '在职' : '暂停'
       ];
@@ -138,164 +244,128 @@ const TeacherManagement = () => {
   // 智能导入 - 解析文件并显示预览
   const handleImportPreview = () => {
     if (!importFile) {
-      alert('请先选择要导入的文件');
+      notify('请先选择要导入的文件');
       return;
     }
     
     const reader = new FileReader();
     reader.onload = (e) => {
-      const content = e.target.result;
-      const lines = content.split('\n').filter(line => {
-        const trimmed = line.trim();
-        return trimmed && !trimmed.startsWith('#');
-      });
-      
-      if (lines.length < 2) {
-        alert('文件格式错误：缺少表头或数据行');
-        return;
-      }
-      
-      const previewData = [];
-      const teacherMap = new Map(); // 用于合并同一教师的多行数据
-      
-      // 第一遍：收集所有数据，合并同一教师的多班级
-      for (let i = 1; i < lines.length; i++) {
-        const cols = lines[i].split(',');
-        if (cols.length >= 3) {
-          const code = cols[0]?.trim() || '';
-          const name = cols[1]?.trim() || '';
-          const phone = cols[2]?.trim() || '';
-          const email = cols[3]?.trim() || '';
-          const subject = cols[4]?.trim() || '';
-          const classNoStr = cols[5]?.trim() || '';
-          
-          // 解析班级
-          const classNos = classNoStr.split(/[;,]/).map(s => s.trim()).filter(Boolean);
-          const classIds = [];
-          classNos.forEach(classNo => {
-            let cls = schoolData.classes.find(c => c.id === parseInt(classNo));
-            if (!cls) {
-              cls = schoolData.classes.find(c => c.class_no === classNo);
-            }
-            if (cls && !classIds.includes(cls.id)) {
-              classIds.push(cls.id);
-            }
-          });
-          
-          if (teacherMap.has(code)) {
-            // 合并同一教师的多个班级
-            const existing = teacherMap.get(code);
-            if (subject && !existing.subjects.includes(subject)) {
-              existing.subjects.push(subject);
-            }
-            classIds.forEach(classId => {
-              if (!existing.teaching_classes.some(tc => tc.class_id === classId)) {
-                existing.teaching_classes.push({ class_id: classId, subject });
-              }
-            });
-          } else {
-            teacherMap.set(code, {
-              code, name, phone, email, subjects: subject ? [subject] : [],
-              teaching_classes: classIds.map(classId => ({ class_id: classId, subject }))
-            });
-          }
+      try {
+        const parsed = parseTeacherImportText(e.target.result || '');
+        const result = buildTeacherImport({
+          parsedRows: parsed.rows,
+          teachers,
+          classes: schoolData.classes || [],
+          formatClassName: schoolData.formatClassName.bind(schoolData),
+        });
+
+        if (result.items.length === 0) {
+          notify('没有可导入的教师数据');
+          return;
         }
+
+        setImportPreviewData(result.items);
+        setShowSmartImport(true);
+        setShowImportModal(false);
+      } catch (error) {
+        notify(error.message || '解析教师导入文件失败');
       }
-      
-      // 第二遍：生成预览数据
-      teacherMap.forEach((data, code) => {
-        const existingTeacher = schoolData.teachers.find(t => t.code === code);
-        
-        if (existingTeacher) {
-          // 检查变化
-          const changes = [];
-          if (data.name !== existingTeacher.name) changes.push('name');
-          if (data.phone !== existingTeacher.phone) changes.push('phone');
-          if (data.email !== existingTeacher.email) changes.push('email');
-          
-          // 检查科目变化
-          const subjectsChanged = 
-            data.subjects.length !== existingTeacher.subjects?.length ||
-            !data.subjects.every(s => existingTeacher.subjects?.includes(s));
-          if (subjectsChanged) changes.push('subjects');
-          
-          // 检查班级变化
-          const classesChanged =
-            data.teaching_classes.length !== existingTeacher.teaching_classes?.length ||
-            !data.teaching_classes.every(tc => 
-              existingTeacher.teaching_classes?.some(etc => etc.class_id === tc.class_id)
-            );
-          if (classesChanged) changes.push('teaching_classes');
-          
-          previewData.push({
-            type: changes.length > 0 ? 'update' : 'unchanged',
-            data: { ...data },
-            existingData: existingTeacher,
-            changes
-          });
-        } else {
-          previewData.push({
-            type: 'new',
-            data: { ...data }
-          });
-        }
-      });
-      
-      setImportPreviewData(previewData);
-      setShowSmartImport(true);
-      setShowImportModal(false);
     };
     
     reader.readAsText(importFile);
   };
 
   // 确认智能导入
-  const handleConfirmImport = (selectedData) => {
-    let addedCount = 0;
-    let updatedCount = 0;
-    
-    selectedData.forEach(item => {
-      if (item.type === 'new') {
-        // 创建新教师
-        schoolData.teachers.push({
-          id: Date.now() + Math.random(),
-          code: item.data.code,
-          name: item.data.name,
-          phone: item.data.phone,
-          email: item.data.email,
-          subjects: item.data.subjects,
-          roles: ['subject_teacher'],
-          status: 'active',
-          teaching_classes: item.data.teaching_classes,
-          custom_permissions: []
-        });
-        addedCount++;
-      } else if (item.type === 'update') {
-        // 更新现有教师
-        const existing = item.existingData;
-        existing.name = item.data.name;
-        existing.phone = item.data.phone;
-        existing.email = item.data.email;
-        existing.subjects = item.data.subjects;
-        existing.teaching_classes = item.data.teaching_classes;
-        updatedCount++;
+  const handleConfirmImport = async (selectedData) => {
+    const addedCount = selectedData.filter(item => item.type === 'new').length;
+    const updatedCount = selectedData.filter(item => item.type === 'update').length;
+
+    if (addedCount === 0 && updatedCount === 0) {
+      notify('没有选择需要写入的教师变更');
+      return;
+    }
+
+    if (hasBackendSession()) {
+      const missingPasswordItems = selectedData.filter(item => (
+        item.type === 'new' && String(item.data?.initial_password || '').trim().length < 6
+      ));
+      if (missingPasswordItems.length > 0) {
+        notify(`有 ${missingPasswordItems.length} 位新增教师缺少至少 6 位初始密码，请补充后再导入。`, 'warning');
+        return;
       }
+
+      setTeacherImporting(true);
+      try {
+        const roles = backendRoles.length > 0 ? backendRoles : await fetchAuthRoles();
+        setBackendRoles(roles);
+
+        for (const item of selectedData) {
+          const data = item.data || {};
+          let targetTeacher = teachers.find(teacher => teacher.code === data.code);
+
+          if (item.type === 'new') {
+            const created = await createTeacherUser({
+              ...data,
+              roles: data.roles || ['subject_teacher'],
+            }, roles);
+            if (created?.success === false) {
+              throw new Error(created.message || `${data.name || data.code} 创建失败`);
+            }
+            if (!created.teacher_id && data.teaching_classes?.length > 0) {
+              throw new Error(`${data.name || data.code} 已创建，但暂时无法定位教师ID来同步任课安排`);
+            }
+            targetTeacher = {
+              id: created.teacher_id,
+              code: data.code,
+              name: data.name,
+              teaching_classes: [],
+            };
+          }
+
+          if (targetTeacher?.id && data.teaching_classes?.length > 0) {
+            await syncTeacherAssignments({
+              teacher: targetTeacher,
+              form: data,
+              classes: schoolData.classes || [],
+              term: getCurrentTerm(),
+            });
+          }
+        }
+
+        await refreshTeachers();
+        setShowSmartImport(false);
+        setImportFile(null);
+        notify(`导入完成：新增 ${addedCount} 位教师，更新 ${updatedCount} 位教师`, 'success');
+        return;
+      } catch (error) {
+        notify('教师导入失败：' + (error.message || '请稍后重试'), 'error');
+        return;
+      } finally {
+        setTeacherImporting(false);
+      }
+    }
+
+    const importResult = { items: selectedData };
+    const updatedTeachers = commitTeacherImport({
+      teachers,
+      importResult,
     });
     
-    setTeachers([...schoolData.teachers]);
+    setTeachers(updatedTeachers);
     setShowSmartImport(false);
     setImportFile(null);
     
-    let message = `导入完成：`;
+    let message = '导入完成：';
     if (addedCount > 0) message += `新增 ${addedCount} 位教师`;
     if (updatedCount > 0) message += `${addedCount > 0 ? '，' : ''}更新 ${updatedCount} 位教师`;
-    alert(message);
+    notify(message, 'success');
   };
 
   const filteredTeachers = teachers.filter(teacher => {
-    const matchesSearch = teacher.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                         teacher.code.toLowerCase().includes(searchTerm.toLowerCase());
-    const matchesSubject = filterSubject === 'all' || teacher.subjects.includes(filterSubject);
+    const keyword = searchTerm.toLowerCase();
+    const matchesSearch = String(teacher.name || '').toLowerCase().includes(keyword) ||
+                         String(teacher.code || '').toLowerCase().includes(keyword);
+    const matchesSubject = filterSubject === 'all' || (teacher.subjects || []).includes(filterSubject);
     const matchesRole = filterRole === 'all' || (teacher.roles && teacher.roles.includes(filterRole));
     return matchesSearch && matchesSubject && matchesRole;
   });
@@ -307,17 +377,54 @@ const TeacherManagement = () => {
     withClasses: teachers.filter(t => t.teaching_classes && t.teaching_classes.length > 0).length
   };
 
-  const handleAddTeacher = () => {
+  const handleAddTeacher = async () => {
+    if (!formData.code.trim() || !formData.name.trim() || !formData.phone.trim()) {
+      notify('请填写工号、姓名和联系电话');
+      return;
+    }
+    if (teachers.some(teacher => teacher.code === formData.code.trim())) {
+      notify('该教师工号已存在，请直接编辑原教师');
+      return;
+    }
+
+    if (hasBackendSession()) {
+      if (formData.initial_password.trim().length < 6) {
+        notify('后端创建教师账号时，初始密码至少需要 6 位。', 'warning');
+        return;
+      }
+
+      setTeacherSaving(true);
+      try {
+        const result = await createTeacherUser(formData, backendRoles);
+        if (result?.success === false) {
+          notify(result.message || '教师账号创建失败', 'warning');
+          return;
+        }
+        await refreshTeachers();
+        setShowAddModal(false);
+        resetTeacherForm();
+        notify(result?.message || '教师账号创建成功！', 'success');
+      } catch (error) {
+        notify('教师账号创建失败：' + (error.message || '请稍后重试'), 'error');
+      } finally {
+        setTeacherSaving(false);
+      }
+      return;
+    }
+
     const newTeacher = {
-      id: teachers.length + 1,
+      id: Math.max(0, ...teachers.map(teacher => Number(teacher.id)).filter(Number.isFinite)) + 1,
       ...formData,
+      code: formData.code.trim(),
+      name: formData.name.trim(),
+      phone: formData.phone.trim(),
+      email: formData.email.trim(),
       teaching_classes: []
     };
     const updatedTeachers = [...teachers, newTeacher];
     setTeachers(updatedTeachers);
-    schoolData.teachers = updatedTeachers;
     setShowAddModal(false);
-    setFormData({ name: '', code: '', phone: '', email: '', subjects: [], roles: ['subject_teacher'], status: 'active', teaching_classes: [], custom_permissions: [] });
+    resetTeacherForm();
   };
 
   const handleEditTeacher = (teacher) => {
@@ -327,6 +434,7 @@ const TeacherManagement = () => {
       code: teacher.code,
       phone: teacher.phone,
       email: teacher.email || '',
+      initial_password: '',
       subjects: teacher.subjects || [],
       roles: teacher.roles || ['subject_teacher'],
       status: teacher.status,
@@ -336,26 +444,91 @@ const TeacherManagement = () => {
     setShowEditModal(true);
   };
 
-  const handleSaveEdit = () => {
+  const handleSaveEdit = async () => {
     if (selectedTeacher) {
+      if (!formData.name.trim() || !formData.phone.trim()) {
+        notify('请填写姓名和联系电话');
+        return;
+      }
+      if ((formData.teaching_classes || []).length > 0 && !(formData.subjects || [])[0]) {
+        notify('请选择任教科目后再保存任课班级');
+        return;
+      }
+
+      if (hasBackendSession()) {
+        setTeacherSaving(true);
+        try {
+          const result = await syncTeacherAssignments({
+            teacher: selectedTeacher,
+            form: formData,
+            classes: schoolData.classes || [],
+            term: getCurrentTerm(),
+          });
+          await refreshTeachers();
+          setShowEditModal(false);
+          notify(`任课安排已同步：新增 ${result.createdCount} 条，移除 ${result.removedCount} 条。账号资料请在账号管理中维护。`, 'success');
+        } catch (error) {
+          notify('任课安排同步失败：' + (error.message || '请稍后重试'), 'error');
+        } finally {
+          setTeacherSaving(false);
+        }
+        return;
+      }
+
       const updatedTeachers = teachers.map(t =>
         t.id === selectedTeacher.id
-          ? { ...t, ...formData }
+          ? {
+              ...t,
+              ...formData,
+              name: formData.name.trim(),
+              phone: formData.phone.trim(),
+              email: formData.email.trim(),
+            }
           : t
       );
       setTeachers(updatedTeachers);
-      schoolData.teachers = updatedTeachers;
       setShowEditModal(false);
-      alert('教师信息更新成功！');
+      notify('教师信息更新成功！');
     }
   };
 
-  const handleDeleteTeacher = (id) => {
-    if (window.confirm('确定要删除这位教师吗？')) {
-      const updatedTeachers = teachers.filter(t => t.id !== id);
-      setTeachers(updatedTeachers);
-      schoolData.teachers = updatedTeachers;
+  const handleDeleteTeacher = async (teacherOrId) => {
+    const teacher = typeof teacherOrId === 'object'
+      ? teacherOrId
+      : teachers.find(item => item.id === teacherOrId);
+    if (!teacher) return;
+
+    const confirmed = await confirmAction({
+      title: hasBackendSession() ? '禁用教师账号' : '删除教师',
+      message: hasBackendSession()
+        ? `确定要禁用 ${teacher.name || teacher.code} 的后端账号吗？历史任课和成绩记录会保留。`
+        : '确定要删除这位教师吗？',
+      confirmText: hasBackendSession() ? '禁用账号' : '删除'
+    });
+    if (!confirmed) return;
+
+    if (hasBackendSession()) {
+      if (teacher.status === 'suspended') {
+        notify('该教师账号已处于禁用状态。', 'warning');
+        return;
+      }
+
+      try {
+        const result = await toggleTeacherStatus(teacher.id);
+        if (result?.success === false) {
+          notify(result.message || '教师账号禁用失败', 'warning');
+          return;
+        }
+        await refreshTeachers();
+        notify(result?.message || '教师账号已禁用', 'success');
+      } catch (error) {
+        notify('教师账号禁用失败：' + (error.message || '请稍后重试'), 'error');
+      }
+      return;
     }
+
+    const updatedTeachers = teachers.filter(t => t.id !== teacher.id);
+    setTeachers(updatedTeachers);
   };
 
   const handleManageRoles = (teacher) => {
@@ -378,29 +551,39 @@ const TeacherManagement = () => {
 
   const handleSaveRoles = () => {
     if (selectedTeacher) {
+      if (hasBackendSession()) {
+        setShowRoleModal(false);
+        notify('后端角色来自系统账号角色，请在账号管理中调整。', 'warning');
+        return;
+      }
+
       const updatedTeachers = teachers.map(t =>
         t.id === selectedTeacher.id
           ? { ...t, roles: formData.roles }
           : t
       );
       setTeachers(updatedTeachers);
-      schoolData.teachers = updatedTeachers;
       setShowRoleModal(false);
-      alert('角色设置已保存！');
+      notify('角色设置已保存！');
     }
   };
 
   const handleSavePermissions = () => {
     if (selectedTeacher) {
+      if (hasBackendSession()) {
+        setShowPermissionModal(false);
+        notify('后端权限由系统角色统一控制，请在角色管理中维护权限码。', 'warning');
+        return;
+      }
+
       const updatedTeachers = teachers.map(t =>
         t.id === selectedTeacher.id
           ? { ...t, custom_permissions: formData.custom_permissions }
           : t
       );
       setTeachers(updatedTeachers);
-      schoolData.teachers = updatedTeachers;
       setShowPermissionModal(false);
-      alert('自定义权限已保存！');
+      notify('自定义权限已保存！');
     }
   };
 
@@ -421,18 +604,39 @@ const TeacherManagement = () => {
     }
   };
 
-  const handleBatchDelete = () => {
+  const handleBatchDelete = async () => {
     if (selectedIds.length === 0) {
-      alert('请先选择要删除的教师');
+      notify('请先选择要删除的教师');
       return;
     }
-    if (window.confirm(`确定要删除选中的 ${selectedIds.length} 位教师吗？`)) {
-      const updatedTeachers = teachers.filter(t => !selectedIds.includes(t.id));
-      setTeachers(updatedTeachers);
-      schoolData.teachers = updatedTeachers;
-      setSelectedIds([]);
-      alert('批量删除成功！');
+    const confirmed = await confirmAction({
+      title: hasBackendSession() ? '批量禁用教师账号' : '批量删除教师',
+      message: hasBackendSession()
+        ? `确定要禁用选中的 ${selectedIds.length} 位教师账号吗？历史数据会保留。`
+        : `确定要删除选中的 ${selectedIds.length} 位教师吗？`,
+      confirmText: hasBackendSession() ? '批量禁用' : '批量删除'
+    });
+    if (!confirmed) return;
+
+    if (hasBackendSession()) {
+      const targets = teachers.filter(t => selectedIds.includes(t.id) && t.status !== 'suspended');
+      try {
+        for (const teacher of targets) {
+          await toggleTeacherStatus(teacher.id);
+        }
+        await refreshTeachers();
+        setSelectedIds([]);
+        notify(`已禁用 ${targets.length} 位教师账号。`, 'success');
+      } catch (error) {
+        notify('批量禁用失败：' + (error.message || '请稍后重试'), 'error');
+      }
+      return;
     }
+
+    const updatedTeachers = teachers.filter(t => !selectedIds.includes(t.id));
+    setTeachers(updatedTeachers);
+    setSelectedIds([]);
+    notify('批量删除成功！');
   };
 
   const getStatusBadge = (status) => {
@@ -460,7 +664,10 @@ const TeacherManagement = () => {
       <div className="flex flex-wrap gap-1">
         {teacher.teaching_classes.map((tc, index) => (
           <span key={index} className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800">
-            {schoolData.formatClassName(tc.class_id)}
+            {schoolData.getClassById(tc.class_id)
+              ? schoolData.formatClassName(tc.class_id)
+              : tc.class_name || tc.class_id || '未知班级'}
+            {tc.subject ? ` · ${tc.subject}` : ''}
           </span>
         ))}
       </div>
@@ -492,14 +699,6 @@ const TeacherManagement = () => {
     { id: 'approve_school_activities', label: '审批学校活动' }
   ];
 
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
-      </div>
-    );
-  }
-
   return (
     <div className="p-6">
       {/* 页面标题 */}
@@ -507,6 +706,21 @@ const TeacherManagement = () => {
         <h1 className="text-2xl font-bold text-gray-800">教师管理</h1>
         <p className="text-gray-500 mt-1">管理教师信息、任教班级和角色权限</p>
       </div>
+
+      {(teacherListLoading || teacherListError || teacherSyncSource === 'backend') && (
+        <div className={`mb-4 flex items-center gap-2 rounded-lg border p-3 text-sm ${
+          teacherListError
+            ? 'border-amber-100 bg-amber-50 text-amber-700'
+            : 'border-emerald-100 bg-emerald-50 text-emerald-700'
+        }`}>
+          {teacherListError ? <X className="h-4 w-4" /> : <CheckCircle className="h-4 w-4" />}
+          <span>
+            {teacherListLoading
+              ? '正在同步后端教师库...'
+              : teacherListError || '已连接后端教师库，教师账号和任课安排来自数据库。'}
+          </span>
+        </div>
+      )}
 
       {/* 统计卡片 */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
@@ -603,7 +817,7 @@ const TeacherManagement = () => {
                 className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700"
               >
                 <Trash2 className="w-4 h-4" />
-                批量删除 ({selectedIds.length})
+                {backendSessionActive ? '批量禁用' : '批量删除'} ({selectedIds.length})
               </button>
             )}
             <button 
@@ -715,7 +929,7 @@ const TeacherManagement = () => {
                         onClick={(e) => {
                           e.preventDefault();
                           e.stopPropagation();
-                          handleDeleteTeacher(teacher.id);
+                          handleDeleteTeacher(teacher);
                         }}
                         className="text-red-600 hover:text-red-900"
                         title="删除"
@@ -779,6 +993,18 @@ const TeacherManagement = () => {
                   className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
                 />
               </div>
+              {backendSessionActive && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">初始密码 *</label>
+                  <input
+                    type="password"
+                    value={formData.initial_password}
+                    onChange={(e) => setFormData({...formData, initial_password: e.target.value})}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">用于创建教师登录账号，至少 6 位。</p>
+                </div>
+              )}
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">任教科目</label>
                 <select
@@ -805,9 +1031,14 @@ const TeacherManagement = () => {
                 </button>
                 <button
                   onClick={handleAddTeacher}
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                  disabled={teacherSaving}
+                  className={`px-4 py-2 rounded-lg ${
+                    teacherSaving
+                      ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                      : 'bg-blue-600 text-white hover:bg-blue-700'
+                  }`}
                 >
-                  保存
+                  {teacherSaving ? '保存中...' : '保存'}
                 </button>
               </div>
             </div>
@@ -818,11 +1049,12 @@ const TeacherManagement = () => {
       {/* 编辑教师弹窗 */}
       {showEditModal && selectedTeacher && (
         <EditTeacherModal
-          teacher={selectedTeacher}
           formData={formData}
           setFormData={setFormData}
           onClose={() => setShowEditModal(false)}
           onSave={handleSaveEdit}
+          backendMode={backendSessionActive}
+          saving={teacherSaving}
         />
       )}
 
@@ -839,7 +1071,7 @@ const TeacherManagement = () => {
             <div className="space-y-4">
               <p className="text-sm text-gray-500">选择该教师的角色（可多选）</p>
               <div className="space-y-2 max-h-64 overflow-y-auto">
-                {teacherRoles.sort((a, b) => b.level - a.level).map(role => (
+                {[...teacherRoles].sort((a, b) => b.level - a.level).map(role => (
                   <label key={role.id} className="flex items-center p-3 border rounded-lg hover:bg-gray-50 cursor-pointer">
                     <input
                       type="checkbox"
@@ -970,11 +1202,11 @@ const TeacherManagement = () => {
                 <p className="text-sm text-gray-600">
                   {importFile ? importFile.name : '点击或拖拽文件到此处上传'}
                 </p>
-                <p className="text-xs text-gray-400 mt-1">支持 CSV、Excel 格式</p>
+                <p className="text-xs text-gray-400 mt-1">支持 CSV、TSV 文本格式</p>
                 <input 
                   ref={fileInputRef}
                   type="file" 
-                  accept=".csv,.xlsx,.xls" 
+                  accept=".csv,.tsv,.txt"
                   className="hidden" 
                   onChange={(e) => setImportFile(e.target.files[0])}
                 />
@@ -983,10 +1215,14 @@ const TeacherManagement = () => {
                 <button onClick={() => {setShowImportModal(false); setImportFile(null);}} className="px-4 py-2 border border-gray-300 rounded-lg">取消</button>
                 <button 
                   onClick={handleImportPreview}
-                  disabled={!importFile}
-                  className={`px-4 py-2 rounded-lg ${importFile ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-gray-300 text-gray-500 cursor-not-allowed'}`}
+                  disabled={teacherImporting}
+                  className={`px-4 py-2 rounded-lg ${
+                    teacherImporting
+                      ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                      : 'bg-blue-600 text-white hover:bg-blue-700'
+                  }`}
                 >
-                  预览导入
+                  {teacherImporting ? '处理中...' : '预览导入'}
                 </button>
               </div>
             </div>
@@ -1005,7 +1241,22 @@ const TeacherManagement = () => {
           { key: 'code', label: '工号' },
           { key: 'name', label: '姓名' },
           { key: 'phone', label: '电话' },
-          { key: 'subjects', label: '任教科目' }
+          {
+            key: 'initial_password',
+            label: '初始密码',
+            render: value => value ? '已填写' : (backendSessionActive ? '缺少' : '-')
+          },
+          { key: 'subjects', label: '任教科目', render: value => (value || []).join('、') || '-' },
+          {
+            key: 'teaching_classes',
+            label: '任教班级',
+            render: value => (value || [])
+              .map(item => schoolData.getClassById(item.class_id)
+                ? schoolData.formatClassName(item.class_id)
+                : item.class_name || item.class_id || '')
+              .filter(Boolean)
+              .join('、') || '-'
+          }
         ]}
       />
     </div>
@@ -1013,11 +1264,13 @@ const TeacherManagement = () => {
 };
 
 // 编辑教师弹窗组件 - 包含年级班级两步选择和任教科目下拉选择
-const EditTeacherModal = ({ teacher, formData, setFormData, onClose, onSave }) => {
+const EditTeacherModal = ({ formData, setFormData, onClose, onSave, backendMode = false, saving = false }) => {
   const [selectedGrade, setSelectedGrade] = useState('');
   const [availableClasses, setAvailableClasses] = useState([]);
   const [selectedClassIds, setSelectedClassIds] = useState(
-    formData.teaching_classes?.map(tc => tc.class_id) || []
+    (formData.teaching_classes || [])
+      .map(tc => Number(tc.class_id))
+      .filter(Number.isFinite)
   );
 
   // 年级选项
@@ -1052,12 +1305,17 @@ const EditTeacherModal = ({ teacher, formData, setFormData, onClose, onSave }) =
       const newIds = prev.includes(classId)
         ? prev.filter(id => id !== classId)
         : [...prev, classId];
+      const subject = formData.subjects?.[0] || '';
       
       // 更新 formData 中的 teaching_classes
-      const newTeachingClasses = newIds.map(id => ({
-        class_id: id,
-        subject: formData.subjects?.[0] || ''
-      }));
+      const newTeachingClasses = newIds.map(id => {
+        const existing = (formData.teaching_classes || []).find(tc => Number(tc.class_id) === Number(id));
+        return {
+          ...existing,
+          class_id: id,
+          subject: subject || existing?.subject || ''
+        };
+      });
       setFormData({ ...formData, teaching_classes: newTeachingClasses });
       
       return newIds;
@@ -1067,7 +1325,11 @@ const EditTeacherModal = ({ teacher, formData, setFormData, onClose, onSave }) =
   // 处理科目选择（单选改为下拉菜单）
   const handleSubjectChange = (e) => {
     const subject = e.target.value;
-    setFormData({ ...formData, subjects: subject ? [subject] : [] });
+    setFormData({
+      ...formData,
+      subjects: subject ? [subject] : [],
+      teaching_classes: (formData.teaching_classes || []).map(tc => ({ ...tc, subject }))
+    });
   };
 
   return (
@@ -1079,6 +1341,11 @@ const EditTeacherModal = ({ teacher, formData, setFormData, onClose, onSave }) =
             <X className="w-6 h-6 text-gray-400 hover:text-gray-600" />
           </button>
         </div>
+        {backendMode && (
+          <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-700">
+            当前连接后端教师库。本页同步任课科目和班级；姓名、电话、邮箱和账号状态请在账号管理中维护。
+          </div>
+        )}
         <div className="space-y-4">
           {/* 工号 - 只读 */}
           <div>
@@ -1097,8 +1364,11 @@ const EditTeacherModal = ({ teacher, formData, setFormData, onClose, onSave }) =
             <input
               type="text"
               value={formData.name}
+              disabled={backendMode}
               onChange={(e) => setFormData({...formData, name: e.target.value})}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
+              className={`w-full px-3 py-2 border border-gray-300 rounded-lg outline-none ${
+                backendMode ? 'bg-gray-100 text-gray-500' : 'focus:ring-2 focus:ring-blue-500'
+              }`}
             />
           </div>
 
@@ -1108,8 +1378,11 @@ const EditTeacherModal = ({ teacher, formData, setFormData, onClose, onSave }) =
             <input
               type="tel"
               value={formData.phone}
+              disabled={backendMode}
               onChange={(e) => setFormData({...formData, phone: e.target.value})}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
+              className={`w-full px-3 py-2 border border-gray-300 rounded-lg outline-none ${
+                backendMode ? 'bg-gray-100 text-gray-500' : 'focus:ring-2 focus:ring-blue-500'
+              }`}
             />
           </div>
 
@@ -1120,8 +1393,11 @@ const EditTeacherModal = ({ teacher, formData, setFormData, onClose, onSave }) =
               type="email"
               placeholder="选填"
               value={formData.email}
+              disabled={backendMode}
               onChange={(e) => setFormData({...formData, email: e.target.value})}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
+              className={`w-full px-3 py-2 border border-gray-300 rounded-lg outline-none ${
+                backendMode ? 'bg-gray-100 text-gray-500' : 'focus:ring-2 focus:ring-blue-500'
+              }`}
             />
           </div>
 
@@ -1224,8 +1500,11 @@ const EditTeacherModal = ({ teacher, formData, setFormData, onClose, onSave }) =
             <label className="block text-sm font-medium text-gray-700 mb-1">状态</label>
             <select
               value={formData.status}
+              disabled={backendMode}
               onChange={(e) => setFormData({...formData, status: e.target.value})}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none bg-white"
+              className={`w-full px-3 py-2 border border-gray-300 rounded-lg outline-none ${
+                backendMode ? 'bg-gray-100 text-gray-500' : 'bg-white focus:ring-2 focus:ring-blue-500'
+              }`}
             >
               <option value="active">在职</option>
               <option value="suspended">暂停</option>
@@ -1242,33 +1521,20 @@ const EditTeacherModal = ({ teacher, formData, setFormData, onClose, onSave }) =
             </button>
             <button
               onClick={onSave}
-              className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+              disabled={saving}
+              className={`px-4 py-2 rounded-lg ${
+                saving
+                  ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                  : 'bg-blue-600 text-white hover:bg-blue-700'
+              }`}
             >
-              保存
+              {saving ? '保存中...' : '保存'}
             </button>
           </div>
         </div>
       </div>
     </div>
   );
-};
-
-// 获取角色颜色
-const getRoleColor = (roleId) => {
-  const colorMap = {
-    'subject_teacher': 'cyan',
-    'head_teacher': 'green',
-    'lesson_leader': 'blue',
-    'research_leader': 'purple',
-    'grade_leader': 'orange',
-    'grade_deputy': 'yellow',
-    'dept_director': 'indigo',
-    'dept_deputy': 'pink',
-    'vice_principal': 'red',
-    'principal': 'red',
-    'admin': 'slate'
-  };
-  return colorMap[roleId] || 'gray';
 };
 
 export default TeacherManagement;

@@ -13,6 +13,8 @@ from datetime import datetime
 import json
 import logging
 
+from core.database import is_postgresql, is_sqlite
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -498,36 +500,68 @@ class LayeredAnalysisService:
             bool: 保存是否成功
         """
         try:
-            sql = """
-                INSERT INTO biz_layered_statistics 
-                (exam_id, layer_code, subject_name, total_students, valid_students,
-                 mean_score, median_score, std_score, max_score, min_score,
-                 q1_score, q3_score, pass_count, pass_rate, excellent_count, excellent_rate,
-                 fail_count, fail_rate, score_distribution, calculated_at)
-                VALUES 
-                (:exam_id, :layer_code, :subject_name, :total_students, :valid_students,
-                 :mean_score, :median_score, :std_score, :max_score, :min_score,
-                 :q1_score, :q3_score, :pass_count, :pass_rate, :excellent_count, :excellent_rate,
-                 :fail_count, :fail_rate, :score_distribution, NOW())
-                ON DUPLICATE KEY UPDATE
-                total_students = VALUES(total_students),
-                valid_students = VALUES(valid_students),
-                mean_score = VALUES(mean_score),
-                median_score = VALUES(median_score),
-                std_score = VALUES(std_score),
-                max_score = VALUES(max_score),
-                min_score = VALUES(min_score),
-                q1_score = VALUES(q1_score),
-                q3_score = VALUES(q3_score),
-                pass_count = VALUES(pass_count),
-                pass_rate = VALUES(pass_rate),
-                excellent_count = VALUES(excellent_count),
-                excellent_rate = VALUES(excellent_rate),
-                fail_count = VALUES(fail_count),
-                fail_rate = VALUES(fail_rate),
-                score_distribution = VALUES(score_distribution),
-                calculated_at = VALUES(calculated_at)
-            """
+            if is_postgresql(self.db) or is_sqlite(self.db):
+                sql = """
+                    INSERT INTO biz_layered_statistics
+                    (exam_id, layer_code, subject_name, total_students, valid_students,
+                     mean_score, median_score, std_score, max_score, min_score,
+                     q1_score, q3_score, pass_count, pass_rate, excellent_count, excellent_rate,
+                     fail_count, fail_rate, score_distribution, calculated_at)
+                    VALUES
+                    (:exam_id, :layer_code, :subject_name, :total_students, :valid_students,
+                     :mean_score, :median_score, :std_score, :max_score, :min_score,
+                     :q1_score, :q3_score, :pass_count, :pass_rate, :excellent_count, :excellent_rate,
+                     :fail_count, :fail_rate, :score_distribution, CURRENT_TIMESTAMP)
+                    ON CONFLICT (exam_id, layer_code, subject_name) DO UPDATE SET
+                    total_students = excluded.total_students,
+                    valid_students = excluded.valid_students,
+                    mean_score = excluded.mean_score,
+                    median_score = excluded.median_score,
+                    std_score = excluded.std_score,
+                    max_score = excluded.max_score,
+                    min_score = excluded.min_score,
+                    q1_score = excluded.q1_score,
+                    q3_score = excluded.q3_score,
+                    pass_count = excluded.pass_count,
+                    pass_rate = excluded.pass_rate,
+                    excellent_count = excluded.excellent_count,
+                    excellent_rate = excluded.excellent_rate,
+                    fail_count = excluded.fail_count,
+                    fail_rate = excluded.fail_rate,
+                    score_distribution = excluded.score_distribution,
+                    calculated_at = CURRENT_TIMESTAMP
+                """
+            else:
+                sql = """
+                    INSERT INTO biz_layered_statistics
+                    (exam_id, layer_code, subject_name, total_students, valid_students,
+                     mean_score, median_score, std_score, max_score, min_score,
+                     q1_score, q3_score, pass_count, pass_rate, excellent_count, excellent_rate,
+                     fail_count, fail_rate, score_distribution, calculated_at)
+                    VALUES
+                    (:exam_id, :layer_code, :subject_name, :total_students, :valid_students,
+                     :mean_score, :median_score, :std_score, :max_score, :min_score,
+                     :q1_score, :q3_score, :pass_count, :pass_rate, :excellent_count, :excellent_rate,
+                     :fail_count, :fail_rate, :score_distribution, NOW())
+                    ON DUPLICATE KEY UPDATE
+                    total_students = VALUES(total_students),
+                    valid_students = VALUES(valid_students),
+                    mean_score = VALUES(mean_score),
+                    median_score = VALUES(median_score),
+                    std_score = VALUES(std_score),
+                    max_score = VALUES(max_score),
+                    min_score = VALUES(min_score),
+                    q1_score = VALUES(q1_score),
+                    q3_score = VALUES(q3_score),
+                    pass_count = VALUES(pass_count),
+                    pass_rate = VALUES(pass_rate),
+                    excellent_count = VALUES(excellent_count),
+                    excellent_rate = VALUES(excellent_rate),
+                    fail_count = VALUES(fail_count),
+                    fail_rate = VALUES(fail_rate),
+                    score_distribution = VALUES(score_distribution),
+                    calculated_at = VALUES(calculated_at)
+                """
             
             self.db.execute(
                 text(sql),
@@ -574,25 +608,46 @@ class LayeredAnalysisService:
             bool: 保存是否成功
         """
         try:
-            sql = """
-                INSERT INTO biz_layered_thresholds 
-                (exam_id, layer_code, percentage, threshold_total,
-                 threshold_chinese, threshold_math, threshold_english, threshold_science, threshold_society,
-                 student_count, calculated_at)
-                VALUES 
-                (:exam_id, :layer_code, :percentage, :threshold_total,
-                 :threshold_chinese, :threshold_math, :threshold_english, :threshold_science, :threshold_society,
-                 :student_count, NOW())
-                ON DUPLICATE KEY UPDATE
-                threshold_total = VALUES(threshold_total),
-                threshold_chinese = VALUES(threshold_chinese),
-                threshold_math = VALUES(threshold_math),
-                threshold_english = VALUES(threshold_english),
-                threshold_science = VALUES(threshold_science),
-                threshold_society = VALUES(threshold_society),
-                student_count = VALUES(student_count),
-                calculated_at = VALUES(calculated_at)
-            """
+            if is_postgresql(self.db) or is_sqlite(self.db):
+                sql = """
+                    INSERT INTO biz_layered_thresholds
+                    (exam_id, layer_code, percentage, threshold_total,
+                     threshold_chinese, threshold_math, threshold_english, threshold_science, threshold_society,
+                     student_count, calculated_at)
+                    VALUES
+                    (:exam_id, :layer_code, :percentage, :threshold_total,
+                     :threshold_chinese, :threshold_math, :threshold_english, :threshold_science, :threshold_society,
+                     :student_count, CURRENT_TIMESTAMP)
+                    ON CONFLICT (exam_id, layer_code, percentage) DO UPDATE SET
+                    threshold_total = excluded.threshold_total,
+                    threshold_chinese = excluded.threshold_chinese,
+                    threshold_math = excluded.threshold_math,
+                    threshold_english = excluded.threshold_english,
+                    threshold_science = excluded.threshold_science,
+                    threshold_society = excluded.threshold_society,
+                    student_count = excluded.student_count,
+                    calculated_at = CURRENT_TIMESTAMP
+                """
+            else:
+                sql = """
+                    INSERT INTO biz_layered_thresholds
+                    (exam_id, layer_code, percentage, threshold_total,
+                     threshold_chinese, threshold_math, threshold_english, threshold_science, threshold_society,
+                     student_count, calculated_at)
+                    VALUES
+                    (:exam_id, :layer_code, :percentage, :threshold_total,
+                     :threshold_chinese, :threshold_math, :threshold_english, :threshold_science, :threshold_society,
+                     :student_count, NOW())
+                    ON DUPLICATE KEY UPDATE
+                    threshold_total = VALUES(threshold_total),
+                    threshold_chinese = VALUES(threshold_chinese),
+                    threshold_math = VALUES(threshold_math),
+                    threshold_english = VALUES(threshold_english),
+                    threshold_science = VALUES(threshold_science),
+                    threshold_society = VALUES(threshold_society),
+                    student_count = VALUES(student_count),
+                    calculated_at = VALUES(calculated_at)
+                """
             
             for threshold in thresholds:
                 self.db.execute(

@@ -5,7 +5,7 @@ uvicorn[standard]==0.32.0
 # 数据库
 sqlalchemy==2.0.36
 pymysql==1.1.1
-psycopg2-binary==2.9.9
+psycopg2-binary==2.9.10
 cryptography==43.0.0
 
 # 数据处理
@@ -25,6 +25,9 @@ passlib[bcrypt]==1.7.4
 
 # Excel处理
 openpyxl==3.1.5
+
+# PDF导出
+reportlab==4.2.5
 
 # 测试
 pytest==8.3.3

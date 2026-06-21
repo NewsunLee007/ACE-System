@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import {
   UserCircle,
   Lock,
@@ -6,107 +6,109 @@ import {
   EyeOff,
   GraduationCap,
   BookOpen,
-  Calendar,
-  TrendingUp,
   LogOut,
-  ChevronLeft,
-  ChevronRight,
-  Search,
-  Phone,
   User
 } from 'lucide-react';
-import schoolData from '../data/schoolData';
+import {
+  authenticateParentStudent,
+  fetchParentStudentExams,
+  fetchParentStudentReport
+} from '../lib/parentPortalApi';
+
+const buildStudentFromReport = (report) => {
+  if (!report) return null;
+  return {
+    id: report.student_id,
+    name: report.student_name,
+    student_code: report.student_code,
+    class_name: report.class_name,
+    current_term: report.current_term,
+    latest_exam_name: report.latest_exam?.exam_name || '',
+    status: '已验证'
+  };
+};
+
+const buildScoreRowsFromExams = (examPayload) => (
+  (examPayload?.exams || []).flatMap((exam) => (
+    Object.entries(exam.subjects || {}).map(([subject, score]) => ({
+      exam_id: exam.exam_id,
+      exam_name: exam.exam_name,
+      subject_name: subject,
+      score: Number(score),
+      full_score: '-',
+      class_rank: exam.class_rank || '-',
+      grade_rank: '-'
+    }))
+  ))
+);
 
 const ParentPortal = () => {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [currentParent, setCurrentParent] = useState(null);
+  const [studentReport, setStudentReport] = useState(null);
+  const [scoreRows, setScoreRows] = useState([]);
   const [loginForm, setLoginForm] = useState({
-    phone: '',
-    password: '',
-    studentCode: ''
+    studentName: '',
+    className: '',
+    authCode: ''
   });
-  const [showPassword, setShowPassword] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [showAuthCode, setShowAuthCode] = useState(false);
   const [loginError, setLoginError] = useState('');
-  const [activeTab, setActiveTab] = useState('scores');
   const [selectedStudent, setSelectedStudent] = useState(null);
 
   // 登录验证
-  const handleLogin = (e) => {
+  const handleLogin = async (e) => {
     e.preventDefault();
     setLoginError('');
+    setLoading(true);
 
-    const { phone, password, studentCode } = loginForm;
-
-    if (!phone || !password) {
-      setLoginError('请输入手机号和密码');
+    const { studentName, className, authCode } = loginForm;
+    if (!studentName.trim() || !className.trim() || !authCode.trim()) {
+      setLoginError('请输入学生姓名、班级和鉴权码');
+      setLoading(false);
       return;
     }
 
-    // 查找家长（通过手机号或学生学籍号）
-    let parent = null;
-    
-    // 先通过手机号查找
-    parent = schoolData.parents?.find(p => p.phone === phone);
-    
-    // 如果没找到，通过学生学籍号查找
-    if (!parent && studentCode) {
-      const student = schoolData.students?.find(s => s.student_code === studentCode);
-      if (student) {
-        parent = schoolData.parents?.find(p => 
-          p.student_ids?.includes(student.id)
-        );
-      }
-    }
+    try {
+      const session = await authenticateParentStudent({
+        studentName,
+        className,
+        authCode
+      });
+      const [report, exams] = await Promise.all([
+        fetchParentStudentReport(session.studentId, session.token),
+        fetchParentStudentExams(session.studentId, session.token)
+      ]);
+      const student = buildStudentFromReport(report);
 
-    if (!parent) {
-      setLoginError('未找到该家长信息，请检查手机号或学籍号');
-      return;
-    }
-
-    // 验证密码（默认密码：手机号后6位）
-    const defaultPassword = parent.phone.slice(-6);
-    if (password !== defaultPassword && password !== parent.password) {
-      setLoginError('密码错误');
-      return;
-    }
-
-    // 登录成功
-    setCurrentParent(parent);
-    setIsLoggedIn(true);
-    
-    // 设置默认选中的学生
-    if (parent.student_ids && parent.student_ids.length > 0) {
-      const firstStudent = schoolData.getStudentById(parent.student_ids[0]);
-      setSelectedStudent(firstStudent);
+      setStudentReport(report);
+      setScoreRows(buildScoreRowsFromExams(exams));
+      setSelectedStudent(student);
+      setIsLoggedIn(true);
+    } catch (error) {
+      setLoginError(error?.message || '家长身份验证失败');
+    } finally {
+      setLoading(false);
     }
   };
 
   // 退出登录
   const handleLogout = () => {
     setIsLoggedIn(false);
-    setCurrentParent(null);
+    setStudentReport(null);
+    setScoreRows([]);
     setSelectedStudent(null);
-    setLoginForm({ phone: '', password: '', studentCode: '' });
+    setLoginForm({ studentName: '', className: '', authCode: '' });
   };
 
   // 获取家长绑定的所有学生
   const getParentStudents = () => {
-    if (!currentParent || !currentParent.student_ids) return [];
-    return currentParent.student_ids
-      .map(id => schoolData.getStudentById(id))
-      .filter(Boolean);
+    return selectedStudent ? [selectedStudent] : [];
   };
 
   // 获取学生的成绩
   const getStudentScores = (studentId) => {
-    return (schoolData.scores || []).filter(s => s.student_id === studentId);
-  };
-
-  // 获取学生的考试列表
-  const getStudentExams = (studentId) => {
-    const scores = getStudentScores(studentId);
-    const examIds = [...new Set(scores.map(s => s.exam_id))];
-    return examIds.map(id => schoolData.exams?.find(e => e.id === id)).filter(Boolean);
+    return Number(selectedStudent?.id) === Number(studentId) ? scoreRows : [];
   };
 
   // 登录界面
@@ -125,58 +127,63 @@ const ParentPortal = () => {
           <form onSubmit={handleLogin} className="space-y-4">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">
-                手机号
-              </label>
-              <div className="relative">
-                <Phone className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-5 h-5" />
-                <input
-                  type="tel"
-                  value={loginForm.phone}
-                  onChange={(e) => setLoginForm({ ...loginForm, phone: e.target.value })}
-                  className="w-full pl-10 pr-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
-                  placeholder="请输入家长手机号"
-                />
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                密码
-              </label>
-              <div className="relative">
-                <Lock className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-5 h-5" />
-                <input
-                  type={showPassword ? 'text' : 'password'}
-                  value={loginForm.password}
-                  onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
-                  className="w-full pl-10 pr-12 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
-                  placeholder="默认密码：手机号后6位"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPassword(!showPassword)}
-                  className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-gray-600"
-                >
-                  {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
-                </button>
-              </div>
-              <p className="text-xs text-gray-500 mt-1">初始密码为手机号后6位</p>
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                学生学籍号（可选）
+                学生姓名
               </label>
               <div className="relative">
                 <User className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-5 h-5" />
                 <input
                   type="text"
-                  value={loginForm.studentCode}
-                  onChange={(e) => setLoginForm({ ...loginForm, studentCode: e.target.value })}
+                  value={loginForm.studentName}
+                  onChange={(e) => setLoginForm({ ...loginForm, studentName: e.target.value })}
                   className="w-full pl-10 pr-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
-                  placeholder="如忘记手机号，可输入学生学籍号"
+                  placeholder="请输入学生姓名"
+                  disabled={loading}
                 />
               </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                班级
+              </label>
+              <div className="relative">
+                <GraduationCap className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-5 h-5" />
+                <input
+                  type="text"
+                  value={loginForm.className}
+                  onChange={(e) => setLoginForm({ ...loginForm, className: e.target.value })}
+                  className="w-full pl-10 pr-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
+                  placeholder="如 701"
+                  disabled={loading}
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                鉴权码
+              </label>
+              <div className="relative">
+                <Lock className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-5 h-5" />
+                <input
+                  type={showAuthCode ? 'text' : 'password'}
+                  value={loginForm.authCode}
+                  onChange={(e) => setLoginForm({ ...loginForm, authCode: e.target.value })}
+                  className="w-full pl-10 pr-12 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
+                  placeholder="学籍辅号或身份证号后6位"
+                  disabled={loading}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowAuthCode(!showAuthCode)}
+                  className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                  disabled={loading}
+                  aria-label={showAuthCode ? '隐藏鉴权码' : '显示鉴权码'}
+                >
+                  {showAuthCode ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                </button>
+              </div>
+              <p className="text-xs text-gray-500 mt-1">鉴权码只用于本次查询，成功后仅能访问该学生成绩。</p>
             </div>
 
             {loginError && (
@@ -187,9 +194,10 @@ const ParentPortal = () => {
 
             <button
               type="submit"
-              className="w-full bg-blue-600 text-white py-3 rounded-lg font-medium hover:bg-blue-700 transition-colors"
+              disabled={loading}
+              className="w-full bg-blue-600 text-white py-3 rounded-lg font-medium hover:bg-blue-700 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
             >
-              登录
+              {loading ? '验证中...' : '验证并查询'}
             </button>
           </form>
 
@@ -218,7 +226,9 @@ const ParentPortal = () => {
               </div>
             </div>
             <div className="flex items-center gap-4">
-              <span className="text-gray-600">{currentParent.name} ({currentParent.relation})</span>
+              <span className="text-gray-600">
+                {studentReport?.student_name || selectedStudent?.name} 家长
+              </span>
               <button
                 onClick={handleLogout}
                 className="flex items-center gap-2 px-4 py-2 text-gray-600 hover:text-red-600 transition-colors"
@@ -238,9 +248,7 @@ const ParentPortal = () => {
             <div className="bg-white rounded-lg shadow-sm p-4">
               <h2 className="text-lg font-semibold text-gray-800 mb-4">我的学生</h2>
               <div className="space-y-3">
-                {students.map(student => {
-                  const cls = schoolData.getClassById(student.class_id);
-                  return (
+                {students.length > 0 ? students.map(student => (
                     <button
                       key={student.id}
                       onClick={() => setSelectedStudent(student)}
@@ -252,12 +260,15 @@ const ParentPortal = () => {
                     >
                       <p className="font-medium text-gray-800">{student.name}</p>
                       <p className="text-sm text-gray-500">
-                        {cls ? schoolData.formatClassName(cls.id) : '未分配班级'}
+                        {student.class_name || '未分配班级'}
                       </p>
                       <p className="text-xs text-gray-400">学号：{student.student_code}</p>
                     </button>
-                  );
-                })}
+                  )) : (
+                  <div className="rounded-lg bg-gray-50 p-4 text-sm text-gray-500">
+                    当前家长档案暂无绑定学生。完成家长管理中的绑定后才会显示成绩。
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -279,23 +290,50 @@ const ParentPortal = () => {
                     <div className="bg-green-50 rounded-lg p-4">
                       <p className="text-sm text-gray-500">班级</p>
                       <p className="font-medium text-gray-800">
-                        {schoolData.getClassById(selectedStudent.class_id) 
-                          ? schoolData.formatClassName(selectedStudent.class_id)
-                          : '未分配'}
+                        {selectedStudent.class_name || '未分配'}
                       </p>
                     </div>
                     <div className="bg-purple-50 rounded-lg p-4">
-                      <p className="text-sm text-gray-500">性别</p>
+                      <p className="text-sm text-gray-500">当前学期</p>
                       <p className="font-medium text-gray-800">
-                        {selectedStudent.gender === 1 ? '男' : '女'}
+                        {selectedStudent.current_term || '-'}
                       </p>
                     </div>
                     <div className="bg-yellow-50 rounded-lg p-4">
-                      <p className="text-sm text-gray-500">状态</p>
-                      <p className="font-medium text-gray-800">{selectedStudent.status || '在读'}</p>
+                      <p className="text-sm text-gray-500">最近考试</p>
+                      <p className="font-medium text-gray-800">{selectedStudent.latest_exam_name || '-'}</p>
                     </div>
                   </div>
                 </div>
+
+                {studentReport && (
+                  <div className="bg-white rounded-lg shadow-sm p-6">
+                    <h3 className="text-lg font-semibold text-gray-800 mb-4">学情诊断</h3>
+                    <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+                      <div className="rounded-lg bg-red-50 p-4">
+                        <p className="text-sm font-medium text-red-700">薄弱学科</p>
+                        <p className="mt-2 text-lg font-semibold text-gray-900">
+                          {(studentReport.weak_subjects || []).join('、') || '暂无明显短板'}
+                        </p>
+                      </div>
+                      <div className="rounded-lg bg-green-50 p-4">
+                        <p className="text-sm font-medium text-green-700">优势学科</p>
+                        <p className="mt-2 text-lg font-semibold text-gray-900">
+                          {(studentReport.advantage_subjects || []).join('、') || '继续观察'}
+                        </p>
+                      </div>
+                      <div className="rounded-lg bg-blue-50 p-4">
+                        <p className="text-sm font-medium text-blue-700">历史考试</p>
+                        <p className="mt-2 text-lg font-semibold text-gray-900">
+                          {(studentReport.historical_trends || []).length} 次
+                        </p>
+                      </div>
+                    </div>
+                    <p className="mt-4 rounded-lg border border-slate-100 bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-600">
+                      {studentReport.diagnosis || '暂无诊断内容'}
+                    </p>
+                  </div>
+                )}
 
                 {/* 成绩列表 */}
                 <div className="bg-white rounded-lg shadow-sm p-6">

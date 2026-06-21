@@ -11,18 +11,25 @@ import json
 import logging
 
 from core.database import get_db
-from core.security import get_current_user, require_permission
+from core.security import require_permission_codes
 from services.report_service import ReportService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/reports", tags=["报表生成"])
+
+REPORT_VIEW_PERMISSION_CODES = (
+    "exam_admin",
+    "grade_leader",
+    "subject_leader",
+)
+REPORT_MANAGE_PERMISSION_CODES = ("edu_admin",)
 
 
 @router.get("/student/{student_id}/report-card")
 def get_student_report_card(
     student_id: int,
     exam_id: int = Query(..., description="考试ID"),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_permission_codes(*REPORT_VIEW_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -51,7 +58,7 @@ def get_class_analysis_report(
     exam_id: int = Query(..., description="考试ID"),
     layer_id: int = Query(..., description="分层ID"),
     class_name: str = Query(..., description="班级名称"),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_permission_codes(*REPORT_VIEW_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -79,7 +86,7 @@ def get_class_analysis_report(
 def get_comprehensive_report(
     exam_id: int = Query(..., description="考试ID"),
     layer_id: int = Query(..., description="分层ID"),
-    current_user: dict = Depends(require_permission("edu_admin")),
+    current_user: dict = Depends(require_permission_codes(*REPORT_MANAGE_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -108,7 +115,7 @@ def export_student_report_card(
     student_id: int,
     exam_id: int = Query(..., description="考试ID"),
     format: str = Query("json", description="导出格式: json/pdf"),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_permission_codes(*REPORT_VIEW_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -150,7 +157,7 @@ def export_class_analysis_report(
     layer_id: int = Query(..., description="分层ID"),
     class_name: str = Query(..., description="班级名称"),
     format: str = Query("json", description="导出格式: json"),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_permission_codes(*REPORT_VIEW_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -187,7 +194,7 @@ def export_comprehensive_report(
     exam_id: int = Query(..., description="考试ID"),
     layer_id: int = Query(..., description="分层ID"),
     format: str = Query("json", description="导出格式: json"),
-    current_user: dict = Depends(require_permission("edu_admin")),
+    current_user: dict = Depends(require_permission_codes(*REPORT_MANAGE_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -226,7 +233,7 @@ def batch_generate_reports(
     exam_id: int = Query(..., description="考试ID"),
     layer_id: int = Query(..., description="分层ID"),
     report_type: str = Query("class", description="报告类型: class/student/comprehensive"),
-    current_user: dict = Depends(require_permission("edu_admin")),
+    current_user: dict = Depends(require_permission_codes(*REPORT_MANAGE_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """

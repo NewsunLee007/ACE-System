@@ -13,9 +13,24 @@ import logging
 
 from services.data_import_service import DataImportService, DataExportService
 from core.database import get_db
+from core.security import require_permission_codes
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/data", tags=["数据导入导出"])
+
+DATA_IMPORT_PERMISSION_CODES = (
+    "sys_admin",
+    "edu_admin",
+    "exam_admin",
+)
+
+DATA_EXPORT_PERMISSION_CODES = (
+    "sys_admin",
+    "edu_admin",
+    "exam_admin",
+    "grade_leader",
+    "subject_leader",
+)
 
 
 @router.post("/import/scores/{exam_id}")
@@ -23,6 +38,7 @@ async def import_scores(
     exam_id: int,
     file: UploadFile = File(...),
     skip_invalid: bool = Query(True, description="是否跳过无效记录"),
+    current_user: dict = Depends(require_permission_codes(*DATA_IMPORT_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -60,6 +76,7 @@ async def import_scores(
 @router.post("/import/students")
 async def import_students(
     file: UploadFile = File(...),
+    current_user: dict = Depends(require_permission_codes(*DATA_IMPORT_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -97,6 +114,7 @@ def create_class_layer(
     layer_name: str = Query(..., description="分层名称，如'A层'"),
     class_names: str = Query(..., description="班级列表，逗号分隔，如'701,702,703'"),
     description: Optional[str] = Query(None, description="分层描述"),
+    current_user: dict = Depends(require_permission_codes(*DATA_IMPORT_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -126,6 +144,7 @@ def create_class_layer(
 def export_scores(
     exam_id: int,
     layer_id: Optional[int] = Query(None, description="分层ID，为空则导出全部"),
+    current_user: dict = Depends(require_permission_codes(*DATA_EXPORT_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -152,6 +171,7 @@ def export_scores(
 def export_z_values(
     exam_id: int,
     layer_id: int,
+    current_user: dict = Depends(require_permission_codes(*DATA_EXPORT_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """
@@ -178,6 +198,7 @@ def export_z_values(
 def export_thresholds(
     exam_id: int,
     layer_id: int,
+    current_user: dict = Depends(require_permission_codes(*DATA_EXPORT_PERMISSION_CODES)),
     db: Session = Depends(get_db)
 ):
     """

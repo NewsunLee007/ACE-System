@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { X, Upload, FileSpreadsheet, AlertCircle, CheckCircle, RefreshCw } from 'lucide-react';
+import { X, AlertCircle, CheckCircle, MinusCircle, RefreshCw } from 'lucide-react';
 
 /**
  * 智能导入弹窗组件
@@ -15,8 +15,10 @@ const SmartImportModal = ({ isOpen, onClose, onConfirm, previewData, title, colu
 
   useEffect(() => {
     if (isOpen && previewData) {
-      // 默认全选
-      setSelectedItems(previewData.map((_, index) => index));
+      // 默认只选择会写入数据的项目，重复导入的无变化行仅供核对。
+      setSelectedItems(previewData
+        .map((item, index) => ['unchanged', 'error'].includes(item.type) ? null : index)
+        .filter(index => index !== null));
     }
   }, [isOpen, previewData]);
 
@@ -24,8 +26,14 @@ const SmartImportModal = ({ isOpen, onClose, onConfirm, previewData, title, colu
 
   const newItems = previewData.filter(item => item.type === 'new');
   const updateItems = previewData.filter(item => item.type === 'update');
+  const unchangedItems = previewData.filter(item => item.type === 'unchanged');
+  const errorItems = previewData.filter(item => item.type === 'error' || item.error);
+  const selectableIndexes = previewData
+    .map((item, index) => ['unchanged', 'error'].includes(item.type) || item.error ? null : index)
+    .filter(index => index !== null);
 
   const toggleSelect = (index) => {
+    if (['unchanged', 'error'].includes(previewData[index]?.type) || previewData[index]?.error) return;
     setSelectedItems(prev => 
       prev.includes(index) 
         ? prev.filter(i => i !== index)
@@ -34,16 +42,21 @@ const SmartImportModal = ({ isOpen, onClose, onConfirm, previewData, title, colu
   };
 
   const toggleSelectAll = () => {
-    if (selectedItems.length === previewData.length) {
+    if (selectedItems.length === selectableIndexes.length) {
       setSelectedItems([]);
     } else {
-      setSelectedItems(previewData.map((_, index) => index));
+      setSelectedItems(selectableIndexes);
     }
   };
 
   const handleConfirm = () => {
     const selectedData = selectedItems.map(index => previewData[index]);
     onConfirm(selectedData);
+  };
+
+  const formatCellValue = (col, item, source = 'data') => {
+    const value = item[source]?.[col.key];
+    return col.render ? col.render(value, item) : (value || '-');
   };
 
   return (
@@ -56,6 +69,8 @@ const SmartImportModal = ({ isOpen, onClose, onConfirm, previewData, title, colu
             <p className="text-sm text-gray-500 mt-1">
               新增 <span className="text-green-600 font-semibold">{newItems.length}</span> 条，
               更新 <span className="text-blue-600 font-semibold">{updateItems.length}</span> 条，
+              无变化 <span className="text-gray-600 font-semibold">{unchangedItems.length}</span> 条，
+              需检查 <span className="text-red-600 font-semibold">{errorItems.length}</span> 条，
               已选 <span className="text-purple-600 font-semibold">{selectedItems.length}</span> 条
             </p>
           </div>
@@ -72,7 +87,7 @@ const SmartImportModal = ({ isOpen, onClose, onConfirm, previewData, title, colu
                 <th className="px-4 py-2 text-left">
                   <input
                     type="checkbox"
-                    checked={selectedItems.length === previewData.length && previewData.length > 0}
+                    checked={selectedItems.length === selectableIndexes.length && selectableIndexes.length > 0}
                     onChange={toggleSelectAll}
                     className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
                   />
@@ -89,26 +104,40 @@ const SmartImportModal = ({ isOpen, onClose, onConfirm, previewData, title, colu
               {previewData.map((item, index) => (
                 <tr 
                   key={index} 
-                  className={`hover:bg-gray-50 ${selectedItems.includes(index) ? 'bg-blue-50' : ''}`}
+                  className={`hover:bg-gray-50 ${selectedItems.includes(index) ? 'bg-blue-50' : ''} ${item.type === 'unchanged' ? 'text-gray-500' : ''} ${item.type === 'error' || item.error ? 'bg-red-50' : ''}`}
                 >
                   <td className="px-4 py-3">
                     <input
                       type="checkbox"
                       checked={selectedItems.includes(index)}
                       onChange={() => toggleSelect(index)}
+                      disabled={['unchanged', 'error'].includes(item.type) || Boolean(item.error)}
                       className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
                     />
                   </td>
                   <td className="px-4 py-3">
-                    {item.type === 'new' ? (
+                    {item.type === 'error' || item.error ? (
+                      <div>
+                        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800">
+                          <AlertCircle className="w-3 h-3 mr-1" />
+                          需检查
+                        </span>
+                        <p className="mt-1 max-w-xs text-xs text-red-600">{item.error}</p>
+                      </div>
+                    ) : item.type === 'new' ? (
                       <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800">
                         <CheckCircle className="w-3 h-3 mr-1" />
                         新增
                       </span>
-                    ) : (
+                    ) : item.type === 'update' ? (
                       <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800">
                         <RefreshCw className="w-3 h-3 mr-1" />
                         更新
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-700">
+                        <MinusCircle className="w-3 h-3 mr-1" />
+                        无变化
                       </span>
                     )}
                   </td>
@@ -117,14 +146,14 @@ const SmartImportModal = ({ isOpen, onClose, onConfirm, previewData, title, colu
                       {item.type === 'update' && item.changes?.includes(col.key) ? (
                         <div>
                           <span className="text-gray-400 line-through text-xs block">
-                            {item.existingData[col.key] || '-'}
+                            {formatCellValue(col, item, 'existingData')}
                           </span>
                           <span className="text-blue-600 font-medium">
-                            {item.data[col.key] || '-'}
+                            {formatCellValue(col, item)}
                           </span>
                         </div>
                       ) : (
-                        item.data[col.key] || '-'
+                        formatCellValue(col, item)
                       )}
                     </td>
                   ))}

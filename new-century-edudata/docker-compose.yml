@@ -2,21 +2,20 @@ version: '3.8'
 
 services:
   db:
-    image: mysql:8.0
-    container_name: new-century-db
+    image: mariadb:11.4
+    container_name: new-century-mariadb
     environment:
-      MYSQL_ROOT_PASSWORD: NewCentury2025!
-      MYSQL_DATABASE: new_century_edudata
-      MYSQL_CHARSET: utf8mb4
-      MYSQL_COLLATION: utf8mb4_unicode_ci
+      MARIADB_ROOT_PASSWORD: NewCentury2025!
+      MARIADB_DATABASE: new_century_edudata
+      MARIADB_AUTO_UPGRADE: "1"
     volumes:
-      - mysql_data:/var/lib/mysql
+      - mariadb_data:/var/lib/mysql
       - ./database/new_century_schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
     ports:
       - "3306:3306"
-    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      test: ["CMD-SHELL", "mariadb-admin ping -h localhost -uroot -p$${MARIADB_ROOT_PASSWORD} --silent"]
       timeout: 20s
       retries: 10
 
@@ -50,4 +49,4 @@ services:
       - backend
 
 volumes:
-  mysql_data:
+  mariadb_data:

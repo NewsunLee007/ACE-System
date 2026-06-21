@@ -4,7 +4,7 @@
 """
 
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Iterable, Optional, Dict, Any
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from fastapi import Depends, HTTPException, status
@@ -24,6 +24,32 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # HTTP Bearer认证
 security_scheme = HTTPBearer()
+
+SUPER_PERMISSION_CODES = {"sys_admin", "edu_admin"}
+PARENT_STUDENT_ACCESS_TOKEN_TYPE = "parent_student_access"
+
+PERMISSION_HIERARCHY = {
+    "sys_admin": 10,
+    "edu_admin": 9,
+    "exam_admin": 8,
+    "grade_leader": 7,
+    "subject_leader": 6,
+    "lesson_leader": 5,
+    "headmaster": 4,
+    "teacher": 3,
+    "parent": 2,
+    "custom": 1,
+}
+
+# Semantic permissions used by analysis routers. Keep these explicit so a typo
+# or new permission label cannot accidentally become available to everyone.
+SEMANTIC_PERMISSION_MIN_LEVELS = {
+    "layer_manage": PERMISSION_HIERARCHY["exam_admin"],
+    "analysis_execute": PERMISSION_HIERARCHY["exam_admin"],
+    "analysis_publish": PERMISSION_HIERARCHY["grade_leader"],
+    "analysis_admin": PERMISSION_HIERARCHY["edu_admin"],
+    "analysis_view": PERMISSION_HIERARCHY["subject_leader"],
+}
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -60,6 +86,21 @@ def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta]
     return encoded_jwt
 
 
+def create_parent_student_access_token(student_id: Any, expires_delta: Optional[timedelta] = None) -> str:
+    """
+    Create a short scoped token for parent access to exactly one student.
+    """
+    normalized_student_id = int(student_id)
+    return create_access_token(
+        {
+            "sub": f"parent:{normalized_student_id}",
+            "student_id": normalized_student_id,
+            "token_type": PARENT_STUDENT_ACCESS_TOKEN_TYPE,
+        },
+        expires_delta=expires_delta or timedelta(hours=12)
+    )
+
+
 def decode_token(token: str) -> Optional[Dict[str, Any]]:
     """
     解码JWT令牌
@@ -75,6 +116,24 @@ def decode_token(token: str) -> Optional[Dict[str, Any]]:
         return payload
     except JWTError:
         return None
+
+
+def is_parent_student_token_valid(payload: Optional[Dict[str, Any]], student_id: Any) -> bool:
+    """
+    Check whether a decoded parent token is scoped to the requested student.
+    """
+    if not payload:
+        return False
+    if payload.get("token_type") != PARENT_STUDENT_ACCESS_TOKEN_TYPE:
+        return False
+
+    try:
+        token_student_id = int(payload.get("student_id"))
+        requested_student_id = int(student_id)
+    except (TypeError, ValueError):
+        return False
+
+    return token_student_id == requested_student_id
 
 
 async def get_current_user(
@@ -152,24 +211,78 @@ def check_permission(user: Dict[str, Any], required_permission: str) -> bool:
     if user.get("permission_code") == "edu_admin":
         return True
     
-    # 检查具体权限
-    permission_hierarchy = {
-        "sys_admin": 10,
-        "edu_admin": 9,
-        "exam_admin": 8,
-        "grade_leader": 7,
-        "subject_leader": 6,
-        "lesson_leader": 5,
-        "headmaster": 4,
-        "teacher": 3,
-        "parent": 2,
-        "custom": 1
-    }
-    
-    user_level = permission_hierarchy.get(user.get("permission_code"), 0)
-    required_level = permission_hierarchy.get(required_permission, 0)
+    required_level = PERMISSION_HIERARCHY.get(required_permission)
+    if required_level is None:
+        required_level = SEMANTIC_PERMISSION_MIN_LEVELS.get(required_permission)
+    if required_level is None:
+        return False
+
+    user_level = PERMISSION_HIERARCHY.get(user.get("permission_code"), 0)
     
     return user_level >= required_level
+
+
+def has_permission_code(
+    user: Dict[str, Any],
+    allowed_permission_codes: Iterable[str],
+    include_superusers: bool = True
+) -> bool:
+    """
+    Check explicit permission-code allowlists.
+
+    This is intentionally stricter than the level-based ``check_permission``:
+    unknown permission labels must not silently become public access.
+    """
+    permission_code = user.get("permission_code")
+    allowed = {code for code in allowed_permission_codes if code}
+
+    if include_superusers and permission_code in SUPER_PERMISSION_CODES:
+        return True
+
+    return permission_code in allowed
+
+
+def has_own_resource_or_permission_code(
+    user: Dict[str, Any],
+    owner_user_id: Any,
+    allowed_permission_codes: Iterable[str],
+    include_superusers: bool = True
+) -> bool:
+    """
+    Allow admin-scoped roles or the owner of a user-bound resource.
+    """
+    if has_permission_code(
+        user,
+        allowed_permission_codes,
+        include_superusers=include_superusers
+    ):
+        return True
+
+    try:
+        return int(user.get("id")) == int(owner_user_id)
+    except (TypeError, ValueError):
+        return False
+
+
+def require_permission_codes(*allowed_permission_codes: str, include_superusers: bool = True):
+    """
+    FastAPI dependency for endpoints that need exact role/permission boundaries.
+    """
+    async def permission_code_checker(
+        current_user: Dict[str, Any] = Depends(get_current_user)
+    ):
+        if not has_permission_code(
+            current_user,
+            allowed_permission_codes,
+            include_superusers=include_superusers
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="权限不足，无法访问此资源"
+            )
+        return current_user
+
+    return permission_code_checker
 
 
 def require_permission(required_permission: str):

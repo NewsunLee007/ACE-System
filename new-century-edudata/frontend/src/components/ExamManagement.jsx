@@ -1,14 +1,11 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useCallback, useState, useEffect, useMemo } from 'react';
 import {
   Plus,
   Search,
-  Filter,
-  MoreVertical,
   Calendar,
   BookOpen,
   Users,
   TrendingUp,
-  FileText,
   Trash2,
   Edit,
   Eye,
@@ -19,35 +16,83 @@ import {
   X,
   CheckCircle,
   AlertCircle,
-  Loader2,
   BarChart3,
-  GraduationCap,
   School
 } from 'lucide-react';
 import schoolData from '../data/schoolData';
+import { notify } from '../lib/notify';
+import {
+  buildExamPayload,
+  createExamRecord,
+  deleteExamRecord,
+  exportExamScores,
+  fetchExamScoreRows,
+  fetchExamListWithStatistics,
+  normalizeExamRecord,
+  updateExamRecord,
+} from '../lib/examApi';
+import {
+  buildScoreImport,
+  commitScoreImport,
+  parseScoreImportText,
+  recalculateScoreRanks,
+  scoreImportRowsToCsv,
+  uploadScoreImportFile,
+} from '../lib/scoreImport';
+import { loadSubjectCatalog } from '../lib/subjectCatalog';
+import {
+  buildLocalExamScoresCsv,
+  buildScoreTemplateCsv,
+  calculateClassStats,
+  calculateExamOverview,
+  downloadBlob,
+  filterAndSortScores,
+  filterExams,
+  getExamValidStudentCount,
+  getGradeClassesForExam,
+  getLocalSubjectNames,
+  getNextExamId,
+  getStatusColor,
+  hasBackendSession,
+  isExcelScoreFile,
+  normalizeExamNameWithTerm,
+} from '../lib/examManagementUtils';
+import { useConfirm } from './ui/confirm';
 import AbsenceManagement from './AbsenceManagement';
+import ExamFormModal from './exam-management/ExamFormModal';
 
 const ExamManagement = () => {
-  const [exams, setExams] = useState([]);
-  const [loading, setLoading] = useState(false);
+  const { confirm: confirmAction } = useConfirm();
+  const [exams, setExams] = useState(() => [...(schoolData.exams || [])]);
+  const localExamCacheRef = React.useRef([...(schoolData.exams || [])]);
+  const [examListLoading, setExamListLoading] = useState(false);
+  const [examListError, setExamListError] = useState('');
+  const [examSyncSource, setExamSyncSource] = useState('local');
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [showEditModal, setShowEditModal] = useState(false);
   const [showDetailModal, setShowDetailModal] = useState(false);
-  const [showImportModal, setShowImportModal] = useState(false);
   const [selectedExam, setSelectedExam] = useState(null);
+  const [exportingExamId, setExportingExamId] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [filterGrade, setFilterGrade] = useState('');
   const [filterTerm, setFilterTerm] = useState('');
-  const [currentPage, setCurrentPage] = useState(1);
-  const [importProgress, setImportProgress] = useState(0);
-  const [importStatus, setImportStatus] = useState('');
-  const [importResults, setImportResults] = useState(null);
-  const fileInputRef = useRef(null);
 
   // 成绩管理相关状态
   const [examScores, setExamScores] = useState([]);
+  const [scoreListLoading, setScoreListLoading] = useState(false);
+  const [scoreListError, setScoreListError] = useState('');
+  const [scoreListSource, setScoreListSource] = useState('local');
   const [showScoreModal, setShowScoreModal] = useState(false);
   const [showScoreImportModal, setShowScoreImportModal] = useState(false);
+  const [scoreImportText, setScoreImportText] = useState('');
+  const [scoreImportPreview, setScoreImportPreview] = useState(null);
+  const [scoreImportRows, setScoreImportRows] = useState([]);
+  const [scoreImportHeaders, setScoreImportHeaders] = useState([]);
+  const [scoreImportError, setScoreImportError] = useState('');
+  const [scoreImportResult, setScoreImportResult] = useState(null);
+  const [scoreImportBackendResult, setScoreImportBackendResult] = useState(null);
+  const [scoreImportFile, setScoreImportFile] = useState(null);
+  const [scoreImporting, setScoreImporting] = useState(false);
   const [showScoreEditModal, setShowScoreEditModal] = useState(false);
   const [selectedScore, setSelectedScore] = useState(null);
   const [scoreSearchTerm, setScoreSearchTerm] = useState('');
@@ -68,17 +113,50 @@ const ExamManagement = () => {
     exam_type: '',
     grade_level: '',
     exam_date: '',
-    subjects: []
+    subjects: [],
+    subject_scores: {},
+    full_score: 0
   });
 
   // 从学科管理获取学科列表
   const [availableSubjects, setAvailableSubjects] = useState([]);
+  const [subjectCatalogSource, setSubjectCatalogSource] = useState('local');
+  const [subjectCatalogError, setSubjectCatalogError] = useState('');
 
   // 加载学科数据
   useEffect(() => {
-    // 从schoolData获取学科列表
-    const subjects = schoolData.subjects || ['语文', '数学', '英语', '科学', '社会'];
-    setAvailableSubjects(subjects);
+    let cancelled = false;
+    const localSubjects = getLocalSubjectNames(schoolData.subjects);
+
+    if (!hasBackendSession()) {
+      setAvailableSubjects(localSubjects);
+      setSubjectCatalogSource('local');
+      setSubjectCatalogError('');
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setSubjectCatalogSource('api');
+    setSubjectCatalogError('');
+    loadSubjectCatalog()
+      .then(({ subjects, source, error }) => {
+        if (cancelled) return;
+        const subjectNames = subjects.map(subject => subject.name).filter(Boolean);
+        setAvailableSubjects(subjectNames.length ? subjectNames : localSubjects);
+        setSubjectCatalogSource(source);
+        setSubjectCatalogError(source === 'api' ? '' : `后端学科目录暂不可用，当前使用本地缓存：${error?.message || '连接失败'}`);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setAvailableSubjects(localSubjects);
+        setSubjectCatalogSource('local');
+        setSubjectCatalogError(`后端学科目录暂不可用，当前使用本地缓存：${error.message || '连接失败'}`);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // 创建考试表单数据
@@ -95,123 +173,79 @@ const ExamManagement = () => {
 
   // 初始化创建表单的学科
   useEffect(() => {
-    if (availableSubjects.length > 0 && createForm.subjects.length === 0) {
+    if (availableSubjects.length === 0) return;
+
+    setCreateForm(prev => {
+      if (prev.subjects.length > 0) return prev;
+
       const defaultSubjects = availableSubjects.slice(0, 5);
-      const defaultScores = {};
-      defaultSubjects.forEach(subj => {
-        defaultScores[subj] = 100;
-      });
-      setCreateForm(prev => ({
+      const defaultScores = defaultSubjects.reduce((scores, subject) => ({
+        ...scores,
+        [subject]: 100,
+      }), {});
+
+      return {
         ...prev,
         subjects: defaultSubjects,
         subject_scores: defaultScores,
-        full_score: defaultSubjects.length * 100
-      }));
-    }
-  }, [availableSubjects]);
-
-  // 从schoolData加载考试数据
-  useEffect(() => {
-    // 优先从localStorage加载数据
-    const storedExams = schoolData.exams || [];
-    if (storedExams.length > 0) {
-      setExams(storedExams);
-    } else {
-      // 如果没有存储数据，使用默认示例数据
-      const defaultSubjects = availableSubjects.length > 0 ? availableSubjects.slice(0, 5) : ['语文', '数学', '英语', '科学', '社会'];
-      const defaultSubjectScores = {
-        '语文': 100,
-        '数学': 100,
-        '英语': 100,
-        '科学': 100,
-        '社会': 100
+        full_score: defaultSubjects.length * 100,
       };
-      const defaultExams = [
-      {
-        id: 1,
-        exam_name: '2025-1 7年级教学调研',
-        term: '2025-1',
-        exam_type: '统测',
-        grade_level: '7年级',
-        exam_date: '2025-02-15',
-        subjects: defaultSubjects,
-        subject_scores: defaultSubjectScores,
-        full_score: 500,
-        total_students: 0,
-        valid_students: 0,
-        class_count: 0,
-        status: '待导入',
-        avg_score: 0,
-        top_score: 0,
-        pass_rate: 0
-      },
-      {
-        id: 2,
-        exam_name: '2024-2 7年级期末统考',
-        term: '2024-2',
-        exam_type: '期末',
-        grade_level: '7年级',
-        exam_date: '2025-01-10',
-        subjects: defaultSubjects,
-        subject_scores: defaultSubjectScores,
-        full_score: 500,
-        total_students: 0,
-        valid_students: 0,
-        class_count: 0,
-        status: '待导入',
-        avg_score: 0,
-        top_score: 0,
-        pass_rate: 0
-      },
-      {
-        id: 3,
-        exam_name: '2024-2 8年级期中考试',
-        term: '2024-2',
-        exam_type: '期中',
-        grade_level: '8年级',
-        exam_date: '2024-11-15',
-        subjects: defaultSubjects,
-        subject_scores: defaultSubjectScores,
-        full_score: 500,
-        total_students: 0,
-        valid_students: 0,
-        class_count: 0,
-        status: '待导入',
-        avg_score: 0,
-        top_score: 0,
-        pass_rate: 0
-      },
-      {
-        id: 4,
-        exam_name: '2025-1 8年级教学调研',
-        term: '2025-1',
-        exam_type: '统测',
-        grade_level: '8年级',
-        exam_date: '2025-02-20',
-        subjects: defaultSubjects,
-        subject_scores: defaultSubjectScores,
-        full_score: 500,
-        total_students: 0,
-        valid_students: 0,
-        class_count: 0,
-        status: '未开始',
-        avg_score: 0,
-        top_score: 0,
-        pass_rate: 0
-      }
-      ];
-      setExams(defaultExams);
-      // 保存到schoolData
-      schoolData.exams = defaultExams;
-    }
+    });
   }, [availableSubjects]);
 
-  // 同步exams到schoolData
+  // 考试列表只读取真实数据；后端为空时保留本地真实导入结果，避免空库覆盖分析口径。
   useEffect(() => {
-    if (exams.length > 0) {
+    if (exams.length > 0 || localExamCacheRef.current.length === 0) {
       schoolData.exams = exams;
     }
+    if (exams.length > 0) {
+      localExamCacheRef.current = exams;
+    }
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new Event('schoolData:changed'));
+    }
   }, [exams]);
+
+  const refreshExamList = useCallback(async () => {
+    if (!hasBackendSession()) {
+      setExamSyncSource('local');
+      return null;
+    }
+
+    setExamListLoading(true);
+    try {
+      const payload = await fetchExamListWithStatistics({ pageSize: 100 });
+      const remoteExams = payload.exams || [];
+      if (remoteExams.length === 0 && localExamCacheRef.current.length > 0) {
+        setExams(localExamCacheRef.current);
+        setExamSyncSource('local');
+        setExamListError('后端考试库暂无考试记录，当前显示本地真实导入数据。');
+        return {
+          ...payload,
+          exams: localExamCacheRef.current,
+          source: 'local-fallback',
+        };
+      }
+
+      setExams(remoteExams);
+      if (remoteExams.length > 0) {
+        localExamCacheRef.current = remoteExams;
+      }
+      setExamSyncSource('backend');
+      setExamListError('');
+      return payload;
+    } catch (error) {
+      setExamSyncSource('local');
+      setExamListError(`后端考试库暂不可用，当前显示本地缓存：${error.message || '连接失败'}`);
+      return null;
+    } finally {
+      setExamListLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshExamList();
+  }, [refreshExamList]);
 
   useEffect(() => {
     if (!selectedExam) return;
@@ -220,7 +254,7 @@ const ExamManagement = () => {
   }, [exams, selectedExam]);
 
   const handleCreateExam = () => {
-    const defaultSubjects = ['语文', '数学', '英语', '科学', '社会'];
+    const defaultSubjects = (availableSubjects.length ? availableSubjects : ['语文', '数学', '英语', '科学', '社会']).slice(0, 5);
     const defaultScores = {};
     defaultSubjects.forEach(subj => {
       defaultScores[subj] = 100;
@@ -233,21 +267,18 @@ const ExamManagement = () => {
       exam_date: '',
       subjects: defaultSubjects,
       subject_scores: defaultScores,
-      full_score: 500
+      full_score: defaultSubjects.length * 100
     });
     setShowCreateModal(true);
   };
 
-  const handleSaveCreate = (e) => {
+  const handleSaveCreate = async (e) => {
     e.preventDefault();
-    // 计算总分
-    const totalScore = createForm.subjects.reduce((sum, subj) => {
-      return sum + (createForm.subject_scores?.[subj] || 100);
-    }, 0);
-    const newExam = {
-      id: exams.length + 1,
+    const payload = buildExamPayload(createForm);
+    const localExam = normalizeExamRecord({
+      id: getNextExamId(exams),
       ...createForm,
-      full_score: totalScore,
+      ...payload,
       total_students: 0,
       valid_students: 0,
       class_count: 0,
@@ -255,10 +286,32 @@ const ExamManagement = () => {
       avg_score: 0,
       top_score: 0,
       pass_rate: 0
-    };
-    setExams([...exams, newExam]);
+    });
+
+    if (hasBackendSession()) {
+      try {
+        const result = await createExamRecord(createForm);
+        if (result?.success === false) {
+          notify(result.message || '考试创建失败', 'warning');
+          return;
+        }
+
+        setShowCreateModal(false);
+        const reloaded = await refreshExamList();
+        if (!reloaded) {
+          setExams(prevExams => [...prevExams, { ...localExam, id: result?.exam_id || localExam.id }]);
+        }
+        notify(result?.message || '考试创建成功！', 'success');
+      } catch (error) {
+        setExamListError(`后端创建考试失败：${error.message || '请稍后重试'}`);
+        notify(`考试创建失败：${error.message || '请稍后重试'}`, 'error');
+      }
+      return;
+    }
+
+    setExams([...exams, localExam]);
     setShowCreateModal(false);
-    alert('考试创建成功！');
+    notify('考试创建成功！', 'success');
   };
 
   const handleEditExam = (exam) => {
@@ -270,15 +323,10 @@ const ExamManagement = () => {
       grade_level: exam.grade_level,
       exam_date: exam.exam_date,
       subjects: [...exam.subjects],
-      subject_scores: { ...(exam.subject_scores || {}) }
+      subject_scores: { ...(exam.subject_scores || {}) },
+      full_score: exam.full_score || 0
     });
     setShowEditModal(true);
-  };
-
-  const normalizeExamNameWithTerm = (examName, term) => {
-    const base = String(examName || '').replace(/^\s*\d{4}-\d{1,2}\s+/, '').trim();
-    if (!term) return base;
-    return `${term} ${base}`.trim();
   };
 
   const handleViewDetail = (exam) => {
@@ -288,103 +336,163 @@ const ExamManagement = () => {
 
   const handleImportScores = (exam) => {
     setSelectedExam(exam);
+    resetScoreImportState();
     setShowScoreImportModal(true);
   };
 
-  const handleFileSelect = (e) => {
-    const file = e.target.files[0];
-    if (file) {
-      processImport(file);
-    }
-  };
-
-  const processImport = async (file) => {
-    setImportStatus('reading');
-    setImportProgress(10);
-    
-    // 模拟读取文件
-    await new Promise(resolve => setTimeout(resolve, 500));
-    setImportProgress(30);
-    
-    // 模拟解析数据
-    setImportStatus('parsing');
-    await new Promise(resolve => setTimeout(resolve, 800));
-    setImportProgress(50);
-    
-    // 模拟数据验证
-    setImportStatus('validating');
-    await new Promise(resolve => setTimeout(resolve, 600));
-    setImportProgress(70);
-    
-    // 模拟导入数据
-    setImportStatus('importing');
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    setImportProgress(90);
-    
-    // 模拟计算Z值
-    setImportStatus('calculating');
-    await new Promise(resolve => setTimeout(resolve, 800));
-    setImportProgress(100);
-    
-    // 导入完成
-    setImportStatus('completed');
-    setImportResults({
-      total: 830,
-      success: 827,
-      failed: 3,
-      skipped: 15,
-      message: '成绩导入成功！已自动计算Z值和班级排名。'
-    });
-    
-    // 更新考试状态
-    if (selectedExam) {
-      setExams(exams.map(e => 
-        e.id === selectedExam.id 
-          ? { ...e, status: '已完成', valid_students: 827, total_students: 830 }
-          : e
-      ));
-    }
-  };
-
-  const handleSaveEdit = () => {
+  const handleSaveEdit = async () => {
     if (selectedExam) {
       const normalizedExamName = normalizeExamNameWithTerm(editForm.exam_name, editForm.term);
-      setExams(exams.map(e => 
+      const nextForm = { ...editForm, exam_name: normalizedExamName };
+      const payload = buildExamPayload(nextForm);
+      const updatedExam = normalizeExamRecord({
+        ...selectedExam,
+        ...nextForm,
+        ...payload,
+      });
+
+      if (hasBackendSession()) {
+        try {
+          const result = await updateExamRecord(selectedExam.id, nextForm);
+          if (result?.success === false) {
+            notify(result.message || '考试信息更新失败', 'warning');
+            return;
+          }
+
+          setExams(exams.map(e =>
+            e.id === selectedExam.id ? updatedExam : e
+          ));
+          setSelectedExam(updatedExam);
+          setShowEditModal(false);
+          await refreshExamList();
+          notify(result?.message || '考试信息更新成功！', 'success');
+        } catch (error) {
+          setExamListError(`后端更新考试失败：${error.message || '请稍后重试'}`);
+          notify(`考试信息更新失败：${error.message || '请稍后重试'}`, 'error');
+        }
+        return;
+      }
+
+      setExams(exams.map(e =>
         e.id === selectedExam.id 
-          ? { ...e, ...editForm, exam_name: normalizedExamName }
+          ? updatedExam
           : e
       ));
-      setSelectedExam({ ...selectedExam, ...editForm, exam_name: normalizedExamName });
+      setSelectedExam(updatedExam);
       setShowEditModal(false);
-      alert('考试信息更新成功！');
+      notify('考试信息更新成功！', 'success');
     }
   };
 
-  const handleDeleteExam = (id) => {
-    if (window.confirm('确定要删除这个考试吗？此操作不可恢复！')) {
-      setExams(exams.filter(exam => exam.id !== id));
+  const handleDeleteExam = async (id) => {
+    const confirmed = await confirmAction({
+      title: '删除考试',
+      message: '确定要删除这个考试吗？此操作不可恢复！',
+      confirmText: '删除'
+    });
+    if (!confirmed) return;
+
+    if (hasBackendSession()) {
+      try {
+        const result = await deleteExamRecord(id);
+        if (result?.success === false) {
+          notify(result.message || '考试删除失败', 'warning');
+          return;
+        }
+        setExams(exams.filter(exam => exam.id !== id));
+        notify(result?.message || '考试删除成功', 'success');
+      } catch (error) {
+        setExamListError(`后端删除考试失败：${error.message || '请稍后重试'}`);
+        notify(`考试删除失败：${error.message || '请稍后重试'}`, 'error');
+      }
+      return;
     }
+
+    setExams(exams.filter(exam => exam.id !== id));
+    notify('考试删除成功', 'success');
   };
 
   // ==================== 成绩管理功能 ====================
 
   // 加载考试成绩数据
-  const loadExamScores = (examId) => {
-    // 从schoolData加载成绩数据
-    const scores = schoolData.examScores?.filter(s => s.exam_id === examId) || [];
-    
-    // 设置成绩数据（不再自动生成模拟数据，用户需要通过导入添加成绩）
-    setExamScores(scores);
-    return scores;
+  const loadExamScores = useCallback(async (examId) => {
+    const readLocalScores = () => (
+      (schoolData.examScores || []).filter(s => Number(s.exam_id) === Number(examId))
+    );
+
+    if (!hasBackendSession()) {
+      const scores = readLocalScores();
+      setScoreListSource('local');
+      setScoreListError('');
+      setExamScores(scores);
+      return scores;
+    }
+
+    setScoreListLoading(true);
+    try {
+      const payload = await fetchExamScoreRows(examId, { includeInvalid: true });
+      const backendScores = recalculateScoreRanks(payload.scores || []);
+      const otherScores = (schoolData.examScores || []).filter(s => Number(s.exam_id) !== Number(examId));
+      schoolData.examScores = [...otherScores, ...backendScores];
+      setExamScores(backendScores);
+      setScoreListSource('backend');
+      setScoreListError('');
+      return backendScores;
+    } catch (error) {
+      const fallbackScores = readLocalScores();
+      setScoreListSource('local');
+      setScoreListError(`后端成绩明细暂不可用，当前显示本地缓存：${error.message || '连接失败'}`);
+      setExamScores(fallbackScores);
+      return fallbackScores;
+    } finally {
+      setScoreListLoading(false);
+    }
+  }, []);
+
+  const updateSelectedExamScores = (scores) => {
+    if (!selectedExam) return scores;
+
+    const rankedScores = recalculateScoreRanks(scores);
+    setExamScores(rankedScores);
+
+    const otherScores = (schoolData.examScores || []).filter(s => Number(s.exam_id) !== Number(selectedExam.id));
+    schoolData.examScores = [...otherScores, ...rankedScores];
+
+    const validScores = rankedScores.filter(score => score.is_valid !== false && Number(score.total_score) > 0);
+    const avgScore = validScores.length
+      ? validScores.reduce((sum, score) => sum + Number(score.total_score), 0) / validScores.length
+      : 0;
+    const topScore = validScores.length
+      ? Math.max(...validScores.map(score => Number(score.total_score)))
+      : 0;
+
+    const nextExams = exams.map(exam =>
+      Number(exam.id) === Number(selectedExam.id)
+        ? {
+            ...exam,
+            status: validScores.length > 0 ? '已完成' : '未开始',
+            total_students: rankedScores.length,
+            valid_students: validScores.length,
+            avg_score: Number(avgScore.toFixed(1)),
+            top_score: Number(topScore.toFixed(1)),
+          }
+        : exam
+    );
+    setExams(nextExams);
+
+    const latestExam = nextExams.find(exam => Number(exam.id) === Number(selectedExam.id));
+    if (latestExam) setSelectedExam(latestExam);
+
+    return rankedScores;
   };
 
   // 打开成绩管理弹窗
-  const handleManageScores = (exam) => {
+  const handleManageScores = async (exam) => {
     setSelectedExam(exam);
-    loadExamScores(exam.id);
     setShowScoreModal(true);
     setScoreSearchTerm('');
     setScoreFilterClass('');
+    await loadExamScores(exam.id);
   };
 
   // 处理缺考管理
@@ -393,253 +501,244 @@ const ExamManagement = () => {
     setShowAbsenceModal(true);
   };
 
+  const resetScoreImportState = () => {
+    setScoreImportText('');
+    setScoreImportPreview(null);
+    setScoreImportRows([]);
+    setScoreImportHeaders([]);
+    setScoreImportError('');
+    setScoreImportResult(null);
+    setScoreImportBackendResult(null);
+    setScoreImportFile(null);
+    setScoreImporting(false);
+  };
+
+  const previewScoreImport = (text, exam = selectedExam) => {
+    if (!text.trim()) {
+      setScoreImportPreview(null);
+      setScoreImportRows([]);
+      setScoreImportHeaders([]);
+      setScoreImportError('');
+      setScoreImportResult(null);
+      setScoreImportBackendResult(null);
+      return null;
+    }
+
+    try {
+      const parsed = parseScoreImportText(text);
+      const existingExamScores = (schoolData.examScores || []).filter(s => Number(s.exam_id) === Number(exam.id));
+      const result = buildScoreImport({
+        parsedRows: parsed.rows,
+        headers: parsed.headers,
+        examData: exam,
+        existingExamScores,
+      });
+      setScoreImportHeaders(parsed.headers);
+      setScoreImportRows(parsed.rows);
+      setScoreImportPreview(result);
+      setScoreImportResult(null);
+      setScoreImportBackendResult(null);
+      setScoreImportError(result.importedScores.length === 0 ? (result.errors[0] || '没有可导入的数据') : '');
+      return result;
+    } catch (error) {
+      setScoreImportPreview(null);
+      setScoreImportRows([]);
+      setScoreImportHeaders([]);
+      setScoreImportError(error.message);
+      setScoreImportResult(null);
+      setScoreImportBackendResult(null);
+      return null;
+    }
+  };
+
   // 处理成绩文件导入
   const handleScoreFileImport = (e) => {
-    const file = e.target.files[0];
+    const file = e.target.files?.[0];
     if (!file || !selectedExam) return;
+
+    setScoreImportFile(file);
+    setScoreImportBackendResult(null);
+    setScoreImportResult(null);
+    setScoreImportError('');
+
+    if (isExcelScoreFile(file)) {
+      setScoreImportText('');
+      setScoreImportPreview(null);
+      setScoreImportRows([]);
+      setScoreImportHeaders([]);
+      e.target.value = '';
+      return;
+    }
 
     const reader = new FileReader();
     reader.onload = (event) => {
-      const content = event.target.result;
-      const lines = content.split('\n').filter(line => line.trim());
+      const content = event.target.result || '';
+      setScoreImportText(content);
+      previewScoreImport(content, selectedExam);
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
 
-      if (lines.length < 2) {
-        alert('文件格式错误，至少需要包含表头和一行数据');
+  const buildScoreImportUploadPayload = (result) => {
+    if (scoreImportFile && isExcelScoreFile(scoreImportFile)) {
+      return { file: scoreImportFile, filename: scoreImportFile.name };
+    }
+
+    if (result && scoreImportHeaders.length && scoreImportRows.length) {
+      const csv = scoreImportRowsToCsv({ headers: scoreImportHeaders, rows: scoreImportRows });
+      return {
+        file: new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8;' }),
+        filename: `${selectedExam.exam_name || selectedExam.id}_scores.csv`,
+      };
+    }
+
+    return null;
+  };
+
+  const handleConfirmScoreImport = async () => {
+    if (!selectedExam) return;
+
+    setScoreImporting(true);
+    setScoreImportError('');
+
+    try {
+      if (scoreImportFile && isExcelScoreFile(scoreImportFile)) {
+        if (!hasBackendSession()) {
+          setScoreImportError('Excel 文件需要在登录后写入后端数据库；当前会话未检测到登录 token。');
+          return;
+        }
+
+        const backendResult = await uploadScoreImportFile({
+          examId: selectedExam.id,
+          file: scoreImportFile,
+          filename: scoreImportFile.name,
+        });
+        if (backendResult?.success === false) {
+          throw new Error(backendResult.message || '后端导入失败');
+        }
+
+        setScoreImportBackendResult(backendResult);
+        setScoreImportResult({
+          importedScores: [],
+          insertedCount: backendResult.stats?.success || 0,
+          updatedCount: 0,
+          validCount: backendResult.stats?.success || 0,
+          errors: backendResult.stats?.errors || [],
+        });
+        await refreshExamList();
+        await loadExamScores(selectedExam.id);
+        notify(backendResult.message || '成绩导入完成，考试统计已刷新。', 'success');
         return;
       }
 
-      // 解析表头
-      const headers = lines[0].split(',').map(h => h.trim());
-      const requiredFields = ['学籍辅号', '姓名'];
-      const subjectFields = selectedExam.subjects;
-
-      // 验证必需字段
-      for (const field of requiredFields) {
-        if (!headers.includes(field)) {
-          alert(`缺少必需字段：${field}`);
-          return;
-        }
+      const result = scoreImportPreview || previewScoreImport(scoreImportText, selectedExam);
+      if (!result || result.importedScores.length === 0) {
+        setScoreImportError(result?.errors?.[0] || '没有可导入的数据');
+        return;
       }
 
-      // 解析数据
-      const importedScores = [];
-      const errors = [];
-
-      for (let i = 1; i < lines.length; i++) {
-        const cols = lines[i].split(',');
-        if (cols.length < headers.length) continue;
-
-        const studentCode = cols[headers.indexOf('学籍辅号')]?.trim();
-        const studentName = cols[headers.indexOf('姓名')]?.trim();
-
-        // 查找学生
-        let student = schoolData.students?.find(s => s.student_code === studentCode);
-        
-        // 如果找不到学生，尝试从学籍号解析班级信息创建临时学生
-        if (!student) {
-          // 尝试从学籍号解析班级ID (如: 20240701001 -> 701)
-          const classIdMatch = studentCode.match(/\d{4}(\d{2})\d+/);
-          if (classIdMatch) {
-            const grade = parseInt(selectedExam.grade_level);
-            const classNum = parseInt(classIdMatch[1]);
-            const classId = grade * 100 + classNum;
-            
-            // 检查班级是否存在
-            const cls = schoolData.classes?.find(c => c.id === classId);
-            if (cls) {
-              // 创建临时学生记录
-              student = {
-                id: Date.now() + i,
-                student_code: studentCode,
-                name: studentName,
-                class_id: classId
-              };
-            } else {
-              errors.push(`第${i + 1}行：学籍辅号 "${studentCode}" 对应的班级不存在`);
-              continue;
-            }
-          } else {
-            errors.push(`第${i + 1}行：学籍辅号 "${studentCode}" 不存在且无法解析班级信息`);
-            continue;
-          }
-        }
-
-        // 解析各科成绩
-        const scores = {};
-        let hasValidScore = false;
-        subjectFields.forEach(subject => {
-          const scoreIndex = headers.indexOf(subject);
-          if (scoreIndex >= 0) {
-            const score = parseFloat(cols[scoreIndex]);
-            if (!isNaN(score) && score >= 0) {
-              scores[subject] = score;
-              hasValidScore = true;
-            }
-          }
+      if (hasBackendSession()) {
+        const uploadPayload = buildScoreImportUploadPayload(result);
+        const backendResult = await uploadScoreImportFile({
+          examId: selectedExam.id,
+          file: uploadPayload.file,
+          filename: uploadPayload.filename,
         });
-
-        if (!hasValidScore) {
-          errors.push(`第${i + 1}行：没有有效的成绩数据`);
-          continue;
+        if (backendResult?.success === false) {
+          throw new Error(backendResult.message || '后端导入失败');
         }
-
-        const totalScore = Object.values(scores).reduce((a, b) => a + b, 0);
-
-        // 解析是否参与统计
-        const isValidIndex = headers.indexOf('参与统计');
-        let isValid = true;
-        if (isValidIndex >= 0) {
-          const validValue = cols[isValidIndex]?.trim();
-          isValid = validValue !== '否' && validValue !== '0' && validValue !== 'false';
-        }
-
-        // 解析额外统计班级
-        const additionalClassesIndex = headers.indexOf('额外统计班级');
-        let additionalClasses = [];
-        if (additionalClassesIndex >= 0) {
-          const classesValue = cols[additionalClassesIndex]?.trim();
-          if (classesValue) {
-            // 格式：班级ID1,班级ID2 或 班级名1,班级名2
-            const classIds = classesValue.split(',').map(c => c.trim());
-            additionalClasses = classIds.map(classId => {
-              // 尝试查找班级
-              const cls = schoolData.classes?.find(c => c.id === parseInt(classId) || c.name === classId);
-              if (cls) {
-                return { class_id: cls.id, class_name: cls.name };
-              }
-              return null;
-            }).filter(Boolean);
-          }
-        }
-
-        importedScores.push({
-          exam_id: selectedExam.id,
-          student_id: student.id,
-          student_code: studentCode,
-          student_name: studentName,
-          class_id: student.class_id,
-          scores: scores,
-          total_score: totalScore,
-          is_valid: isValid,
-          additional_classes: additionalClasses,
-          rank: 0,
-          class_rank: 0,
-          created_at: new Date().toISOString().split('T')[0],
-          updated_at: new Date().toISOString().split('T')[0]
-        });
+        setScoreImportBackendResult(backendResult);
       }
 
-      if (errors.length > 0) {
-        console.warn('导入警告：', errors);
+      commitScoreImport({ examData: selectedExam, importResult: result });
+      setExamScores(result.mergedScores);
+      setExams([...(schoolData.exams || [])]);
+      const latestExam = (schoolData.exams || []).find(exam => Number(exam.id) === Number(selectedExam.id));
+      if (latestExam) setSelectedExam(latestExam);
+      setScoreImportResult(result);
+      setScoreImportError(result.errors.length ? `已写入成绩库，但有 ${result.errors.length} 行需要检查。` : '');
+      if (hasBackendSession()) {
+        await refreshExamList();
+        await loadExamScores(selectedExam.id);
       }
-
-      // 合并现有成绩和新导入的成绩
-      const existingScores = examScores.filter(s => s.exam_id === selectedExam.id);
-      const mergedScores = [...existingScores];
-
-      importedScores.forEach(newScore => {
-        const existingIndex = mergedScores.findIndex(s => s.student_id === newScore.student_id);
-        if (existingIndex >= 0) {
-          // 更新现有记录
-          mergedScores[existingIndex] = {
-            ...mergedScores[existingIndex],
-            scores: { ...mergedScores[existingIndex].scores, ...newScore.scores },
-            total_score: newScore.total_score,
-            updated_at: new Date().toISOString().split('T')[0]
-          };
-        } else {
-          // 添加新记录 - 使用学生ID和考试ID组合生成唯一ID
-          mergedScores.push({
-            ...newScore,
-            id: `${selectedExam.id}_${newScore.student_id}_${Date.now()}`
-          });
-        }
-      });
-
-      // 重新计算排名
-      mergedScores.sort((a, b) => b.total_score - a.total_score);
-      mergedScores.forEach((score, index) => {
-        score.rank = index + 1;
-      });
-
-      // 按班级计算班级排名
-      const classGroups = {};
-      mergedScores.forEach(score => {
-        if (!classGroups[score.class_id]) classGroups[score.class_id] = [];
-        classGroups[score.class_id].push(score);
-      });
-
-      Object.values(classGroups).forEach(classScores => {
-        classScores.sort((a, b) => b.total_score - a.total_score);
-        classScores.forEach((score, index) => {
-          score.class_rank = index + 1;
-        });
-      });
-
-      // 更新状态
-      setExamScores(mergedScores);
-
-      // 更新schoolData
-      const otherScores = (schoolData.examScores || []).filter(s => s.exam_id !== selectedExam.id);
-      schoolData.examScores = [...otherScores, ...mergedScores];
-
-      // 更新考试统计信息
-      const validStudents = mergedScores.filter(s => s.total_score > 0).length;
-      const avgScore = validStudents > 0
-        ? mergedScores.reduce((sum, s) => sum + s.total_score, 0) / validStudents
-        : 0;
-      const topScore = validStudents > 0
-        ? Math.max(...mergedScores.map(s => s.total_score))
-        : 0;
-
-      setExams(exams.map(e =>
-        e.id === selectedExam.id
-          ? {
-              ...e,
-              status: '已完成',
-              valid_students: validStudents,
-              total_students: mergedScores.length,
-              avg_score: avgScore.toFixed(1),
-              top_score: topScore.toFixed(1)
-            }
-          : e
-      ));
-
-      // 构建导入结果提示
-      let message = '成功导入 ' + importedScores.length + ' 条成绩记录';
-      if (errors.length > 0) {
-        message += '\n\n以下 ' + errors.length + ' 条记录出错：\n';
-        message += errors.slice(0, 20).join('\n'); // 最多显示20条错误
-        if (errors.length > 20) {
-          message += '\n... 还有 ' + (errors.length - 20) + ' 条错误未显示';
-        }
-      }
-      alert(message);
-      setShowScoreImportModal(false);
-    };
-    reader.readAsText(file);
+      notify(`成绩导入完成：新增 ${result.insertedCount} 条，覆盖 ${result.updatedCount} 条，参与统计 ${result.validCount} 人。`, result.errors.length ? 'warning' : 'success');
+    } catch (error) {
+      setScoreImportError(error.message || '成绩导入失败');
+      notify(`成绩导入失败：${error.message || '请稍后重试'}`, 'error');
+    } finally {
+      setScoreImporting(false);
+    }
   };
 
   // 下载成绩导入模板
   const downloadScoreTemplate = () => {
     if (!selectedExam) return;
 
-    const headers = ['学籍辅号', '姓名', ...selectedExam.subjects, '参与统计', '额外统计班级'];
-    const sampleData = [
-      ['20240701001', '张三', ...selectedExam.subjects.map(() => '85'), '是', '704,705'],
-      ['20240701002', '李四', ...selectedExam.subjects.map(() => '90'), '是', ''],
-    ];
-
-    const csvContent = [headers.join(','), ...sampleData.map(row => row.join(','))].join('\n');
+    const csvContent = buildScoreTemplateCsv(selectedExam);
     const blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = `${selectedExam.exam_name}_成绩导入模板.csv`;
-    link.click();
+    downloadBlob(blob, `${selectedExam.exam_name}_成绩导入模板.csv`);
   };
+
+  const exportLocalExamScores = (exam) => {
+    const scores = (schoolData.examScores || []).filter(score => Number(score.exam_id) === Number(exam.id));
+    if (scores.length === 0) {
+      notify('当前考试没有可导出的本地成绩数据', 'warning');
+      return false;
+    }
+
+    const csv = buildLocalExamScoresCsv({ exam, scores });
+    const blob = new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8;' });
+    downloadBlob(blob, `${exam.exam_name || `exam_${exam.id}`}_成绩明细.csv`);
+    return true;
+  };
+
+  const handleExportScores = async (exam) => {
+    if (!exam?.id) return;
+
+    setExportingExamId(exam.id);
+    try {
+      if (hasBackendSession()) {
+        const blob = await exportExamScores(exam.id);
+        downloadBlob(
+          blob,
+          `${exam.exam_name || `exam_${exam.id}`}_成绩明细.xlsx`
+        );
+        notify('成绩明细已导出', 'success');
+        return;
+      }
+
+      if (exportLocalExamScores(exam)) {
+        notify('本地成绩明细已导出', 'success');
+      }
+    } catch (error) {
+      if (exportLocalExamScores(exam)) {
+        notify(`后端导出失败，已导出本地缓存：${error.message || '连接失败'}`, 'warning');
+      } else {
+        notify(`导出失败：${error.message || '请稍后重试'}`, 'error');
+      }
+    } finally {
+      setExportingExamId(null);
+    }
+  };
+
+  const renderSubjectCatalogHint = () => (
+    <p className={`mt-2 text-xs ${subjectCatalogError ? 'text-amber-600' : 'text-gray-500'}`}>
+      {subjectCatalogError || (
+        subjectCatalogSource === 'api'
+          ? '学科选项来自后端学科目录。'
+          : '学科选项来自本地缓存。'
+      )}
+    </p>
+  );
 
   // 打开成绩编辑弹窗
   const handleEditScore = (score) => {
+    if (hasBackendSession() && scoreListSource === 'backend') {
+      notify('后端成绩明细暂不支持直接编辑，请通过成绩导入覆盖更新。', 'warning');
+      return;
+    }
+
     setSelectedScore(score);
     setEditingScores({ ...score.scores });
     setEditingIsValid(score.is_valid !== false);
@@ -674,14 +773,14 @@ const ExamManagement = () => {
     });
 
     if (hasError) {
-      alert('数据校验失败：' + errorMsg);
+      notify('数据校验失败：' + errorMsg);
       return;
     }
 
     // 检查是否所有成绩都为空
     const hasAnyScore = Object.values(validatedScores).some(v => v !== null && v !== undefined);
     if (!hasAnyScore) {
-      alert('请至少输入一科成绩');
+      notify('请至少输入一科成绩');
       return;
     }
 
@@ -701,259 +800,104 @@ const ExamManagement = () => {
       s.id === selectedScore.id ? updatedScore : s
     );
 
-    // 重新计算排名
-    updatedScores.sort((a, b) => b.total_score - a.total_score);
-    updatedScores.forEach((score, index) => {
-      score.rank = index + 1;
-    });
-
-    // 按班级计算班级排名
-    const classGroups = {};
-    updatedScores.forEach(score => {
-      if (!classGroups[score.class_id]) classGroups[score.class_id] = [];
-      classGroups[score.class_id].push(score);
-    });
-
-    Object.values(classGroups).forEach(classScores => {
-      classScores.sort((a, b) => b.total_score - a.total_score);
-      classScores.forEach((score, index) => {
-        score.class_rank = index + 1;
-      });
-    });
-
-    setExamScores(updatedScores);
-
-    // 更新schoolData
-    const otherScores = (schoolData.examScores || []).filter(s => s.exam_id !== selectedExam.id);
-    schoolData.examScores = [...otherScores, ...updatedScores];
-
-    // 更新考试统计
-    const validStudents = updatedScores.filter(s => s.total_score > 0).length;
-    const avgScore = validStudents > 0
-      ? updatedScores.reduce((sum, s) => sum + s.total_score, 0) / validStudents
-      : 0;
-
-    setExams(exams.map(e =>
-      e.id === selectedExam.id
-        ? { ...e, avg_score: avgScore.toFixed(1) }
-        : e
-    ));
-
+    updateSelectedExamScores(updatedScores);
     setShowScoreEditModal(false);
-    alert('成绩修改成功！排名已自动更新。');
+    notify('成绩修改成功！排名已自动更新。');
   };
 
   // 删除成绩
-  const handleDeleteScore = (scoreId) => {
-    if (window.confirm('确定要删除这条成绩记录吗？此操作不可恢复！')) {
-      const updatedScores = examScores.filter(s => s.id !== scoreId);
-      setExamScores(updatedScores);
-      
-      // 更新schoolData
-      const otherScores = (schoolData.examScores || []).filter(s => s.exam_id !== selectedExam.id);
-      schoolData.examScores = [...otherScores, ...updatedScores];
-      
-      // 重新计算排名
-      updatedScores.sort((a, b) => b.total_score - a.total_score);
-      updatedScores.forEach((score, index) => {
-        score.rank = index + 1;
-      });
-      
-      // 按班级计算班级排名
-      const classGroups = {};
-      updatedScores.forEach(score => {
-        if (!classGroups[score.class_id]) classGroups[score.class_id] = [];
-        classGroups[score.class_id].push(score);
-      });
-      
-      Object.values(classGroups).forEach(classScores => {
-        classScores.sort((a, b) => b.total_score - a.total_score);
-        classScores.forEach((score, index) => {
-          score.class_rank = index + 1;
-        });
-      });
-      
-      setExamScores([...updatedScores]);
+  const handleDeleteScore = async (scoreId) => {
+    if (hasBackendSession() && scoreListSource === 'backend') {
+      notify('后端成绩明细暂不支持直接删除，请通过重新导入或数据库维护处理。', 'warning');
+      return;
     }
+
+    const confirmed = await confirmAction({
+      title: '删除成绩记录',
+      message: '确定要删除这条成绩记录吗？此操作不可恢复！',
+      confirmText: '删除'
+    });
+    if (!confirmed) return;
+
+    const updatedScores = examScores.filter(s => s.id !== scoreId);
+    updateSelectedExamScores(updatedScores);
+    notify('成绩记录已删除，排名已重新计算。');
   };
 
   // 一键清空成绩
-  const handleClearAllScores = () => {
+  const handleClearAllScores = async () => {
     if (!selectedExam) return;
-    
+
     const count = examScores.length;
-    if (count === 0) {
-      alert('当前没有成绩数据可清空');
+    if (hasBackendSession() && scoreListSource === 'backend') {
+      notify('已连接后端成绩库，清空成绩需要后端删除接口支持；请通过重新导入覆盖或联系管理员处理。', 'warning');
       return;
     }
-    
-    if (window.confirm(`确定要清空所有 ${count} 条成绩记录吗？此操作不可恢复！`)) {
-      // 先清空成绩状态
-      setExamScores([]);
-      
-      // 更新schoolData
-      const otherScores = (schoolData.examScores || []).filter(s => s.exam_id !== selectedExam.id);
-      schoolData.examScores = otherScores;
-      
-      // 更新考试状态
-      setExams(prevExams => prevExams.map(e =>
-        e.id === selectedExam.id
-          ? { ...e, status: '未开始', valid_students: 0, total_students: 0, avg_score: 0, top_score: 0, pass_rate: 0 }
-          : e
-      ));
-      
-      // 重置筛选状态
-      setScoreSearchTerm('');
-      setScoreFilterClass('');
-      setScoreSortField('total_score');
-      setScoreSortOrder('desc');
+
+    if (count === 0) {
+      notify('当前没有成绩数据可清空');
+      return;
     }
+
+    const confirmed = await confirmAction({
+      title: '清空成绩',
+      message: `确定要清空所有 ${count} 条成绩记录吗？此操作不可恢复！`,
+      confirmText: '清空'
+    });
+    if (!confirmed) return;
+
+    // 先清空成绩状态
+    setExamScores([]);
+
+    // 更新schoolData
+    const otherScores = (schoolData.examScores || []).filter(s => s.exam_id !== selectedExam.id);
+    schoolData.examScores = otherScores;
+
+    // 更新考试状态
+    setExams(prevExams => prevExams.map(e =>
+      e.id === selectedExam.id
+        ? { ...e, status: '未开始', valid_students: 0, total_students: 0, avg_score: 0, top_score: 0, pass_rate: 0 }
+        : e
+    ));
+
+    // 重置筛选状态
+    setScoreSearchTerm('');
+    setScoreFilterClass('');
+    setScoreSortField('total_score');
+    setScoreSortOrder('desc');
   };
 
   // 过滤和排序成绩 - 使用 useMemo 缓存结果
-  const filteredScores = useMemo(() => {
-    // 直接使用当前 examScores，不再按 exam_id 筛选（因为打开弹窗时已经加载了该考试的成绩）
-    let scores = [...examScores];
-
-    // 搜索过滤
-    if (scoreSearchTerm) {
-      const term = scoreSearchTerm.toLowerCase();
-      scores = scores.filter(s =>
-        s.student_name?.toLowerCase().includes(term) ||
-        s.student_code?.toLowerCase().includes(term)
-      );
-    }
-
-    // 班级过滤 - 使用严格比较
-    if (scoreFilterClass && scoreFilterClass !== '') {
-      const filterId = scoreFilterClass;
-      scores = scores.filter(s => {
-        const scoreId = String(s.class_id);
-        return scoreId === filterId;
-      });
-    }
-
-    // 排序 - 确保返回新数组避免原地修改问题
-    const sortedScores = [...scores].sort((a, b) => {
-      let aVal, bVal;
-      if (scoreSortField === 'total_score') {
-        aVal = Number(a.total_score) || 0;
-        bVal = Number(b.total_score) || 0;
-      } else if (scoreSortField === 'rank') {
-        aVal = Number(a.rank) || 0;
-        bVal = Number(b.rank) || 0;
-      } else if (scoreSortField === 'class_rank') {
-        aVal = Number(a.class_rank) || 0;
-        bVal = Number(b.class_rank) || 0;
-      } else {
-        aVal = Number(a.scores?.[scoreSortField]) || 0;
-        bVal = Number(b.scores?.[scoreSortField]) || 0;
-      }
-
-      return scoreSortOrder === 'asc' ? aVal - bVal : bVal - aVal;
-    });
-
-    return sortedScores;
-  }, [examScores, scoreSearchTerm, scoreFilterClass, scoreSortField, scoreSortOrder]);
+  const filteredScores = useMemo(() => (
+    filterAndSortScores({
+      scores: examScores,
+      searchTerm: scoreSearchTerm,
+      filterClass: scoreFilterClass,
+      sortField: scoreSortField,
+      sortOrder: scoreSortOrder,
+    })
+  ), [examScores, scoreSearchTerm, scoreFilterClass, scoreSortField, scoreSortOrder]);
 
   // 获取班级列表 - 返回该年级的所有班级
   const getClassList = () => {
-    if (!selectedExam) return [];
-    const grade = parseInt(selectedExam.grade_level);
-    
-    // 获取该年级的所有班级
-    const allGradeClasses = schoolData.classes?.filter(c => Math.floor(c.id / 100) === grade) || [];
-    
-    // 返回所有班级，不管是否有成绩数据
-    return allGradeClasses.sort((a, b) => a.id - b.id);
+    return getGradeClassesForExam({ exam: selectedExam, classes: schoolData.classes || [] });
   };
 
-  const getStatusColor = (status) => {
-    switch (status) {
-      case '已完成':
-        return 'bg-green-100 text-green-700';
-      case '进行中':
-        return 'bg-blue-100 text-blue-700';
-      case '未开始':
-        return 'bg-gray-100 text-gray-700';
-      default:
-        return 'bg-gray-100 text-gray-700';
-    }
-  };
+  const filteredExams = useMemo(() => (
+    filterExams({ exams, searchTerm, filterGrade, filterTerm })
+  ), [exams, searchTerm, filterGrade, filterTerm]);
 
-  const filteredExams = exams.filter(exam => {
-    const matchSearch = exam.exam_name.toLowerCase().includes(searchTerm.toLowerCase());
-    const matchGrade = !filterGrade || exam.grade_level === filterGrade;
-    const matchTerm = !filterTerm || exam.term === filterTerm;
-    return matchSearch && matchGrade && matchTerm;
+  const sourceExamScores = schoolData.examScores || [];
+  const examOverview = calculateExamOverview({
+    exams,
+    examScores: sourceExamScores,
   });
 
-  // 根据实际成绩数据计算班级统计
-  const calculateClassStats = () => {
-    if (!selectedExam || examScores.length === 0) return [];
-    
-    const grade = parseInt(selectedExam.grade_level);
-    const gradeClasses = schoolData.classes?.filter(c => Math.floor(c.id / 100) === grade) || [];
-    
-    // 获取该考试的所有成绩
-    const scores = schoolData.examScores?.filter(s => s.exam_id === selectedExam.id) || [];
-    
-    // 计算年级平均分用于Z值计算
-    const allScores = scores.map(s => s.total_score);
-    const gradeAvg = allScores.reduce((a, b) => a + b, 0) / allScores.length;
-    const gradeStd = Math.sqrt(allScores.reduce((sq, n) => sq + Math.pow(n - gradeAvg, 2), 0) / allScores.length);
-    
-    // 计算前20%的分数线
-    const sortedScores = [...allScores].sort((a, b) => b - a);
-    const top20Threshold = sortedScores[Math.floor(allScores.length * 0.2)] || 0;
-    
-    // 按班级统计
-    const classStatsMap = {};
-    
-    scores.forEach(score => {
-      const classId = score.class_id;
-      if (!classStatsMap[classId]) {
-        classStatsMap[classId] = {
-          class_id: classId,
-          scores: [],
-          top20_count: 0
-        };
-      }
-      classStatsMap[classId].scores.push(score.total_score);
-      if (score.total_score >= top20Threshold) {
-        classStatsMap[classId].top20_count++;
-      }
-    });
-    
-    // 计算每个班级的统计数据
-    const stats = Object.values(classStatsMap).map(stat => {
-      const cls = gradeClasses.find(c => c.id === stat.class_id);
-      const classNo = cls ? parseInt(String(cls.id).slice(-2)) : 0;
-      const count = stat.scores.length;
-      const avg = stat.scores.reduce((a, b) => a + b, 0) / count;
-      const zValue = gradeStd > 0 ? (avg - gradeAvg) / gradeStd : 0;
-      const top20Rate = Math.round((stat.top20_count / count) * 100);
-      
-      return {
-        class_no: classNo,
-        student_count: count,
-        avg_score: avg.toFixed(1),
-        z_value: zValue.toFixed(2),
-        top20_rate: top20Rate,
-        rank: 0 // 稍后计算
-      };
-    });
-    
-    // 按平均分排序计算排名
-    stats.sort((a, b) => b.avg_score - a.avg_score);
-    stats.forEach((stat, index) => {
-      stat.rank = index + 1;
-    });
-    
-    return stats;
-  };
-  
-  const classStats = calculateClassStats();
+  const classStats = calculateClassStats({
+    selectedExam,
+    examScores: sourceExamScores,
+    classes: schoolData.classes || [],
+  });
 
   return (
     <div className="min-h-screen bg-gray-50 p-6">
@@ -962,6 +906,21 @@ const ExamManagement = () => {
         <h1 className="text-2xl font-bold text-gray-800">考试管理</h1>
         <p className="text-gray-500 mt-1">创建和管理各类考试，导入成绩数据</p>
       </div>
+
+      {(examListLoading || examListError || examSyncSource === 'backend') && (
+        <div className={`mb-4 flex items-center gap-2 rounded-lg border p-3 text-sm ${
+          examListError
+            ? 'border-amber-100 bg-amber-50 text-amber-700'
+            : 'border-emerald-100 bg-emerald-50 text-emerald-700'
+        }`}>
+          {examListError ? <AlertCircle className="h-4 w-4" /> : <CheckCircle className="h-4 w-4" />}
+          <span>
+            {examListLoading
+              ? '正在同步后端考试库...'
+              : examListError || '已连接后端考试库，考试列表和统计来自数据库。'}
+          </span>
+        </div>
+      )}
 
       {/* 操作栏 */}
       <div className="bg-white rounded-lg shadow-sm p-4 mb-6">
@@ -1021,7 +980,7 @@ const ExamManagement = () => {
           <div className="flex items-center justify-between">
             <div>
               <p className="text-sm text-gray-500">考试总数</p>
-              <p className="text-2xl font-bold text-gray-800">{exams.length}</p>
+              <p className="text-2xl font-bold text-gray-800">{examOverview.totalExams}</p>
             </div>
             <div className="bg-blue-100 p-3 rounded-lg">
               <BookOpen className="w-6 h-6 text-blue-600" />
@@ -1029,67 +988,45 @@ const ExamManagement = () => {
           </div>
         </div>
 
-        {(() => {
-          // 从实际成绩数据计算概览统计
-          const allExamScores = schoolData.examScores || [];
-          const validStudents = allExamScores.filter(s => s.is_valid !== false).length;
-          
-          // 计算本月考试数量
-          const now = new Date();
-          const currentMonth = now.getMonth();
-          const currentYear = now.getFullYear();
-          const thisMonthExams = exams.filter(e => {
-            const examDate = new Date(e.exam_date);
-            return examDate.getMonth() === currentMonth && examDate.getFullYear() === currentYear;
-          }).length;
-          
-          // 计算已完成考试数量（有成绩数据的考试）
-          const completedExams = new Set(allExamScores.map(s => s.exam_id)).size;
-          
-          return (
-            <>
-              <div className="bg-white rounded-lg shadow-sm p-6">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-sm text-gray-500">已完成</p>
-                    <p className="text-2xl font-bold text-green-600">
-                      {completedExams}
-                    </p>
-                  </div>
-                  <div className="bg-green-100 p-3 rounded-lg">
-                    <TrendingUp className="w-6 h-6 text-green-600" />
-                  </div>
-                </div>
-              </div>
+        <div className="bg-white rounded-lg shadow-sm p-6">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm text-gray-500">已完成</p>
+              <p className="text-2xl font-bold text-green-600">
+                {examOverview.completedExams}
+              </p>
+            </div>
+            <div className="bg-green-100 p-3 rounded-lg">
+              <TrendingUp className="w-6 h-6 text-green-600" />
+            </div>
+          </div>
+        </div>
 
-              <div className="bg-white rounded-lg shadow-sm p-6">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-sm text-gray-500">参与学生</p>
-                    <p className="text-2xl font-bold text-gray-800">
-                      {validStudents}
-                    </p>
-                  </div>
-                  <div className="bg-purple-100 p-3 rounded-lg">
-                    <Users className="w-6 h-6 text-purple-600" />
-                  </div>
-                </div>
-              </div>
+        <div className="bg-white rounded-lg shadow-sm p-6">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm text-gray-500">参与学生</p>
+              <p className="text-2xl font-bold text-gray-800">
+                {examOverview.validStudents}
+              </p>
+            </div>
+            <div className="bg-purple-100 p-3 rounded-lg">
+              <Users className="w-6 h-6 text-purple-600" />
+            </div>
+          </div>
+        </div>
 
-              <div className="bg-white rounded-lg shadow-sm p-6">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-sm text-gray-500">本月考试</p>
-                    <p className="text-2xl font-bold text-gray-800">{thisMonthExams}</p>
-                  </div>
-                  <div className="bg-yellow-100 p-3 rounded-lg">
-                    <Calendar className="w-6 h-6 text-yellow-600" />
-                  </div>
-                </div>
-              </div>
-            </>
-          );
-        })()}
+        <div className="bg-white rounded-lg shadow-sm p-6">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm text-gray-500">本月考试</p>
+              <p className="text-2xl font-bold text-gray-800">{examOverview.thisMonthExams}</p>
+            </div>
+            <div className="bg-yellow-100 p-3 rounded-lg">
+              <Calendar className="w-6 h-6 text-yellow-600" />
+            </div>
+          </div>
+        </div>
       </div>
 
       {/* 考试列表 */}
@@ -1112,10 +1049,10 @@ const ExamManagement = () => {
             </thead>
             <tbody className="divide-y divide-gray-200">
               {filteredExams.map((exam) => {
-                // 从实际成绩数据计算参与人数
-                const examScoresData = schoolData.examScores?.filter(s => s.exam_id === exam.id) || [];
-                const validStudents = examScoresData.filter(s => s.is_valid !== false).length;
-                const totalStudents = examScoresData.length;
+                const validStudents = getExamValidStudentCount({
+                  exam,
+                  scores: schoolData.examScores || [],
+                });
                 
                 return (
                 <tr key={exam.id} className="hover:bg-gray-50">
@@ -1207,9 +1144,10 @@ const ExamManagement = () => {
         {/* 移动端卡片布局 */}
         <div className="md:hidden">
           {filteredExams.map((exam) => {
-            // 从实际成绩数据计算参与人数
-            const examScoresData = schoolData.examScores?.filter(s => s.exam_id === exam.id) || [];
-            const validStudents = examScoresData.filter(s => s.is_valid !== false).length;
+            const validStudents = getExamValidStudentCount({
+              exam,
+              scores: schoolData.examScores || [],
+            });
             
             return (
             <div key={exam.id} className="p-4 border-b border-gray-200 hover:bg-gray-50">
@@ -1318,319 +1256,31 @@ const ExamManagement = () => {
 
       {/* 创建考试弹窗 */}
       {showCreateModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg w-full max-w-lg p-6">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-xl font-bold text-gray-800">创建新考试</h2>
-              <button onClick={() => setShowCreateModal(false)}>
-                <X className="w-6 h-6 text-gray-400 hover:text-gray-600" />
-              </button>
-            </div>
-            
-            <form className="space-y-4" onSubmit={handleSaveCreate}>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">考试名称 *</label>
-                <input 
-                  type="text" 
-                  required
-                  value={createForm.exam_name}
-                  onChange={(e) => setCreateForm({...createForm, exam_name: e.target.value})}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none" 
-                  placeholder="如：2025-1 7年级教学调研" 
-                />
-              </div>
-              
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">学期</label>
-                  <select 
-                    value={createForm.term}
-                    onChange={(e) => setCreateForm({...createForm, term: e.target.value})}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
-                  >
-                    <option>2025-1</option>
-                    <option>2024-2</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">考试类型</label>
-                  <select 
-                    value={createForm.exam_type}
-                    onChange={(e) => setCreateForm({...createForm, exam_type: e.target.value})}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
-                  >
-                    <option>期中</option>
-                    <option>期末</option>
-                    <option>月考</option>
-                    <option>统测</option>
-                  </select>
-                </div>
-              </div>
-              
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">年级</label>
-                  <select 
-                    value={createForm.grade_level}
-                    onChange={(e) => setCreateForm({...createForm, grade_level: e.target.value})}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
-                  >
-                    <option>7年级</option>
-                    <option>8年级</option>
-                    <option>9年级</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">考试日期 *</label>
-                  <input 
-                    type="date" 
-                    required
-                    value={createForm.exam_date}
-                    onChange={(e) => setCreateForm({...createForm, exam_date: e.target.value})}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none" 
-                  />
-                </div>
-              </div>
-              
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">考试科目</label>
-                <div className="flex gap-2 flex-wrap">
-                  {availableSubjects.map(subject => (
-                    <label key={subject} className="flex items-center gap-1 px-3 py-1 bg-gray-100 rounded cursor-pointer hover:bg-gray-200">
-                      <input
-                        type="checkbox"
-                        checked={createForm.subjects.includes(subject)}
-                        onChange={(e) => {
-                          if (e.target.checked) {
-                            setCreateForm({...createForm, subjects: [...createForm.subjects, subject]});
-                          } else {
-                            setCreateForm({...createForm, subjects: createForm.subjects.filter(s => s !== subject)});
-                          }
-                        }}
-                        className="rounded"
-                      />
-                      <span className="text-sm">{subject}</span>
-                    </label>
-                  ))}
-                </div>
-                {availableSubjects.length === 0 && (
-                  <p className="text-sm text-gray-500 mt-2">请先前往"学科管理"添加学科</p>
-                )}
-              </div>
-
-              {/* 学科满分分值设定 */}
-              {createForm.subjects.length > 0 && (
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">学科满分分值设定</label>
-                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
-                    {createForm.subjects.map(subject => (
-                      <div key={subject} className="flex items-center gap-2">
-                        <span className="text-sm text-gray-600 w-12">{subject}</span>
-                        <input
-                          type="number"
-                          min="0"
-                          max="200"
-                          value={createForm.subject_scores?.[subject] || 100}
-                          onChange={(e) => {
-                            const newScores = { ...(createForm.subject_scores || {}) };
-                            newScores[subject] = parseInt(e.target.value) || 0;
-                            // 自动计算总分
-                            const totalScore = createForm.subjects.reduce((sum, subj) => {
-                              return sum + (newScores[subj] || 100);
-                            }, 0);
-                            setCreateForm({
-                              ...createForm,
-                              subject_scores: newScores,
-                              full_score: totalScore
-                            });
-                          }}
-                          className="w-20 px-2 py-1 border border-gray-300 rounded text-center text-sm focus:ring-2 focus:ring-blue-500 outline-none"
-                        />
-                        <span className="text-xs text-gray-400">分</span>
-                      </div>
-                    ))}
-                  </div>
-                  <p className="text-sm text-gray-500 mt-2">
-                    总分: <span className="font-medium text-blue-600">{createForm.full_score || createForm.subjects.reduce((sum, subj) => sum + (createForm.subject_scores?.[subj] || 100), 0)}</span> 分
-                  </p>
-                </div>
-              )}
-
-              <div className="flex justify-end gap-3 mt-6">
-                <button
-                  type="button"
-                  onClick={() => setShowCreateModal(false)}
-                  className="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50"
-                >
-                  取消
-                </button>
-                <button
-                  type="submit"
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
-                >
-                  创建
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
+        <ExamFormModal
+          mode="create"
+          form={createForm}
+          setForm={setCreateForm}
+          availableSubjects={availableSubjects}
+          subjectCatalogHint={renderSubjectCatalogHint()}
+          onClose={() => setShowCreateModal(false)}
+          onSubmit={handleSaveCreate}
+        />
       )}
 
       {/* 编辑考试弹窗 */}
       {showEditModal && selectedExam && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg w-full max-w-lg p-6">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-xl font-bold text-gray-800">编辑考试</h2>
-              <button onClick={() => setShowEditModal(false)}>
-                <X className="w-6 h-6 text-gray-400 hover:text-gray-600" />
-              </button>
-            </div>
-            
-            <form className="space-y-4" onSubmit={(e) => { e.preventDefault(); handleSaveEdit(); }}>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">考试名称</label>
-                <input 
-                  type="text" 
-                  value={editForm.exam_name}
-                  onChange={(e) => setEditForm({...editForm, exam_name: e.target.value})}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none" 
-                />
-              </div>
-              
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">学期</label>
-                  <select 
-                    value={editForm.term}
-                    onChange={(e) => setEditForm({...editForm, term: e.target.value})}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
-                  >
-                    <option>2025-1</option>
-                    <option>2024-2</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">考试类型</label>
-                  <select 
-                    value={editForm.exam_type}
-                    onChange={(e) => setEditForm({...editForm, exam_type: e.target.value})}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
-                  >
-                    <option>期中</option>
-                    <option>期末</option>
-                    <option>月考</option>
-                    <option>统测</option>
-                  </select>
-                </div>
-              </div>
-              
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">年级</label>
-                  <select 
-                    value={editForm.grade_level}
-                    onChange={(e) => setEditForm({...editForm, grade_level: e.target.value})}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
-                  >
-                    <option>7年级</option>
-                    <option>8年级</option>
-                    <option>9年级</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">考试日期</label>
-                  <input 
-                    type="date" 
-                    value={editForm.exam_date}
-                    onChange={(e) => setEditForm({...editForm, exam_date: e.target.value})}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none" 
-                  />
-                </div>
-              </div>
-              
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">考试科目</label>
-                <div className="flex gap-2 flex-wrap">
-                  {availableSubjects.map(subject => (
-                    <label key={subject} className="flex items-center gap-1 px-3 py-1 bg-gray-100 rounded cursor-pointer hover:bg-gray-200">
-                      <input
-                        type="checkbox"
-                        checked={editForm.subjects.includes(subject)}
-                        onChange={(e) => {
-                          if (e.target.checked) {
-                            setEditForm({...editForm, subjects: [...editForm.subjects, subject]});
-                          } else {
-                            setEditForm({...editForm, subjects: editForm.subjects.filter(s => s !== subject)});
-                          }
-                        }}
-                        className="rounded"
-                      />
-                      <span className="text-sm">{subject}</span>
-                    </label>
-                  ))}
-                </div>
-                {availableSubjects.length === 0 && (
-                  <p className="text-sm text-gray-500 mt-2">请先前往"学科管理"添加学科</p>
-                )}
-              </div>
-
-              {/* 学科满分分值设定 */}
-              {editForm.subjects.length > 0 && (
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">学科满分分值设定</label>
-                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
-                    {editForm.subjects.map(subject => (
-                      <div key={subject} className="flex items-center gap-2">
-                        <span className="text-sm text-gray-600 w-12">{subject}</span>
-                        <input
-                          type="number"
-                          min="0"
-                          max="200"
-                          value={editForm.subject_scores?.[subject] || 100}
-                          onChange={(e) => {
-                            const newScores = { ...(editForm.subject_scores || {}) };
-                            newScores[subject] = parseInt(e.target.value) || 0;
-                            // 自动计算总分
-                            const totalScore = editForm.subjects.reduce((sum, subj) => {
-                              return sum + (newScores[subj] || 100);
-                            }, 0);
-                            setEditForm({
-                              ...editForm,
-                              subject_scores: newScores,
-                              full_score: totalScore
-                            });
-                          }}
-                          className="w-20 px-2 py-1 border border-gray-300 rounded text-center text-sm focus:ring-2 focus:ring-blue-500 outline-none"
-                        />
-                        <span className="text-xs text-gray-400">分</span>
-                      </div>
-                    ))}
-                  </div>
-                  <p className="text-sm text-gray-500 mt-2">
-                    总分: <span className="font-medium text-blue-600">{editForm.full_score || editForm.subjects.reduce((sum, subj) => sum + (editForm.subject_scores?.[subj] || 100), 0)}</span> 分
-                  </p>
-                </div>
-              )}
-              
-              <div className="flex justify-end gap-3 mt-6">
-                <button
-                  type="button"
-                  onClick={() => setShowEditModal(false)}
-                  className="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50"
-                >
-                  取消
-                </button>
-                <button
-                  type="submit"
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
-                >
-                  保存
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
+        <ExamFormModal
+          mode="edit"
+          form={editForm}
+          setForm={setEditForm}
+          availableSubjects={availableSubjects}
+          subjectCatalogHint={renderSubjectCatalogHint()}
+          onClose={() => setShowEditModal(false)}
+          onSubmit={(event) => {
+            event.preventDefault();
+            handleSaveEdit();
+          }}
+        />
       )}
 
       {/* 考试详情弹窗 */}
@@ -1643,16 +1293,20 @@ const ExamManagement = () => {
             // 从schoolData获取该考试的实际成绩数据
             const examScoresData = schoolData.examScores?.filter(s => s.exam_id === selectedExam.id) || [];
             
-            // 实时计算统计数据
-            const validStudents = examScoresData.filter(s => s.is_valid !== false).length;
-            const totalStudents = examScoresData.length;
+            // 优先展示后端统计；本地成绩弹窗编辑时仍可即时反映未同步的本地变化。
+            const localValidStudents = examScoresData.filter(s => s.is_valid !== false).length;
+            const validStudents = Number(currentExam.valid_students || 0) || localValidStudents;
+            const totalStudents = Number(currentExam.total_students || 0) || examScoresData.length;
             
             // 计算平均分、最高分、及格率
             let avgScore = '-';
             let topScore = '-';
             let passRate = '-';
             
-            if (examScoresData.length > 0) {
+            if (Number(currentExam.avg_score || 0) > 0 || Number(currentExam.top_score || 0) > 0) {
+              avgScore = Number(currentExam.avg_score || 0).toFixed(1);
+              topScore = Number(currentExam.top_score || 0).toFixed(1);
+            } else if (examScoresData.length > 0) {
               const validScores = examScoresData.filter(s => s.is_valid !== false);
               if (validScores.length > 0) {
                 const scores = validScores.map(s => s.total_score);
@@ -1739,7 +1393,7 @@ const ExamManagement = () => {
                     }}
                     className="flex items-center gap-2 px-4 py-2 md:px-6 md:py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 mx-auto text-sm"
                   >
-                    <Upload className="w-4 h-4 md:w-5 md:h-5" />
+                    <Download className="w-4 h-4 md:w-5 md:h-5" />
                     导入成绩
                   </button>
                 </div>
@@ -1835,11 +1489,12 @@ const ExamManagement = () => {
                 导入成绩
               </button>
               <button
-                onClick={() => alert('导出功能开发中...')}
-                className="flex items-center justify-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm"
+                onClick={() => handleExportScores(currentExam)}
+                disabled={exportingExamId === currentExam.id}
+                className="flex items-center justify-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm disabled:cursor-not-allowed disabled:bg-gray-300"
               >
                 <Download className="w-4 h-4" />
-                导出报表
+                {exportingExamId === currentExam.id ? '导出中...' : '导出成绩'}
               </button>
             </div>
           </div>
@@ -1848,122 +1503,13 @@ const ExamManagement = () => {
         </div>
       )}
 
-      {/* 导入成绩弹窗 */}
-      {showImportModal && selectedExam && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg w-full max-w-lg p-6">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-xl font-bold text-gray-800">导入成绩数据</h2>
-              <button onClick={() => setShowImportModal(false)}>
-                <X className="w-6 h-6 text-gray-400 hover:text-gray-600" />
-              </button>
-            </div>
-
-            <div className="mb-4">
-              <p className="text-sm text-gray-600 mb-2">考试：{selectedExam.exam_name}</p>
-              <p className="text-sm text-gray-500">请上传CSV格式的成绩文件，系统支持以下字段：</p>
-              <div className="mt-2 p-3 bg-gray-50 rounded text-xs text-gray-600">
-                <p className="font-medium mb-1">必需字段：学籍号、姓名、班级、各科成绩</p>
-                <p>可选字段：考号、是否参与统计、备注</p>
-              </div>
-            </div>
-
-            {!importStatus && (
-              <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center">
-                <Upload className="w-12 h-12 text-gray-400 mx-auto mb-4" />
-                <p className="text-gray-600 mb-4">点击或拖拽文件到此处上传</p>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".csv"
-                  onChange={handleFileSelect}
-                  className="hidden"
-                />
-                <button
-                  onClick={() => fileInputRef.current?.click()}
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
-                >
-                  选择文件
-                </button>
-                <p className="text-xs text-gray-400 mt-4">支持格式：CSV (GBK编码)</p>
-              </div>
-            )}
-
-            {importStatus && importStatus !== 'completed' && (
-              <div className="space-y-4">
-                <div className="flex items-center gap-3">
-                  <Loader2 className="w-5 h-5 text-blue-600 animate-spin" />
-                  <span className="text-gray-700">
-                    {importStatus === 'reading' && '正在读取文件...'}
-                    {importStatus === 'parsing' && '正在解析数据...'}
-                    {importStatus === 'validating' && '正在验证数据...'}
-                    {importStatus === 'importing' && '正在导入成绩...'}
-                    {importStatus === 'calculating' && '正在计算Z值...'}
-                  </span>
-                </div>
-                <div className="w-full bg-gray-200 rounded-full h-2">
-                  <div
-                    className="bg-blue-600 h-2 rounded-full transition-all duration-300"
-                    style={{ width: `${importProgress}%` }}
-                  />
-                </div>
-                <p className="text-sm text-gray-500 text-center">{importProgress}%</p>
-              </div>
-            )}
-
-            {importStatus === 'completed' && importResults && (
-              <div className="space-y-4">
-                <div className="flex items-center gap-3 text-green-600">
-                  <CheckCircle className="w-6 h-6" />
-                  <span className="font-medium">导入完成！</span>
-                </div>
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="bg-gray-50 rounded-lg p-4 text-center">
-                    <p className="text-2xl font-bold text-gray-800">{importResults.total}</p>
-                    <p className="text-sm text-gray-500">总记录数</p>
-                  </div>
-                  <div className="bg-green-50 rounded-lg p-4 text-center">
-                    <p className="text-2xl font-bold text-green-600">{importResults.success}</p>
-                    <p className="text-sm text-gray-500">导入成功</p>
-                  </div>
-                  <div className="bg-yellow-50 rounded-lg p-4 text-center">
-                    <p className="text-2xl font-bold text-yellow-600">{importResults.skipped}</p>
-                    <p className="text-sm text-gray-500">跳过(不参与统计)</p>
-                  </div>
-                  <div className="bg-red-50 rounded-lg p-4 text-center">
-                    <p className="text-2xl font-bold text-red-600">{importResults.failed}</p>
-                    <p className="text-sm text-gray-500">导入失败</p>
-                  </div>
-                </div>
-                <p className="text-sm text-gray-600 bg-blue-50 p-3 rounded">
-                  {importResults.message}
-                </p>
-                <div className="flex justify-end gap-3">
-                  <button
-                    onClick={() => setShowImportModal(false)}
-                    className="px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200"
-                  >
-                    关闭
-                  </button>
-                  <button
-                    onClick={() => {
-                      setShowImportModal(false);
-                      handleViewDetail(selectedExam);
-                    }}
-                    className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
-                  >
-                    查看详情
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
       {/* 成绩管理弹窗 */}
       {showScoreModal && selectedExam && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 overflow-y-auto">
+          {(() => {
+            const scoreEditingLocked = hasBackendSession() && scoreListSource === 'backend';
+
+            return (
           <div className="bg-white rounded-lg w-full max-w-7xl m-4 p-6 max-h-[90vh] overflow-y-auto">
             <div className="flex items-center justify-between mb-6">
               <div>
@@ -1997,6 +1543,21 @@ const ExamManagement = () => {
                 </button>
               </div>
             </div>
+
+            {(scoreListLoading || scoreListError || scoreListSource === 'backend') && (
+              <div className={`mb-4 flex items-center gap-2 rounded-lg border p-3 text-sm ${
+                scoreListError
+                  ? 'border-amber-100 bg-amber-50 text-amber-700'
+                  : 'border-emerald-100 bg-emerald-50 text-emerald-700'
+              }`}>
+                {scoreListError ? <AlertCircle className="h-4 w-4" /> : <CheckCircle className="h-4 w-4" />}
+                <span>
+                  {scoreListLoading
+                    ? '正在读取后端成绩明细...'
+                    : scoreListError || '成绩明细来自后端数据库；如需修正，请通过成绩导入覆盖更新。'}
+                </span>
+              </div>
+            )}
 
             {/* 筛选和搜索 */}
             <div className="flex flex-wrap items-center gap-4 mb-4 p-4 bg-gray-50 rounded-lg">
@@ -2096,19 +1657,20 @@ const ExamManagement = () => {
                       <td className="px-3 py-3 whitespace-nowrap text-center">
                         <button
                           onClick={() => {
+                            if (scoreEditingLocked) {
+                              notify('后端成绩明细暂不支持直接切换参与统计，请通过成绩导入覆盖更新。', 'warning');
+                              return;
+                            }
                             const updatedScores = examScores.map(s =>
-                              s.id === score.id ? { ...s, is_valid: !s.is_valid } : s
+                              s.id === score.id ? { ...s, is_valid: s.is_valid === false } : s
                             );
-                            setExamScores(updatedScores);
-                            // 更新schoolData
-                            const otherScores = (schoolData.examScores || []).filter(s => s.exam_id !== selectedExam.id);
-                            schoolData.examScores = [...otherScores, ...updatedScores];
+                            updateSelectedExamScores(updatedScores);
                           }}
                           className={`px-2 py-1 rounded text-xs font-medium ${
                             score.is_valid !== false
                               ? 'bg-green-100 text-green-700'
                               : 'bg-gray-100 text-gray-500'
-                          }`}
+                          } ${scoreEditingLocked ? 'cursor-not-allowed opacity-70' : ''}`}
                         >
                           {score.is_valid !== false ? '是' : '否'}
                         </button>
@@ -2117,7 +1679,11 @@ const ExamManagement = () => {
                         <div className="flex items-center justify-center gap-1">
                           <button
                             onClick={() => handleEditScore(score)}
-                            className="p-1.5 text-blue-600 hover:bg-blue-50 rounded"
+                            className={`p-1.5 rounded ${
+                              scoreEditingLocked
+                                ? 'cursor-not-allowed text-gray-300'
+                                : 'text-blue-600 hover:bg-blue-50'
+                            }`}
                             title="编辑成绩"
                           >
                             <Edit className="w-4 h-4" />
@@ -2129,7 +1695,11 @@ const ExamManagement = () => {
                               e.stopPropagation();
                               handleDeleteScore(score.id);
                             }}
-                            className="p-1.5 text-red-600 hover:bg-red-50 rounded"
+                            className={`p-1.5 rounded ${
+                              scoreEditingLocked
+                                ? 'cursor-not-allowed text-gray-300'
+                                : 'text-red-600 hover:bg-red-50'
+                            }`}
                             title="删除成绩"
                           >
                             <Trash2 className="w-4 h-4" />
@@ -2149,48 +1719,165 @@ const ExamManagement = () => {
               )}
             </div>
           </div>
+            );
+          })()}
         </div>
       )}
 
       {/* 成绩导入弹窗 */}
       {showScoreImportModal && selectedExam && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg w-full max-w-lg p-6">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-xl font-bold text-gray-800">导入成绩</h2>
-              <button onClick={() => setShowScoreImportModal(false)}>
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 overflow-y-auto">
+          <div className="bg-white rounded-lg w-full max-w-5xl m-4 max-h-[92vh] overflow-y-auto p-6">
+            <div className="flex flex-col gap-3 border-b border-gray-200 pb-4 md:flex-row md:items-start md:justify-between">
+              <div>
+                <h2 className="text-xl font-bold text-gray-800">导入成绩</h2>
+                <p className="mt-1 text-sm text-gray-500">
+                  {selectedExam.exam_name} · {selectedExam.grade_level} · {selectedExam.subjects.join('、')}
+                </p>
+              </div>
+              <button onClick={() => setShowScoreImportModal(false)} className="self-end md:self-start">
                 <X className="w-6 h-6 text-gray-400 hover:text-gray-600" />
               </button>
             </div>
 
-            <div className="bg-green-50 p-4 rounded-lg mb-4">
-              <h3 className="font-medium text-green-900 mb-2">导入说明</h3>
-              <ul className="text-sm text-green-700 space-y-1">
-                <li>• 支持CSV格式文件</li>
-                <li>• 表头必须包含：学籍辅号、姓名、{selectedExam.subjects.join('、')}</li>
-                <li>• 可选字段：参与统计（是/否）、额外统计班级（如：704,705）</li>
-                <li>• 学籍辅号必须存在于系统中</li>
-                <li>• 导入后会自动计算排名</li>
-                <li>• 系统会自动检测并更新已存在的成绩记录</li>
-              </ul>
+            <div className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-[0.9fr_1.1fr]">
+              <div className="space-y-4">
+                <div className="rounded-lg border border-emerald-100 bg-emerald-50 p-4">
+                  <h3 className="font-medium text-emerald-900">导入规则</h3>
+                  <ul className="mt-2 space-y-1 text-sm leading-6 text-emerald-800">
+                    <li>支持 CSV/TSV 预览导入，也支持 Excel 文件直接写入后端。</li>
+                    <li>表头建议包含：学籍辅号、姓名、班级、{selectedExam.subjects.join('、')}。</li>
+                    <li>可选字段：总分、参与统计、额外统计班级。</li>
+                    <li>确认写入前会预检新增、覆盖和异常行。</li>
+                  </ul>
+                </div>
+
+                <label
+                  htmlFor="score-file-input"
+                  className="block cursor-pointer rounded-lg border-2 border-dashed border-gray-300 p-6 text-center transition-colors hover:border-emerald-400 hover:bg-emerald-50"
+                >
+                  <Upload className="mx-auto mb-2 h-8 w-8 text-gray-400" />
+                  <p className="text-sm font-medium text-gray-700">选择成绩文件</p>
+                  <p className="mt-1 text-xs text-gray-400">CSV/TSV 先预览，Excel 直接写入后端</p>
+                  <input
+                    id="score-file-input"
+                    type="file"
+                    accept=".csv,.tsv,.txt,.xls,.xlsx"
+                    className="hidden"
+                    onChange={handleScoreFileImport}
+                  />
+                </label>
+              </div>
+
+              <div>
+                <label className="mb-2 block text-sm font-medium text-gray-700">粘贴成绩表</label>
+                <textarea
+                  value={scoreImportText}
+                  onChange={(event) => {
+                    setScoreImportFile(null);
+                    setScoreImportText(event.target.value);
+                    previewScoreImport(event.target.value, selectedExam);
+                  }}
+                  className="h-56 w-full resize-none rounded-lg border border-gray-300 p-3 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
+                  placeholder="学籍辅号\t姓名\t班级\t语文\t数学\t英语\t总分\t参与统计"
+                />
+              </div>
             </div>
 
-            <div
-              className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center cursor-pointer hover:border-green-400 hover:bg-green-50 transition-colors"
-              onClick={() => document.getElementById('score-file-input').click()}
-            >
-              <Upload className="w-8 h-8 text-gray-400 mx-auto mb-2" />
-              <p className="text-sm text-gray-600">点击选择文件或拖拽到此处</p>
-              <input
-                id="score-file-input"
-                type="file"
-                accept=".csv"
-                className="hidden"
-                onChange={handleScoreFileImport}
-              />
-            </div>
+            {scoreImportFile && isExcelScoreFile(scoreImportFile) && (
+              <div className="mt-4 rounded-lg border border-blue-100 bg-blue-50 p-4 text-sm text-blue-800">
+                <div className="flex items-center gap-2 font-medium">
+                  <Upload className="h-4 w-4" />
+                  Excel 文件待写入
+                </div>
+                <p className="mt-2 text-blue-700">{scoreImportFile.name}</p>
+                <p className="mt-1 text-blue-600">该文件将交由后端校验并写入数据库，本页不读取 Excel 内容做本地预览。</p>
+              </div>
+            )}
 
-            <div className="flex justify-between items-center mt-6">
+            {scoreImportError && (
+              <div className={`mt-4 flex items-start gap-2 rounded-lg p-3 text-sm ${scoreImportResult ? 'bg-amber-50 text-amber-800' : 'bg-red-50 text-red-700'}`}>
+                <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+                <span>{scoreImportError}</span>
+              </div>
+            )}
+
+            {scoreImportPreview && (
+              <div className="mt-5 space-y-4">
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                  {[
+                    ['新增', scoreImportPreview.insertedCount],
+                    ['覆盖', scoreImportPreview.updatedCount],
+                    ['参与统计', scoreImportPreview.validCount],
+                    ['需检查', scoreImportPreview.errors.length],
+                  ].map(([label, value]) => (
+                    <div key={label} className="rounded-lg border border-gray-200 bg-gray-50 p-4">
+                      <p className="text-xs text-gray-500">{label}</p>
+                      <p className="mt-1 text-2xl font-bold text-gray-900">{value}</p>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="rounded-lg border border-gray-200">
+                  <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
+                    <p className="font-medium text-gray-800">解析预览</p>
+                    <p className="text-sm text-gray-500">共 {scoreImportRows.length} 行，仅显示前 20 行</p>
+                  </div>
+                  <div className="max-h-64 overflow-auto">
+                    <table className="w-full min-w-[720px] text-sm">
+                      <thead className="sticky top-0 bg-gray-50">
+                        <tr>
+                          {scoreImportHeaders.map(header => (
+                            <th key={header} className="px-3 py-2 text-left font-medium text-gray-500">{header}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-100">
+                        {scoreImportRows.slice(0, 20).map((row, rowIndex) => (
+                          <tr key={rowIndex}>
+                            {scoreImportHeaders.map(header => (
+                              <td key={header} className="whitespace-nowrap px-3 py-2 text-gray-700">{row[header] || '-'}</td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                {scoreImportPreview.errors.length > 0 && (
+                  <div className="rounded-lg bg-amber-50 p-4 text-sm text-amber-800">
+                    <p className="font-medium">需检查行</p>
+                    <ul className="mt-2 space-y-1">
+                      {scoreImportPreview.errors.slice(0, 8).map(item => (
+                        <li key={item}>{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {scoreImportResult && (
+              <div className="mt-4 flex items-center gap-2 rounded-lg bg-emerald-50 p-3 text-sm text-emerald-800">
+                <CheckCircle className="h-4 w-4" />
+                <span>成绩已写入，考试统计和排名已刷新。</span>
+              </div>
+            )}
+
+            {scoreImportBackendResult && (
+              <div className="mt-4 rounded-lg border border-emerald-100 bg-emerald-50 p-4 text-sm text-emerald-800">
+                <div className="flex items-center gap-2 font-medium">
+                  <CheckCircle className="h-4 w-4" />
+                  已同步后端数据库
+                </div>
+                <p className="mt-2">
+                  {scoreImportBackendResult.message || `成功 ${scoreImportBackendResult.stats?.success || 0} 条，失败 ${scoreImportBackendResult.stats?.failed || 0} 条`}
+                </p>
+              </div>
+            )}
+
+            <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <button
                 onClick={downloadScoreTemplate}
                 className="flex items-center gap-2 text-green-600 hover:text-green-800 text-sm"
@@ -2198,12 +1885,33 @@ const ExamManagement = () => {
                 <Download className="w-4 h-4" />
                 下载模板
               </button>
-              <button
-                onClick={() => setShowScoreImportModal(false)}
-                className="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50"
-              >
-                取消
-              </button>
+              <div className="flex justify-end gap-3">
+                <button
+                  onClick={() => setShowScoreImportModal(false)}
+                  className="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50"
+                >
+                  取消
+                </button>
+                {scoreImportResult ? (
+                  <button
+                    onClick={() => {
+                      setShowScoreImportModal(false);
+                      handleManageScores(selectedExam);
+                    }}
+                    className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                  >
+                    查看成绩
+                  </button>
+                ) : (
+                  <button
+                    onClick={handleConfirmScoreImport}
+                    disabled={scoreImporting || !(scoreImportPreview?.importedScores?.length || (scoreImportFile && isExcelScoreFile(scoreImportFile)))}
+                    className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:cursor-not-allowed disabled:bg-gray-300"
+                  >
+                    {scoreImporting ? '写入中...' : '确认写入'}
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         </div>

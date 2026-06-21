@@ -6,13 +6,13 @@
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
-from typing import Generator
+from typing import Generator, Optional
 import os
 
 # 数据库配置
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "mysql+pymysql://root:password@localhost:3306/new_century_edudata?charset=utf8mb4"
+    "mysql+pymysql://root:NewCentury2025!@localhost:3306/new_century_edudata?charset=utf8mb4"
 )
 
 # 兼容部分云服务(如Neon/Heroku)提供的 postgres:// 旧前缀
@@ -25,6 +25,7 @@ engine = create_engine(
     pool_size=10,
     max_overflow=20,
     pool_pre_ping=True,
+    pool_recycle=3600,
     echo=False
 )
 
@@ -55,3 +56,26 @@ def init_db():
     创建所有表结构
     """
     Base.metadata.create_all(bind=engine)
+
+
+def get_db_dialect(db: Optional[Session] = None) -> str:
+    """Return the active SQLAlchemy dialect name for raw-SQL compatibility branches."""
+    bind = None
+    if db is not None:
+        try:
+            bind = db.get_bind()
+        except Exception:
+            bind = getattr(db, "bind", None)
+
+    dialect = getattr(getattr(bind, "dialect", None), "name", None)
+    if not dialect:
+        dialect = getattr(engine.dialect, "name", None)
+    return (dialect or "mysql").lower()
+
+
+def is_postgresql(db: Optional[Session] = None) -> bool:
+    return get_db_dialect(db) in {"postgresql", "postgres"}
+
+
+def is_sqlite(db: Optional[Session] = None) -> bool:
+    return get_db_dialect(db) == "sqlite"

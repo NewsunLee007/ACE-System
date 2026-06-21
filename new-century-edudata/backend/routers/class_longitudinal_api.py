@@ -12,9 +12,151 @@ import logging
 
 from services.score_analysis_service import ScoreAnalysisService, WeakSubjectTracker
 from core.database import get_db
+from core.security import get_current_user, has_permission_code
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/analysis", tags=["班主任专属视图"])
+
+CLASS_LONGITUDINAL_MANAGEMENT_PERMISSION_CODES = (
+    "exam_admin",
+    "grade_leader",
+    "subject_leader",
+)
+CLASS_LONGITUDINAL_ASSIGNMENT_PERMISSION_CODES = {
+    "headmaster",
+    "teacher",
+    "lesson_leader",
+}
+SUBJECT_LABELS = {
+    "chinese": "语文",
+    "math": "数学",
+    "english": "英语",
+    "science": "科学",
+    "society": "社会",
+}
+
+
+def _subject_filter_values(subject: Optional[str]) -> Dict[str, Optional[str]]:
+    if not subject:
+        return {
+            "subject_code": None,
+            "subject_label": None,
+            "subject_original": None,
+        }
+
+    subject_original = subject.strip()
+    subject_code = subject_original.lower()
+    return {
+        "subject_code": subject_code,
+        "subject_label": SUBJECT_LABELS.get(subject_code, subject_original),
+        "subject_original": subject_original,
+    }
+
+
+def _clean_terms(terms: Optional[List[str]]) -> List[str]:
+    return [term.strip() for term in terms or [] if term and term.strip()]
+
+
+def _term_filter_clause(cleaned_terms: List[str], params: Dict[str, Any]) -> str:
+    if not cleaned_terms:
+        return ""
+
+    placeholders = []
+    for index, term in enumerate(cleaned_terms):
+        param_name = f"term_{index}"
+        params[param_name] = term
+        placeholders.append(f":{param_name}")
+
+    return f" AND term IN ({', '.join(placeholders)})"
+
+
+def _has_class_assignment(
+    current_user: Dict[str, Any],
+    class_name: str,
+    db: Session,
+    terms: Optional[List[str]] = None,
+    subject: Optional[str] = None,
+    allow_subject_teacher: bool = False
+) -> bool:
+    permission_code = current_user.get("permission_code")
+    if permission_code not in CLASS_LONGITUDINAL_ASSIGNMENT_PERMISSION_CODES:
+        return False
+
+    try:
+        teacher_id = int(current_user.get("id"))
+    except (TypeError, ValueError):
+        return False
+
+    params: Dict[str, Any] = {
+        "teacher_id": teacher_id,
+        "class_name": class_name,
+    }
+    cleaned_terms = _clean_terms(terms)
+    term_clause = _term_filter_clause(cleaned_terms, params)
+    active_relation_clause = "" if cleaned_terms else " AND (end_date IS NULL OR end_date >= CURDATE())"
+
+    if allow_subject_teacher and subject:
+        params.update(_subject_filter_values(subject))
+        assignment_scope_clause = """
+          AND (
+            is_headmaster = 1
+            OR LOWER(COALESCE(subject_name, '')) = :subject_code
+            OR subject_name = :subject_label
+            OR subject_name = :subject_original
+          )
+        """
+    elif allow_subject_teacher:
+        assignment_scope_clause = """
+          AND (
+            is_headmaster = 1
+            OR subject_name IS NOT NULL
+          )
+        """
+    else:
+        assignment_scope_clause = " AND is_headmaster = 1"
+
+    assignment = db.execute(
+        text(f"""
+            SELECT 1
+            FROM biz_teacher_class_rel
+            WHERE teacher_id = :teacher_id
+              AND class_name = :class_name
+              {term_clause}
+              {active_relation_clause}
+              {assignment_scope_clause}
+            LIMIT 1
+        """),
+        params
+    ).fetchone()
+
+    return assignment is not None
+
+
+def ensure_can_view_class_longitudinal(
+    current_user: Dict[str, Any],
+    class_name: str,
+    db: Session,
+    terms: Optional[List[str]] = None,
+    subject: Optional[str] = None,
+    allow_subject_teacher: bool = False
+) -> None:
+    if has_permission_code(
+        current_user,
+        CLASS_LONGITUDINAL_MANAGEMENT_PERMISSION_CODES
+    ):
+        return
+
+    if _has_class_assignment(
+        current_user,
+        class_name,
+        db,
+        terms=terms,
+        subject=subject,
+        allow_subject_teacher=allow_subject_teacher
+    ):
+        return
+
+    raise HTTPException(status_code=403, detail="权限不足，无法查看该班级分析数据")
 
 
 # ============ Pydantic模型定义 ============
@@ -82,7 +224,8 @@ def get_class_longitudinal_view(
     class_name: str,
     term: str = Query("2025-1", description="当前学期，如: 2025-1"),
     limit: int = Query(5, description="返回最近几次考试的数据"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
 ):
     """
     获取班级历史成绩纵向追踪视图
@@ -93,6 +236,13 @@ def get_class_longitudinal_view(
     - 前20%、前80%贡献率变化
     """
     try:
+        ensure_can_view_class_longitudinal(
+            current_user,
+            class_name,
+            db,
+            terms=[term],
+        )
+
         service = ScoreAnalysisService(db)
         
         # 获取历史趋势数据
@@ -125,6 +275,8 @@ def get_class_longitudinal_view(
             }
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取班级纵向视图失败: {e}")
         raise HTTPException(status_code=500, detail="获取班级纵向视图失败")
@@ -135,7 +287,8 @@ def get_student_rank_changes(
     class_name: str,
     exam_id: int,
     previous_exam_id: Optional[int] = Query(None, description="前一次考试ID，为空则自动查找"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
 ):
     """
     获取班级学生进退步名单
@@ -143,6 +296,21 @@ def get_student_rank_changes(
     对比两次考试，计算每位学生的排名变化
     """
     try:
+        exam = db.execute(
+            text("SELECT term FROM biz_exams WHERE id = :exam_id"),
+            {"exam_id": exam_id}
+        ).fetchone()
+
+        if not exam:
+            raise HTTPException(status_code=404, detail="考试不存在")
+
+        ensure_can_view_class_longitudinal(
+            current_user,
+            class_name,
+            db,
+            terms=[exam.term],
+        )
+
         # 如果没有提供前一次考试ID，自动查找
         if not previous_exam_id:
             prev_exam = db.execute(
@@ -245,6 +413,8 @@ def get_student_rank_changes(
             "students": students
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取学生进退步名单失败: {e}")
         raise HTTPException(status_code=500, detail="获取学生进退步名单失败")
@@ -255,7 +425,8 @@ def get_class_weak_subject_trend(
     class_name: str,
     subject: str = Query(..., description="学科名称: chinese/math/english/science/society"),
     terms: str = Query("2024-2,2025-1", description="学期列表，逗号分隔"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
 ):
     """
     获取班级薄弱学科趋势分析
@@ -263,8 +434,20 @@ def get_class_weak_subject_trend(
     追踪指定学科与年级均分的差距变化，量化提升效果
     """
     try:
+        term_list = [t.strip() for t in terms.split(",") if t.strip()]
+        if not term_list:
+            raise HTTPException(status_code=400, detail="请至少选择一个学期")
+
+        ensure_can_view_class_longitudinal(
+            current_user,
+            class_name,
+            db,
+            terms=term_list,
+            subject=subject,
+            allow_subject_teacher=True,
+        )
+
         tracker = WeakSubjectTracker(db)
-        term_list = [t.strip() for t in terms.split(",")]
         
         result = tracker.get_subject_trend_analysis(class_name, subject, term_list)
         
@@ -289,6 +472,8 @@ def get_class_weak_subject_trend(
         
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取薄弱学科趋势失败: {e}")
         raise HTTPException(status_code=500, detail="获取薄弱学科趋势失败")
@@ -298,7 +483,8 @@ def get_class_weak_subject_trend(
 def get_class_exam_detail(
     class_name: str,
     exam_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
 ):
     """
     获取班级单次考试详细数据
@@ -318,6 +504,13 @@ def get_class_exam_detail(
         
         if not exam:
             raise HTTPException(status_code=404, detail="考试不存在")
+
+        ensure_can_view_class_longitudinal(
+            current_user,
+            class_name,
+            db,
+            terms=[exam.term],
+        )
         
         # 获取班级成绩数据
         sql = """

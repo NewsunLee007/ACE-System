@@ -149,6 +149,14 @@ def reset_sequence(cur, table: str) -> None:
     )
 
 
+def dedupe_rows(rows: list[tuple], key_indexes: tuple[int, ...]) -> list[tuple]:
+    """Keep the last row for each conflict key before PostgreSQL upsert."""
+    keyed_rows = {}
+    for row in rows:
+        keyed_rows[tuple(row[index] for index in key_indexes)] = row
+    return list(keyed_rows.values())
+
+
 def seed_roles(cur, role_ids: dict) -> None:
     rows = []
     for permission_code, (frontend_id, level, permissions) in ROLE_FRONTEND_META.items():
@@ -511,7 +519,7 @@ def seed_user_layer_permissions(cur, data: dict) -> None:
           grant_by = excluded.grant_by,
           updated_at = CURRENT_TIMESTAMP
         """,
-        rows,
+        dedupe_rows(rows, (0, 2, 3, 4)),
         page_size=500,
     )
 
@@ -584,10 +592,10 @@ def seed_exams_scores_and_layers(cur, data: dict) -> None:
                     detail_rows,
                 )
 
-    score_rows = []
+    score_rows = {}
     for score in data["examScores"]:
         values = score.get("scores") or {}
-        score_rows.append((
+        row = (
             int(score["exam_id"]),
             int(score["student_id"]),
             score.get("student_code"),
@@ -602,7 +610,8 @@ def seed_exams_scores_and_layers(cur, data: dict) -> None:
             None,
             score.get("created_at"),
             score.get("updated_at"),
-        ))
+        )
+        score_rows[(row[0], row[1])] = row
     execute_values(
         cur,
         """
@@ -624,7 +633,7 @@ def seed_exams_scores_and_layers(cur, data: dict) -> None:
           remarks = excluded.remarks,
           updated_at = CURRENT_TIMESTAMP
         """,
-        score_rows,
+        list(score_rows.values()),
         page_size=500,
     )
 

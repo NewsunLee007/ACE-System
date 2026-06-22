@@ -122,7 +122,10 @@ def main() -> int:
 
     status, body = request_json("GET", endpoint(args.base_url, "/api/ready"))
     ready_ok = status == 200 and isinstance(body, dict) and body.get("status") == "ready"
-    ready_detail = body.get("reason") or body.get("detail") if isinstance(body, dict) else body
+    if isinstance(body, dict):
+        ready_detail = body.get("reason") or body.get("detail") or body
+    else:
+        ready_detail = body
     record(results, "business readiness", ready_ok, f"HTTP {status}; {ready_detail or 'ready'}")
 
     status, body = request_json("GET", endpoint(args.base_url, "/api/openapi.json"))

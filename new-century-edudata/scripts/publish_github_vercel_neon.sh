@@ -22,6 +22,7 @@ set -euo pipefail
 #   CREATE_VERCEL_PROJECT=1 \
 #   SYNC_VERCEL_ENV=1 \
 #   DEPLOY_PROD=1 \
+#   VERIFY_DEPLOYMENT=1 \
 #   ./new-century-edudata/scripts/publish_github_vercel_neon.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,6 +38,11 @@ SKIP_CHECKS="${SKIP_CHECKS:-0}"
 SKIP_GIT_DRY_RUN="${SKIP_GIT_DRY_RUN:-0}"
 SYNC_VERCEL_ENV="${SYNC_VERCEL_ENV:-0}"
 VERCEL_ENV_TARGETS="${VERCEL_ENV_TARGETS:-production preview development}"
+VERIFY_DEPLOYMENT="${VERIFY_DEPLOYMENT:-0}"
+ACE_BASE_URL="${ACE_BASE_URL:-https://ace-system-sandy.vercel.app}"
+SEED_DEFAULT_PASSWORD="${SEED_DEFAULT_PASSWORD:-NewCentury2025!}"
+ACE_DEAN_PASSWORD="${ACE_DEAN_PASSWORD:-${SEED_DEFAULT_PASSWORD}}"
+ACE_PARENT_PASSWORD="${ACE_PARENT_PASSWORD:-${SEED_DEFAULT_PASSWORD}}"
 SECRET_KEY="${SECRET_KEY:-}"
 
 log() {
@@ -171,6 +177,17 @@ if [[ "${DEPLOY_PROD}" == "1" ]]; then
 else
   log "Deploying preview to Vercel"
   (cd "${REPO_ROOT}" && vercel_cli deploy)
+fi
+
+if [[ "${VERIFY_DEPLOYMENT}" == "1" ]]; then
+  log "Verifying deployed business links at ${ACE_BASE_URL}"
+  (
+    cd "${APP_DIR}" && \
+      ACE_BASE_URL="${ACE_BASE_URL}" \
+      ACE_DEAN_PASSWORD="${ACE_DEAN_PASSWORD}" \
+      ACE_PARENT_PASSWORD="${ACE_PARENT_PASSWORD}" \
+      "${PYTHON_BIN:-python3}" scripts/verify_deployment_readiness.py
+  )
 fi
 
 log "Publish flow finished"

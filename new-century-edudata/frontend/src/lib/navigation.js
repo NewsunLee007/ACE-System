@@ -118,11 +118,62 @@ export const navigationConfig = [
   },
 ];
 
-export const getUserRole = (user) => user?.role_name || user?.role || user?.permission_code || '';
+const CANONICAL_ROLES = new Set([
+  '校长',
+  '副校长',
+  '教务处主任',
+  '管理员',
+  '年段长',
+  '段长',
+  '副段长',
+  '班主任',
+  '科任教师',
+  '教研组长',
+  '备课组长',
+  '家长',
+]);
+
+const ROLE_ALIASES = {
+  principal: '校长',
+  vice_principal: '副校长',
+  school_leader: '校长',
+  '教务处主任/校领导': '教务处主任',
+  dean: '教务处主任',
+  edu_admin: '教务处主任',
+  admin: '管理员',
+  sys_admin: '管理员',
+  super_admin: '管理员',
+  '系统管理员': '管理员',
+  grade_leader: '年段长',
+  grade_deputy: '副段长',
+  head_teacher: '班主任',
+  class_teacher: '班主任',
+  teacher: '科任教师',
+  subject_teacher: '科任教师',
+  research_leader: '教研组长',
+  prep_leader: '备课组长',
+  lesson_prep_leader: '备课组长',
+  parent: '家长',
+  guardian: '家长',
+};
+
+const normalizeRole = (value) => {
+  const role = String(value || '').trim();
+  if (!role) return '';
+  return ROLE_ALIASES[role] || (CANONICAL_ROLES.has(role) ? role : '');
+};
+
+export const getUserRole = (user) => {
+  const candidates = [user?.role_name, user?.role, user?.permission_code, user?.legacy_role];
+  const normalized = candidates.map(normalizeRole).find(Boolean);
+  if (normalized) return normalized;
+  return candidates.map((value) => String(value || '').trim()).find(Boolean) || '';
+};
 
 export const isAllowedForRole = (item, role) => {
+  const normalizedRole = normalizeRole(role) || role;
   if (!item.roles || item.roles.length === 0) return true;
-  return item.roles.includes(role);
+  return item.roles.includes(normalizedRole);
 };
 
 const getChildWithInheritedRoles = (item, child) => ({
@@ -131,16 +182,18 @@ const getChildWithInheritedRoles = (item, child) => ({
   roles: child.roles || item.roles,
 });
 
-export const getNavigationForRole = (role) =>
-  navigationConfig
+export const getNavigationForRole = (role) => {
+  const normalizedRole = normalizeRole(role) || role;
+
+  return navigationConfig
     .map((item) => {
-      if (!item.children) return isAllowedForRole(item, role) ? item : null;
+      if (!item.children) return isAllowedForRole(item, normalizedRole) ? item : null;
 
       const children = item.children
         .map((child) => getChildWithInheritedRoles(item, child))
-        .filter((child) => isAllowedForRole(child, role));
+        .filter((child) => isAllowedForRole(child, normalizedRole));
 
-      if (!isAllowedForRole(item, role) && children.length === 0) return null;
+      if (!isAllowedForRole(item, normalizedRole) && children.length === 0) return null;
 
       return {
         ...item,
@@ -149,6 +202,7 @@ export const getNavigationForRole = (role) =>
     })
     .filter(Boolean)
     .filter((item) => !item.children || item.children.length > 0);
+};
 
 export const getFlatNavigationForRole = (role) =>
   getNavigationForRole(role).flatMap((item) => {
@@ -176,8 +230,9 @@ const DEFAULT_PATH_BY_ROLE = {
 };
 
 export const getDefaultPathForRole = (role) => {
-  const flatNavigation = getFlatNavigationForRole(role);
-  const preferredPath = DEFAULT_PATH_BY_ROLE[role];
+  const normalizedRole = normalizeRole(role) || role;
+  const flatNavigation = getFlatNavigationForRole(normalizedRole);
+  const preferredPath = DEFAULT_PATH_BY_ROLE[normalizedRole];
   if (preferredPath && flatNavigation.some((item) => item.path === preferredPath)) {
     return preferredPath;
   }

@@ -2,6 +2,7 @@ import {
   getDefaultPathForRole,
   getFlatNavigationForRole,
   getNavigationForRole,
+  getUserRole,
 } from './navigation';
 
 const labelsForRole = (role) => getFlatNavigationForRole(role).map((item) => item.label);
@@ -18,6 +19,19 @@ describe('navigation role rules', () => {
     expect(getDefaultPathForRole('科任教师')).toBe('/teacher-dashboard');
     expect(getDefaultPathForRole('教研组长')).toBe('/research-dashboard');
     expect(getDefaultPathForRole('家长')).toBe('/parent-dashboard');
+  });
+
+  it('normalizes backend role aliases before routing protected pages', () => {
+    const deanRole = getUserRole({
+      username: 'dean',
+      role_name: '教务处主任/校领导',
+      permission_code: 'edu_admin',
+    });
+
+    expect(deanRole).toBe('教务处主任');
+    expect(getDefaultPathForRole(deanRole)).toBe('/dashboard');
+    expect(labelsForRole(deanRole)).toEqual(expect.arrayContaining(['成绩分析', '教务处', '系统设置']));
+    expect(getUserRole({ role_name: '教师', permission_code: 'teacher' })).toBe('科任教师');
   });
 
   it('keeps educational management out of non-admin quick navigation', () => {

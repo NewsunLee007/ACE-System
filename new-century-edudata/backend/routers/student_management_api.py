@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/students", tags=["学生管理"])
 
 STUDENT_MANAGEMENT_PERMISSION_CODES = ("exam_admin",)
+ACTIVE_STUDENT_STATUS_SQL = "'在读', '在籍', '借读', '请长假'"
 
 
 # ============ Pydantic模型定义 ============
@@ -538,7 +539,7 @@ def get_student_statistics(
                 COUNT(*) as total_students,
                 SUM(CASE WHEN gender = 1 THEN 1 ELSE 0 END) as male_count,
                 SUM(CASE WHEN gender = 0 THEN 1 ELSE 0 END) as female_count,
-                SUM(CASE WHEN status = '在读' THEN 1 ELSE 0 END) as active_count,
+                SUM(CASE WHEN status IN ({ACTIVE_STUDENT_STATUS_SQL}) THEN 1 ELSE 0 END) as active_count,
                 SUM(CASE WHEN status = '休学' THEN 1 ELSE 0 END) as suspended_count,
                 SUM(CASE WHEN status = '转学' THEN 1 ELSE 0 END) as transferred_count
             FROM biz_students

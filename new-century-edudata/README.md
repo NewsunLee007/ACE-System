@@ -102,6 +102,15 @@ export SEED_DEFAULT_PASSWORD="请改成临时强密码"
 python scripts/seed_neon_demo_data.py --with-schema
 ```
 
+同步后用线上链路验证脚本确认教务主任、家长账号和家长学情报告都可用：
+
+```bash
+ACE_BASE_URL="https://ace-system-sandy.vercel.app" \
+ACE_DEAN_PASSWORD="$SEED_DEFAULT_PASSWORD" \
+ACE_PARENT_PASSWORD="$SEED_DEFAULT_PASSWORD" \
+python scripts/verify_deployment_readiness.py
+```
+
 ### 3. 后端部署
 
 ```bash

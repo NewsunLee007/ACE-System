@@ -4,8 +4,12 @@
 技术栈: FastAPI + SQLAlchemy + MySQL
 """
 
+import os
+
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 import uvicorn
 import logging
 
@@ -31,7 +35,7 @@ from routers import (
     ai_analysis_api,
     score_visibility_api
 )
-from core.database import init_db
+from core.database import DATABASE_URL, SessionLocal, get_db_dialect, init_db
 
 # 配置日志
 logging.basicConfig(
@@ -104,6 +108,77 @@ def root():
 def health_check():
     """健康检查"""
     return {"status": "healthy"}
+
+
+def _database_url_source() -> str:
+    return "environment" if os.getenv("DATABASE_URL") else "fallback"
+
+
+def _database_target() -> str:
+    url = DATABASE_URL.lower()
+    if url.startswith(("postgresql://", "postgres://")):
+        return "postgresql"
+    if url.startswith("mysql"):
+        return "mysql"
+    return "unknown"
+
+
+@app.get("/ready")
+@app.get("/api/ready")
+def readiness_check():
+    """业务就绪检查：验证数据库配置、连接和核心演示数据。"""
+    payload = {
+        "status": "ready",
+        "checks": {
+            "database_url_source": _database_url_source(),
+            "database_target": _database_target(),
+            "database_url_configured": bool(os.getenv("DATABASE_URL")),
+            "database_connection": False,
+            "seed_data": False,
+        },
+        "tables": {},
+    }
+
+    if not payload["checks"]["database_url_configured"]:
+        payload["status"] = "not_ready"
+        payload["reason"] = "DATABASE_URL is not configured; runtime is using the local fallback database URL."
+        return JSONResponse(status_code=503, content=payload)
+
+    db = SessionLocal()
+    try:
+        db.execute(text("SELECT 1"))
+        payload["checks"]["database_connection"] = True
+        payload["checks"]["database_dialect"] = get_db_dialect(db)
+
+        required_tables = {
+            "sys_users": 1,
+            "biz_students": 1,
+            "biz_parent_student_rel": 1,
+            "biz_exams": 1,
+            "biz_scores": 1,
+            "biz_class_layers": 1,
+        }
+        for table_name, minimum_count in required_tables.items():
+            count = db.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar() or 0
+            payload["tables"][table_name] = int(count)
+            if count < minimum_count:
+                payload["status"] = "not_ready"
+
+        payload["checks"]["seed_data"] = payload["status"] == "ready"
+        if payload["status"] != "ready":
+            payload["reason"] = "Database is reachable, but required seeded business data is missing."
+            return JSONResponse(status_code=503, content=payload)
+
+        return payload
+    except Exception as exc:
+        logger.error("业务就绪检查失败: %s", exc)
+        payload["status"] = "not_ready"
+        payload["checks"]["database_dialect"] = get_db_dialect(db)
+        payload["error_type"] = exc.__class__.__name__
+        payload["reason"] = "Database connection or schema check failed."
+        return JSONResponse(status_code=503, content=payload)
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":

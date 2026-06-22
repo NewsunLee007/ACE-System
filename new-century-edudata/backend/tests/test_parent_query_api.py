@@ -56,3 +56,14 @@ def test_parent_exam_list_calculates_rank_before_filtering_to_student():
     assert result == {"student_id": 7, "total_exams": 0, "exams": []}
     assert_ranked_before_student_filter(db.calls[0][0])
     assert db.calls[0][1] == {"student_id": 7, "limit": 10}
+
+
+def test_parent_auth_accepts_active_registry_statuses():
+    db = CapturingDB()
+
+    result = ParentQueryService(db).authenticate("甲", "123456", "701")
+
+    assert result["success"] is False
+    sql = db.calls[0][0]
+    assert "status IN ('在读', '在籍', '借读', '请长假')" in sql
+    assert db.calls[0][1] == {"student_name": "甲", "class_name": "701"}

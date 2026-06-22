@@ -20,6 +20,7 @@ from core.security import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/parents", tags=["家长端H5查询"])
+ACTIVE_STUDENT_STATUS_SQL = "'在读', '在籍', '借读', '请长假'"
 
 
 def require_parent_student_access(
@@ -146,12 +147,12 @@ class ParentQueryService:
             Dict: 鉴权结果
         """
         # 查询学生信息
-        sql = """
+        sql = f"""
             SELECT id, name, student_code, current_class, id_card_last6
             FROM biz_students
             WHERE name = :student_name
               AND current_class = :class_name
-              AND status = '在读'
+              AND status IN ({ACTIVE_STUDENT_STATUS_SQL})
         """
         
         result = self.db.execute(

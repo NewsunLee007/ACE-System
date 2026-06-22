@@ -19,6 +19,10 @@
       "dest": "backend/main.py"
     },
     {
+      "src": "/ready",
+      "dest": "backend/main.py"
+    },
+    {
       "src": "/api/docs",
       "dest": "backend/main.py"
     },

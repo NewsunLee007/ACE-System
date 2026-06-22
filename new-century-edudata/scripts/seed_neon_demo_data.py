@@ -30,6 +30,14 @@ TEACHER_USER_OFFSET = 10000
 PARENT_USER_OFFSET = 20000
 DEFAULT_TERM = "2025-1"
 DEFAULT_ACADEMIC_YEAR = "2025-2026"
+VALID_STUDENT_STATUSES = {"在籍", "在读", "借读", "休学", "转学", "退学", "请长假", "毕业", "待核验"}
+STUDENT_STATUS_ALIASES = {
+    "active": "在籍",
+    "normal": "在籍",
+    "enrolled": "在籍",
+    "在校": "在籍",
+    "就读": "在读",
+}
 
 ROLE_FRONTEND_META = {
     "sys_admin": ("admin", 9, ["all_permissions", "system_config"]),
@@ -97,6 +105,14 @@ def class_layer_lookup(data: dict) -> dict[str, dict]:
         class_code(layer.get("class_name") or layer.get("class_id")): layer
         for layer in data.get("classLayers") or []
     }
+
+
+def normalize_student_status(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "在籍"
+    normalized = STUDENT_STATUS_ALIASES.get(text, text)
+    return normalized if normalized in VALID_STUDENT_STATUSES else "待核验"
 
 
 def reset_sequence(cur, table: str) -> None:
@@ -295,7 +311,7 @@ def seed_students(cur, data: dict) -> None:
                 grade_from_class_id(student.get("class_id")),
                 str(student.get("class_id") or ""),
                 str(student.get("student_code") or "")[-6:],
-                student.get("status") or "在籍",
+                normalize_student_status(student.get("status")),
                 student.get("created_at"),
                 student.get("created_at"),
             )

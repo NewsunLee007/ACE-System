@@ -205,6 +205,18 @@ def _valid_bootstrap_token(token: str | None) -> bool:
     return bool(token) and token in {configured_token, derived_token}
 
 
+def _bootstrap_default_password(seed_module) -> str:
+    raw_password = os.getenv("SEED_DEFAULT_PASSWORD")
+    normalizer = getattr(seed_module, "normalize_seed_password", None)
+    if callable(normalizer):
+        return normalizer(raw_password)
+
+    password = str(raw_password or "").strip()
+    if not password or len(password.encode("utf-8")) > 72:
+        return "NewCentury2025!"
+    return password
+
+
 @app.post("/api/internal/bootstrap-seed")
 def bootstrap_seed(x_bootstrap_token: str | None = Header(default=None)):
     """Protected one-time initializer for managed Vercel/Neon environments."""
@@ -219,7 +231,7 @@ def bootstrap_seed(x_bootstrap_token: str | None = Header(default=None)):
     try:
         seed_module = _load_seed_module()
         data = seed_module.load_demo_data()
-        default_password = os.getenv("SEED_DEFAULT_PASSWORD", "NewCentury2025!")
+        default_password = _bootstrap_default_password(seed_module)
         conn = seed_module.psycopg2.connect(seed_module.normalize_database_url(DATABASE_URL))
         seed_module.execute_schema(conn)
         with conn.cursor() as cur:

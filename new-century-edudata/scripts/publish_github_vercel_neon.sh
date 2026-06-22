@@ -9,7 +9,9 @@ set -euo pipefail
 #      - or SSH: change origin to git@github.com:NewsunLee007/ACE-System.git and add an SSH key
 #   2. Authenticate Vercel CLI:
 #      npx vercel login
-#   3. Create a Neon database and export DATABASE_URL when seeding/deploying with Neon.
+#      or export VERCEL_TOKEN for non-interactive CI/local publishing.
+#   3. Create a Neon database and export DATABASE_URL when seeding/deploying
+#      or syncing Vercel environment variables.
 #
 # Common usage:
 #   cd "/Users/newsunsmac/Downloads/ACE System"
@@ -18,6 +20,7 @@ set -euo pipefail
 #   DATABASE_URL="postgresql://USER:PASSWORD@HOST/neondb?sslmode=require" \
 #   SEED_NEON=1 \
 #   CREATE_VERCEL_PROJECT=1 \
+#   SYNC_VERCEL_ENV=1 \
 #   DEPLOY_PROD=1 \
 #   ./new-century-edudata/scripts/publish_github_vercel_neon.sh
 
@@ -32,6 +35,9 @@ CREATE_VERCEL_PROJECT="${CREATE_VERCEL_PROJECT:-0}"
 DEPLOY_PROD="${DEPLOY_PROD:-0}"
 SKIP_CHECKS="${SKIP_CHECKS:-0}"
 SKIP_GIT_DRY_RUN="${SKIP_GIT_DRY_RUN:-0}"
+SYNC_VERCEL_ENV="${SYNC_VERCEL_ENV:-0}"
+VERCEL_ENV_TARGETS="${VERCEL_ENV_TARGETS:-production preview development}"
+SECRET_KEY="${SECRET_KEY:-}"
 
 log() {
   printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
@@ -52,6 +58,45 @@ require_command git
 require_command npm
 require_command npx
 
+if command -v python3.11 >/dev/null 2>&1; then
+  PYTHON_BIN="${PYTHON_BIN:-python3.11}"
+else
+  PYTHON_BIN="${PYTHON_BIN:-python3}"
+fi
+
+VERCEL_TOKEN_ARGS=()
+if [[ -n "${VERCEL_TOKEN:-}" ]]; then
+  VERCEL_TOKEN_ARGS=(--token "${VERCEL_TOKEN}")
+fi
+
+vercel_cli() {
+  npx vercel "$@" "${VERCEL_TOKEN_ARGS[@]}"
+}
+
+require_vercel_auth() {
+  if ! (cd "${REPO_ROOT}" && vercel_cli whoami >/dev/null 2>&1); then
+    printf 'Vercel CLI is not authenticated. Run `npx vercel login` or export VERCEL_TOKEN.\n' >&2
+    exit 1
+  fi
+}
+
+add_vercel_env_if_set() {
+  local key="$1"
+  local value="$2"
+  local target
+
+  if [[ -z "${value}" ]]; then
+    return 0
+  fi
+
+  for target in ${VERCEL_ENV_TARGETS}; do
+    log "Syncing Vercel env ${key} to ${target}"
+    if ! printf '%s' "${value}" | (cd "${REPO_ROOT}" && vercel_cli env add "${key}" "${target}" --scope "${VERCEL_SCOPE}" >/dev/null); then
+      log "Skipping ${key} for ${target}; it may already exist. Remove it in Vercel first if the value must change."
+    fi
+  done
+}
+
 if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=no)" ]]; then
   printf 'Tracked files have uncommitted changes. Commit or stash them before publishing.\n' >&2
   git -C "${REPO_ROOT}" status --short
@@ -70,11 +115,6 @@ if [[ "${SKIP_CHECKS}" != "1" ]]; then
   log "Building frontend"
   (cd "${APP_DIR}/frontend" && npm run build)
 
-  if command -v python3.11 >/dev/null 2>&1; then
-    PYTHON_BIN="python3.11"
-  else
-    PYTHON_BIN="python3"
-  fi
   if "${PYTHON_BIN}" -m pytest --version >/dev/null 2>&1; then
     log "Running backend tests"
     (cd "${APP_DIR}/backend" && "${PYTHON_BIN}" -m pytest -q)
@@ -98,28 +138,39 @@ if [[ "${SEED_NEON}" == "1" ]]; then
 fi
 
 if [[ -n "${VERCEL_SCOPE}" ]]; then
+  require_vercel_auth
   if [[ "${CREATE_VERCEL_PROJECT}" == "1" ]]; then
     log "Creating Vercel project ${VERCEL_PROJECT} in scope ${VERCEL_SCOPE} if it does not already exist"
-    (cd "${REPO_ROOT}" && npx vercel project add "${VERCEL_PROJECT}" --scope "${VERCEL_SCOPE}") || true
+    (cd "${REPO_ROOT}" && vercel_cli project add "${VERCEL_PROJECT}" --scope "${VERCEL_SCOPE}") || true
   fi
   log "Linking Vercel project ${VERCEL_PROJECT} in scope ${VERCEL_SCOPE}"
-  (cd "${REPO_ROOT}" && npx vercel link --yes --project "${VERCEL_PROJECT}" --scope "${VERCEL_SCOPE}")
+  (cd "${REPO_ROOT}" && vercel_cli link --yes --project "${VERCEL_PROJECT}" --scope "${VERCEL_SCOPE}")
 else
   log "Skipping vercel link because VERCEL_SCOPE is empty"
 fi
 
-if [[ -n "${DATABASE_URL:-}" ]]; then
-  log "DATABASE_URL is set locally. Ensure it is also configured in Vercel project environment variables."
-  log "Vercel CLI env setup is intentionally left interactive so secrets are not echoed into shell history."
-  log "Run if needed: npx vercel env add DATABASE_URL production"
+if [[ "${SYNC_VERCEL_ENV}" == "1" ]]; then
+  if [[ -z "${VERCEL_SCOPE}" ]]; then
+    printf 'VERCEL_SCOPE is required when SYNC_VERCEL_ENV=1.\n' >&2
+    exit 1
+  fi
+  require_vercel_auth
+  add_vercel_env_if_set "DATABASE_URL" "${DATABASE_URL:-}"
+  add_vercel_env_if_set "SECRET_KEY" "${SECRET_KEY}"
+  add_vercel_env_if_set "DEEPSEEK_API_KEY" "${DEEPSEEK_API_KEY:-}"
+  add_vercel_env_if_set "DEEPSEEK_API_BASE_URL" "${DEEPSEEK_API_BASE_URL:-}"
+  add_vercel_env_if_set "DEEPSEEK_MODEL" "${DEEPSEEK_MODEL:-}"
+elif [[ -n "${DATABASE_URL:-}" ]]; then
+  log "DATABASE_URL is set locally. Set SYNC_VERCEL_ENV=1 to add it to the linked Vercel project."
 fi
 
+require_vercel_auth
 if [[ "${DEPLOY_PROD}" == "1" ]]; then
   log "Deploying production to Vercel"
-  (cd "${REPO_ROOT}" && npx vercel deploy --prod)
+  (cd "${REPO_ROOT}" && vercel_cli deploy --prod)
 else
   log "Deploying preview to Vercel"
-  (cd "${REPO_ROOT}" && npx vercel deploy)
+  (cd "${REPO_ROOT}" && vercel_cli deploy)
 fi
 
 log "Publish flow finished"

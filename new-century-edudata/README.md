@@ -236,11 +236,19 @@ cd "/Users/newsunsmac/Downloads/ACE System"
 VERCEL_SCOPE="newsun-lees-projects" \
 VERCEL_PROJECT="ace-system" \
 DATABASE_URL="postgresql://USER:PASSWORD@HOST/neondb?sslmode=require" \
+SECRET_KEY="change-me-to-a-long-random-string" \
+VERCEL_TOKEN="vercel-token-if-not-logged-in" \
 SEED_NEON=1 \
 CREATE_VERCEL_PROJECT=1 \
+SYNC_VERCEL_ENV=1 \
 DEPLOY_PROD=1 \
 ./new-century-edudata/scripts/publish_github_vercel_neon.sh
 ```
+
+其中 `VERCEL_TOKEN` 可选；如果本机已经通过 `npx vercel login`
+登录，可以不传。`SYNC_VERCEL_ENV=1` 会把 `DATABASE_URL`、`SECRET_KEY`
+以及可选的 `DEEPSEEK_*` 配置写入 Vercel 的 production、preview 和
+development 环境；如果变量已存在，需要先在 Vercel 控制台删除旧值再重新同步。
 
 当前后端已对核心教务链路的 PostgreSQL 方言做兼容：家长绑定、班级/学科/角色/教师职务管理、成绩导入、成绩分析结果包、分层统计缓存和排名可见性设置。
 

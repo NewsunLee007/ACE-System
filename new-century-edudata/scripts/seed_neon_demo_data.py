@@ -19,7 +19,7 @@ from pathlib import Path
 
 import psycopg2
 from passlib.hash import bcrypt
-from psycopg2.extras import Json, execute_values
+from psycopg2.extras import execute_values
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +28,8 @@ SCHEMA_FILE = PROJECT_ROOT / "database" / "neon_postgres_schema.sql"
 
 TEACHER_USER_OFFSET = 10000
 PARENT_USER_OFFSET = 20000
+DEFAULT_TERM = "2025-1"
+DEFAULT_ACADEMIC_YEAR = "2025-2026"
 
 ROLE_FRONTEND_META = {
     "sys_admin": ("admin", 9, ["all_permissions", "system_config"]),
@@ -84,6 +86,17 @@ def grade_from_class_id(class_id: int | str | None) -> str:
 
 def class_code(value) -> str:
     return str(value or "").replace("班", "").strip()
+
+
+def layer_name_for_code(layer_code: str) -> str:
+    return "全年级" if layer_code == "ALL" else f"{layer_code}层"
+
+
+def class_layer_lookup(data: dict) -> dict[str, dict]:
+    return {
+        class_code(layer.get("class_name") or layer.get("class_id")): layer
+        for layer in data.get("classLayers") or []
+    }
 
 
 def reset_sequence(cur, table: str) -> None:
@@ -219,6 +232,42 @@ def seed_classes_and_subjects(cur, data: dict) -> None:
     )
 
 
+def seed_class_layer_settings(cur, data: dict) -> None:
+    rows = []
+    for layer in data.get("classLayers") or []:
+        rows.append((
+            layer.get("grade_level") or grade_from_class_id(layer.get("class_id")),
+            int(layer["class_id"]),
+            class_code(layer.get("class_name") or layer.get("class_id")),
+            layer.get("layer_code") or "C",
+            layer.get("layer_name") or layer_name_for_code(layer.get("layer_code") or "C"),
+            DEFAULT_ACADEMIC_YEAR,
+            DEFAULT_TERM,
+            "由真实导入班级层次生成",
+            layer.get("created_at"),
+            layer.get("created_at"),
+        ))
+    if not rows:
+        return
+
+    execute_values(
+        cur,
+        """
+        INSERT INTO biz_class_layers
+          (grade_level, class_id, class_name, layer_code, layer_name,
+           academic_year, term, description, created_at, updated_at)
+        VALUES %s
+        ON CONFLICT (grade_level, class_id, academic_year, term) DO UPDATE SET
+          class_name = excluded.class_name,
+          layer_code = excluded.layer_code,
+          layer_name = excluded.layer_name,
+          description = excluded.description,
+          updated_at = CURRENT_TIMESTAMP
+        """,
+        rows,
+    )
+
+
 def seed_students(cur, data: dict) -> None:
     execute_values(
         cur,
@@ -322,6 +371,110 @@ def seed_parents(cur, data: dict) -> None:
     )
 
 
+def seed_parent_student_layers(cur, data: dict) -> None:
+    layer_by_class = class_layer_lookup(data)
+    student_by_id = {int(student["id"]): student for student in data["students"]}
+    rows = []
+
+    for parent in data["parents"]:
+        parent_id = PARENT_USER_OFFSET + int(parent["id"])
+        for student_id in parent.get("student_ids") or []:
+            student = student_by_id.get(int(student_id))
+            if not student:
+                continue
+            class_name = class_code(student.get("class_id"))
+            layer = layer_by_class.get(class_name, {})
+            rows.append((
+                parent_id,
+                int(student_id),
+                layer.get("layer_code") or "C",
+                class_name,
+                DEFAULT_ACADEMIC_YEAR,
+                DEFAULT_TERM,
+                1,
+            ))
+    if not rows:
+        return
+
+    execute_values(
+        cur,
+        """
+        INSERT INTO biz_parent_student_layer
+          (parent_user_id, student_id, layer_code, class_name, academic_year, term, is_active)
+        VALUES %s
+        ON CONFLICT (parent_user_id, student_id, academic_year, term) DO UPDATE SET
+          layer_code = excluded.layer_code,
+          class_name = excluded.class_name,
+          is_active = excluded.is_active,
+          updated_at = CURRENT_TIMESTAMP
+        """,
+        rows,
+    )
+
+
+def seed_user_layer_permissions(cur, data: dict) -> None:
+    layer_by_class = class_layer_lookup(data)
+    rows = []
+
+    for layer_code in ["ALL", "A", "B", "C"]:
+        rows.extend([
+            (1, "sys_admin", layer_code, "*", "view", 1),
+            (1, "sys_admin", layer_code, "*", "push", 1),
+            (2, "edu_admin", layer_code, "*", "view", 1),
+            (2, "edu_admin", layer_code, "*", "push", 1),
+        ])
+
+    for teacher in data["teachers"]:
+        teacher_id = TEACHER_USER_OFFSET + int(teacher["id"])
+        for assignment in teacher.get("teaching_classes") or []:
+            class_name = class_code(assignment.get("class_id"))
+            layer = layer_by_class.get(class_name, {})
+            rows.append((
+                teacher_id,
+                "teacher",
+                layer.get("layer_code") or "C",
+                class_name,
+                "view",
+                2,
+            ))
+
+    student_by_id = {int(student["id"]): student for student in data["students"]}
+    for parent in data["parents"]:
+        parent_id = PARENT_USER_OFFSET + int(parent["id"])
+        for student_id in parent.get("student_ids") or []:
+            student = student_by_id.get(int(student_id))
+            if not student:
+                continue
+            class_name = class_code(student.get("class_id"))
+            layer = layer_by_class.get(class_name, {})
+            rows.append((
+                parent_id,
+                "parent",
+                layer.get("layer_code") or "C",
+                class_name,
+                "view",
+                2,
+            ))
+
+    if not rows:
+        return
+
+    execute_values(
+        cur,
+        """
+        INSERT INTO biz_user_layer_permissions
+          (user_id, user_role, layer_code, class_name, permission_type, grant_by)
+        VALUES %s
+        ON CONFLICT (user_id, layer_code, class_name, permission_type) DO UPDATE SET
+          user_role = excluded.user_role,
+          grant_by = excluded.grant_by,
+          updated_at = CURRENT_TIMESTAMP
+        """,
+        rows,
+        page_size=500,
+    )
+
+
 def seed_exams_scores_and_layers(cur, data: dict) -> None:
     execute_values(
         cur,
@@ -346,7 +499,7 @@ def seed_exams_scores_and_layers(cur, data: dict) -> None:
                 exam.get("exam_type") or "统测",
                 exam.get("grade_level") or grade_from_class_id(str(exam["id"])[0]),
                 exam.get("exam_date"),
-                Json(exam.get("subjects") or data["subjects"]),
+                json.dumps(exam.get("subjects") or data["subjects"], ensure_ascii=False),
                 exam.get("full_score") or 500,
                 exam.get("created_at"),
             )
@@ -438,14 +591,29 @@ def seed_exams_scores_and_layers(cur, data: dict) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--with-schema", action="store_true", help="Run database/neon_postgres_schema.sql before seeding")
+    parser.add_argument("--dry-run", action="store_true", help="Load and summarize the demo dataset without touching a database")
     args = parser.parse_args()
+
+    default_password = os.getenv("SEED_DEFAULT_PASSWORD", "NewCentury2025!")
+
+    data = load_demo_data()
+    if args.dry_run:
+        parent = next((item for item in data["parents"] if item.get("phone")), None)
+        print(
+            "Seed dry run: "
+            f"{len(data['classes'])} classes, {len(data['students'])} students, "
+            f"{len(data['teachers'])} teachers, {len(data['parents'])} parents, "
+            f"{len(data['classLayers'])} class layers, {len(data['exams'])} exams, "
+            f"{len(data['examScores'])} score rows. "
+            f"Sample login: dean / {default_password}; "
+            f"parent {parent['phone']} / {default_password}."
+        )
+        return
 
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise SystemExit("DATABASE_URL is required")
-    default_password = os.getenv("SEED_DEFAULT_PASSWORD", "NewCentury2025!")
 
-    data = load_demo_data()
     conn = psycopg2.connect(normalize_database_url(database_url))
     try:
         if args.with_schema:
@@ -455,9 +623,12 @@ def main() -> None:
             seed_roles(cur, role_ids)
             seed_users(cur, data, role_ids, default_password)
             seed_classes_and_subjects(cur, data)
+            seed_class_layer_settings(cur, data)
             seed_students(cur, data)
             seed_teaching_relations(cur, data)
             seed_parents(cur, data)
+            seed_parent_student_layers(cur, data)
+            seed_user_layer_permissions(cur, data)
             seed_exams_scores_and_layers(cur, data)
         conn.commit()
     except Exception:

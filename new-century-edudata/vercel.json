@@ -5,7 +5,12 @@
   "outputDirectory": "frontend/build",
   "functions": {
     "api/index.py": {
-      "includeFiles": "backend/**"
+      "includeFiles": [
+        "backend/**",
+        "database/neon_postgres_schema.sql",
+        "frontend/src/data/demoSchoolData.js",
+        "scripts/seed_neon_demo_data.py"
+      ]
     }
   },
   "rewrites": [

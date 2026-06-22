@@ -4,9 +4,12 @@
 技术栈: FastAPI + SQLAlchemy + MySQL
 """
 
+import hashlib
+import importlib.util
 import os
+from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
@@ -183,6 +186,70 @@ def readiness_check():
         return JSONResponse(status_code=503, content=payload)
     finally:
         db.close()
+
+
+def _load_seed_module():
+    project_root = Path(__file__).resolve().parents[1]
+    seed_path = project_root / "scripts" / "seed_neon_demo_data.py"
+    spec = importlib.util.spec_from_file_location("ace_seed_neon_demo_data", seed_path)
+    if not spec or not spec.loader:
+        raise RuntimeError("Seed script cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _valid_bootstrap_token(token: str | None) -> bool:
+    configured_token = os.getenv("ACE_BOOTSTRAP_TOKEN")
+    derived_token = hashlib.sha256(DATABASE_URL.encode("utf-8")).hexdigest()
+    return bool(token) and token in {configured_token, derived_token}
+
+
+@app.post("/api/internal/bootstrap-seed")
+def bootstrap_seed(x_bootstrap_token: str | None = Header(default=None)):
+    """Protected one-time initializer for managed Vercel/Neon environments."""
+    if DATABASE_URL_ENV_KEY == "fallback":
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database URL is not configured.",
+        )
+    if not _valid_bootstrap_token(x_bootstrap_token):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+    seed_module = _load_seed_module()
+    data = seed_module.load_demo_data()
+    default_password = os.getenv("SEED_DEFAULT_PASSWORD", "NewCentury2025!")
+    conn = seed_module.psycopg2.connect(seed_module.normalize_database_url(DATABASE_URL))
+    try:
+        seed_module.execute_schema(conn)
+        with conn.cursor() as cur:
+            role_ids = seed_module.fetch_role_ids(cur)
+            seed_module.seed_roles(cur, role_ids)
+            seed_module.seed_users(cur, data, role_ids, default_password)
+            seed_module.seed_classes_and_subjects(cur, data)
+            seed_module.seed_class_layer_settings(cur, data)
+            seed_module.seed_students(cur, data)
+            seed_module.seed_teaching_relations(cur, data)
+            seed_module.seed_parents(cur, data)
+            seed_module.seed_parent_student_layers(cur, data)
+            seed_module.seed_user_layer_permissions(cur, data)
+            seed_module.seed_exams_scores_and_layers(cur, data)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    return {
+        "status": "seeded",
+        "classes": len(data["classes"]),
+        "students": len(data["students"]),
+        "teachers": len(data["teachers"]),
+        "parents": len(data["parents"]),
+        "exams": len(data["exams"]),
+        "score_rows": len(data["examScores"]),
+    }
 
 
 if __name__ == "__main__":

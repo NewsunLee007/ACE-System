@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -58,14 +59,25 @@ def load_demo_data() -> dict:
       const {{ DEMO_SCHOOL_DATA }} = require({json.dumps(str(DATA_FILE))});
       process.stdout.write(JSON.stringify(DEMO_SCHOOL_DATA));
     """
-    result = subprocess.run(
-        ["node", "-e", node_code],
-        cwd=str(PROJECT_ROOT),
-        check=True,
-        text=True,
-        capture_output=True,
-    )
-    return json.loads(result.stdout)
+    try:
+        result = subprocess.run(
+            ["node", "-e", node_code],
+            cwd=str(PROJECT_ROOT),
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        return json.loads(result.stdout)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        source = DATA_FILE.read_text(encoding="utf-8")
+        match = re.search(
+            r"export const DEMO_SCHOOL_DATA = (\{.*?\n\});\n\nexport default",
+            source,
+            flags=re.S,
+        )
+        if not match:
+            raise RuntimeError("Unable to parse DEMO_SCHOOL_DATA from frontend seed data")
+        return json.loads(match.group(1))
 
 
 def normalize_database_url(url: str) -> str:

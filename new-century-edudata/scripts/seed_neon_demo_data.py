@@ -18,8 +18,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import bcrypt
 import psycopg2
-from passlib.hash import bcrypt
 from psycopg2.extras import execute_values
 
 
@@ -174,7 +174,10 @@ def seed_roles(cur, role_ids: dict) -> None:
 
 def seed_users(cur, data: dict, role_ids: dict, default_password: str) -> None:
     default_password = normalize_seed_password(default_password)
-    password_hash = bcrypt.hash(default_password)
+    password_hash = bcrypt.hashpw(
+        default_password.encode("utf-8"),
+        bcrypt.gensalt(),
+    ).decode("utf-8")
     admin_users = [
         (1, role_ids["sys_admin"], "admin", password_hash, "系统管理员", "", "", 1),
         (2, role_ids["edu_admin"], "dean", password_hash, "李主任", "", "", 1),

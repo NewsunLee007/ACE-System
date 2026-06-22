@@ -5,8 +5,8 @@
 
 from datetime import datetime, timedelta
 from typing import Iterable, Optional, Dict, Any
+import bcrypt
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
@@ -19,8 +19,6 @@ SECRET_KEY = "your-secret-key-change-in-production-min-32-chars-long"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24小时
 
-# 密码加密上下文
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 BCRYPT_MAX_PASSWORD_BYTES = 72
 
 # HTTP Bearer认证
@@ -62,14 +60,23 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     """验证密码"""
     if not is_bcrypt_password_length_valid(plain_password):
         return False
-    return pwd_context.verify(plain_password, hashed_password)
+    try:
+        return bcrypt.checkpw(
+            str(plain_password or "").encode("utf-8"),
+            str(hashed_password or "").encode("utf-8"),
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def get_password_hash(password: str) -> str:
     """获取密码哈希"""
     if not is_bcrypt_password_length_valid(password):
         raise ValueError("password cannot be longer than 72 bytes")
-    return pwd_context.hash(password)
+    return bcrypt.hashpw(
+        str(password or "").encode("utf-8"),
+        bcrypt.gensalt(),
+    ).decode("utf-8")
 
 
 def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:

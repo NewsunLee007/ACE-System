@@ -17,7 +17,8 @@ from core.security import (
     get_password_hash,
     create_access_token,
     get_current_user,
-    ACCESS_TOKEN_EXPIRE_MINUTES
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+    is_bcrypt_password_length_valid
 )
 
 logger = logging.getLogger(__name__)
@@ -164,6 +165,8 @@ def change_password(
         
         if len(request.new_password) < 6:
             return {"success": False, "message": "新密码长度不能少于6位"}
+        if not is_bcrypt_password_length_valid(request.new_password):
+            return {"success": False, "message": "新密码过长，请控制在72字节以内"}
         
         # 查询当前密码
         sql = "SELECT password_hash FROM sys_users WHERE id = :user_id"
@@ -215,6 +218,10 @@ def create_user(
         
         if existing:
             return {"success": False, "message": "用户名已存在"}
+        if len(request.password.strip()) < 6:
+            return {"success": False, "message": "密码长度不能少于6位"}
+        if not is_bcrypt_password_length_valid(request.password):
+            return {"success": False, "message": "密码过长，请控制在72字节以内"}
         
         # 创建用户
         password_hash = get_password_hash(request.password)

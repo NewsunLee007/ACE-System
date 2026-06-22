@@ -31,6 +31,8 @@ TEACHER_USER_OFFSET = 10000
 PARENT_USER_OFFSET = 20000
 DEFAULT_TERM = "2025-1"
 DEFAULT_ACADEMIC_YEAR = "2025-2026"
+BCRYPT_MAX_PASSWORD_BYTES = 72
+DEFAULT_SEED_PASSWORD = "NewCentury2025!"
 VALID_STUDENT_STATUSES = {"在籍", "在读", "借读", "休学", "转学", "退学", "请长假", "毕业", "待核验"}
 STUDENT_STATUS_ALIASES = {
     "active": "在籍",
@@ -84,6 +86,13 @@ def normalize_database_url(url: str) -> str:
     if url.startswith("postgres://"):
         return url.replace("postgres://", "postgresql://", 1)
     return url
+
+
+def normalize_seed_password(value: str | None) -> str:
+    password = str(value or "").strip() or DEFAULT_SEED_PASSWORD
+    if len(password.encode("utf-8")) > BCRYPT_MAX_PASSWORD_BYTES:
+        return DEFAULT_SEED_PASSWORD
+    return password
 
 
 def execute_schema(conn) -> None:
@@ -164,6 +173,7 @@ def seed_roles(cur, role_ids: dict) -> None:
 
 
 def seed_users(cur, data: dict, role_ids: dict, default_password: str) -> None:
+    default_password = normalize_seed_password(default_password)
     password_hash = bcrypt.hash(default_password)
     admin_users = [
         (1, role_ids["sys_admin"], "admin", password_hash, "系统管理员", "", "", 1),
@@ -622,7 +632,7 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Load and summarize the demo dataset without touching a database")
     args = parser.parse_args()
 
-    default_password = os.getenv("SEED_DEFAULT_PASSWORD", "NewCentury2025!")
+    default_password = normalize_seed_password(os.getenv("SEED_DEFAULT_PASSWORD"))
 
     data = load_demo_data()
     if args.dry_run:

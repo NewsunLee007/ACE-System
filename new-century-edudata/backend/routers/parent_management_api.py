@@ -11,7 +11,11 @@ from typing import Optional
 import logging
 
 from core.database import get_db, is_postgresql, is_sqlite
-from core.security import get_password_hash, require_permission_codes
+from core.security import (
+    get_password_hash,
+    is_bcrypt_password_length_valid,
+    require_permission_codes,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/parent-management", tags=["家长管理"])
@@ -281,6 +285,8 @@ def create_parent(
         phone = request.phone.strip()
         if len(request.password.strip()) < 6:
             return {"success": False, "message": "初始密码长度不能少于6位"}
+        if not is_bcrypt_password_length_valid(request.password):
+            return {"success": False, "message": "初始密码过长，请控制在72字节以内"}
 
         existing = db.execute(
             text("SELECT id FROM sys_users WHERE username = :username"),

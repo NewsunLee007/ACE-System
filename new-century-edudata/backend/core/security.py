@@ -21,6 +21,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24小时
 
 # 密码加密上下文
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+BCRYPT_MAX_PASSWORD_BYTES = 72
 
 # HTTP Bearer认证
 security_scheme = HTTPBearer()
@@ -52,13 +53,22 @@ SEMANTIC_PERMISSION_MIN_LEVELS = {
 }
 
 
+def is_bcrypt_password_length_valid(password: str) -> bool:
+    """Return whether bcrypt can hash or verify this password safely."""
+    return len(str(password or "").encode("utf-8")) <= BCRYPT_MAX_PASSWORD_BYTES
+
+
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """验证密码"""
+    if not is_bcrypt_password_length_valid(plain_password):
+        return False
     return pwd_context.verify(plain_password, hashed_password)
 
 
 def get_password_hash(password: str) -> str:
     """获取密码哈希"""
+    if not is_bcrypt_password_length_valid(password):
+        raise ValueError("password cannot be longer than 72 bytes")
     return pwd_context.hash(password)
 
 

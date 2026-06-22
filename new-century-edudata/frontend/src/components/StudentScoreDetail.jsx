@@ -30,6 +30,8 @@ import {
 } from 'recharts';
 import schoolData from '../data/schoolData';
 import { analyzeStudentScoreWithAI, buildStudentScoreAiPayload } from '../lib/aiAnalysisApi';
+import { fetchStudentScoreHistory } from '../lib/scoreHistoryApi';
+import { hasBackendAuthToken } from '../lib/sessionToken';
 import {
   getLocalScoreVisibilitySettings,
   maskRankValue,
@@ -380,14 +382,58 @@ const StudentScoreDetail = ({ studentId, onBack }) => {
   const [aiResult, setAiResult] = useState('');
   const [aiError, setAiError] = useState('');
   const [visibilitySettings] = useState(getLocalScoreVisibilitySettings);
+  const [historyMode, setHistoryMode] = useState('recent');
+  const [historyTerm, setHistoryTerm] = useState('2025-1');
+  const [historyAcademicYear, setHistoryAcademicYear] = useState('2025-2026');
+  const [backendHistory, setBackendHistory] = useState(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState('');
 
   useEffect(() => {
     setStudent(findStudentForScoreDetail(studentId));
     setSelectedExam('latest');
     setAiResult('');
     setAiError('');
+    setBackendHistory(null);
+    setHistoryError('');
     setLoading(false);
   }, [studentId]);
+
+  useEffect(() => {
+    if (!student?.id || !hasBackendAuthToken()) {
+      setBackendHistory(null);
+      setHistoryError('');
+      return undefined;
+    }
+
+    let cancelled = false;
+    setHistoryLoading(true);
+    setHistoryError('');
+
+    fetchStudentScoreHistory({
+      studentId: student.id,
+      mode: historyMode,
+      term: historyMode === 'term' ? historyTerm : undefined,
+      academicYear: historyMode === 'academic_year' ? historyAcademicYear : undefined,
+      limit: 6,
+    })
+      .then((payload) => {
+        if (cancelled) return;
+        setBackendHistory(Array.isArray(payload?.exam_scores) ? payload : null);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setBackendHistory(null);
+        setHistoryError(error?.message || '后端历史成绩暂不可用，已使用本地成绩');
+      })
+      .finally(() => {
+        if (!cancelled) setHistoryLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [student?.id, historyMode, historyTerm, historyAcademicYear]);
 
   const currentUser = useMemo(() => {
     try {
@@ -401,7 +447,9 @@ const StudentScoreDetail = ({ studentId, onBack }) => {
     [currentUser, visibilitySettings]
   );
   const profile = useMemo(() => getProfile(student), [student]);
-  const examScores = useMemo(() => buildStudentExamScores(student), [student]);
+  const localExamScores = useMemo(() => buildStudentExamScores(student), [student]);
+  const backendExamScores = backendHistory?.exam_scores || [];
+  const examScores = backendExamScores.length ? backendExamScores : localExamScores;
   const currentExam = selectedExam === 'latest'
     ? examScores[0]
     : examScores.find((exam) => String(exam.exam_id) === String(selectedExam)) || examScores[0];
@@ -612,17 +660,52 @@ const StudentScoreDetail = ({ studentId, onBack }) => {
 
       <div className="mb-6 rounded-lg bg-white p-6 shadow-sm">
         <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-          <h3 className="text-lg font-semibold text-gray-800">考试成绩总览</h3>
-          <select
-            value={selectedExam}
-            onChange={(e) => setSelectedExam(e.target.value)}
-            className="rounded-lg border border-gray-300 px-3 py-1 text-sm"
-          >
-            <option value="latest">最新：{examScores[0].exam_name}</option>
-            {examScores.map((exam) => (
-              <option key={exam.exam_id} value={exam.exam_id}>{exam.exam_name}</option>
-            ))}
-          </select>
+          <div>
+            <h3 className="text-lg font-semibold text-gray-800">考试成绩总览</h3>
+            <p className="mt-1 text-xs text-gray-500">
+              {backendExamScores.length ? `后端历史结果 · ${backendHistory?.mode || 'recent'}` : '本地成绩结果'}
+              {historyLoading ? ' · 正在更新历史数据' : ''}
+              {historyError ? ` · ${historyError}` : ''}
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <select
+              value={historyMode}
+              onChange={(e) => setHistoryMode(e.target.value)}
+              className="h-9 rounded-lg border border-gray-300 px-3 text-sm"
+            >
+              <option value="recent">最近6场</option>
+              <option value="term">按学期</option>
+              <option value="academic_year">按学年</option>
+              <option value="all">全部历史</option>
+            </select>
+            {historyMode === 'term' && (
+              <input
+                value={historyTerm}
+                onChange={(e) => setHistoryTerm(e.target.value)}
+                className="h-9 w-24 rounded-lg border border-gray-300 px-3 text-sm"
+                placeholder="2025-1"
+              />
+            )}
+            {historyMode === 'academic_year' && (
+              <input
+                value={historyAcademicYear}
+                onChange={(e) => setHistoryAcademicYear(e.target.value)}
+                className="h-9 w-32 rounded-lg border border-gray-300 px-3 text-sm"
+                placeholder="2025-2026"
+              />
+            )}
+            <select
+              value={selectedExam}
+              onChange={(e) => setSelectedExam(e.target.value)}
+              className="h-9 rounded-lg border border-gray-300 px-3 text-sm"
+            >
+              <option value="latest">最新：{examScores[0].exam_name}</option>
+              {examScores.map((exam) => (
+                <option key={exam.exam_id} value={exam.exam_id}>{exam.exam_name}</option>
+              ))}
+            </select>
+          </div>
         </div>
 
         <div className="mb-6 grid grid-cols-1 gap-4 md:grid-cols-3 xl:grid-cols-6">
@@ -636,6 +719,11 @@ const StudentScoreDetail = ({ studentId, onBack }) => {
               <span className="text-gray-600">班排：{maskRankValue(currentExam.total.class_rank, scoreVisibility.show_class_rank)}</span>
               <span className="mx-2">|</span>
               <span className="text-gray-600">年排：{maskRankValue(currentExam.total.grade_rank, scoreVisibility.show_grade_rank)}</span>
+            </div>
+            <div className="mt-1 text-xs text-gray-600">
+              <span>同层均分：{currentExam.total.layer_mean ?? '-'}</span>
+              <span className="mx-2">|</span>
+              <span>层排：{maskRankValue(currentExam.total.layer_rank, scoreVisibility.show_layer_rank)}</span>
             </div>
           </div>
 

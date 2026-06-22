@@ -289,12 +289,21 @@ export const computeComprehensive = ({
       const values = scopedValid
         .map(score => (score.scores && score.scores[subject] !== undefined ? Number(score.scores[subject]) : null))
         .filter(value => value !== null && Number.isFinite(value));
+      const allValues = tagged
+        .filter(score => score.is_valid !== false)
+        .map(score => (score.scores && score.scores[subject] !== undefined ? Number(score.scores[subject]) : null))
+        .filter(value => value !== null && Number.isFinite(value));
       const stats = calcBasicStats(values);
+      const allStats = calcBasicStats(allValues);
       const fullScore = fullScores[subject] || Number(exam?.subject_scores?.[subject] ?? 100) || 100;
       const passCount = values.filter(value => value >= fullScore * 0.6).length;
       const excellentCount = values.filter(value => value >= fullScore * 0.9).length;
       subjectStatistics[subject] = {
         ...stats,
+        range_mean: allStats.mean,
+        range_diff: stats.mean - allStats.mean,
+        same_layer_mean: stats.mean,
+        same_layer_diff: 0,
         pass_rate: values.length ? (passCount / values.length * 100) : 0,
         excellent_rate: values.length ? (excellentCount / values.length * 100) : 0
       };

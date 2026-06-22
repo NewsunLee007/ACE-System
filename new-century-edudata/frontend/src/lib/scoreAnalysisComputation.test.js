@@ -77,6 +77,8 @@ describe('scoreAnalysisComputation', () => {
     expect(result.scopes.all.key_metrics.subjects.科学.full_score).toBe(120);
     expect(result.scopes.all.subject_analysis.subject_statistics.科学.pass_rate).toBe(100);
     expect(result.scopes.all.subject_analysis.subject_statistics.科学.excellent_rate).toBe(25);
+    expect(result.scopes.A.subject_analysis.subject_statistics.语文.range_mean).toBe(78.75);
+    expect(result.scopes.A.subject_analysis.subject_statistics.语文.range_diff).toBeCloseTo(11.25);
 
     expect(result.scopes.A.summary.participated).toBe(2);
     expect(result.scopes.B.summary.grade_mean).toBe(176);
@@ -105,6 +107,8 @@ describe('scoreAnalysisComputation', () => {
       rank: 1,
       valid_subject_count: 2,
     });
+    expect(teachingScore.class_rows[0].range_mean_diff).toBeCloseTo(23.5);
+    expect(teachingScore.class_rows[0].same_layer_diff).toBe(0);
     expect(teachingScore.class_rows[0].subject_metrics.科学.reference_count).toBe(2);
     expect(teachingScore.summary.ranked_count).toBe(3);
   });

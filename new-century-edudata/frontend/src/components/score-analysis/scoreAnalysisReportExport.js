@@ -173,16 +173,17 @@ export const buildComprehensiveReportHtml = ({
       </tbody>
     </table>
 
-    <h2>学科统计（均分 / 标准差 / 前20%分数线）</h2>
+    <h2>学科统计（均分 / 与全段差 / 标准差 / 前20%分数线）</h2>
     <table>
       <thead>
-        <tr><th>学科</th><th>平均分</th><th>标准差</th><th>前20%分数线</th></tr>
+        <tr><th>学科</th><th>平均分</th><th>与全段差</th><th>标准差</th><th>前20%分数线</th></tr>
       </thead>
       <tbody>
         ${subjects.map(subject => `
           <tr>
             <td>${escapeHtml(subject)}</td>
             <td>${formatReportNumber(subjectStats?.[subject]?.mean)}</td>
+            <td>${formatReportNumber(subjectStats?.[subject]?.range_diff)}</td>
             <td>${formatReportNumber(subjectStats?.[subject]?.std)}</td>
             <td>${formatReportNumber(subjectKey?.[subject]?.top20_score)}</td>
           </tr>

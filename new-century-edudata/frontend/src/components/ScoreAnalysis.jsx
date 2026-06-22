@@ -715,11 +715,11 @@ const ScoreAnalysis = ({ currentUser: propUser }) => {
         ${row(['层次', '人数', '均分', '优秀率', '达标率'])}
         ${layerRows.map(([layer, stats]) => row([layer, stats.student_count, formatMetric(stats.mean), `${formatMetric(stats.excellent_rate)}%`, `${formatMetric(stats.pass_rate)}%`])).join('')}
         ${row([])}
-        ${row(['学科', '均分', '最高分', '最低分', '优秀率', '达标率'])}
-        ${subjectRows.map(([subject, stats]) => row([subject, formatMetric(stats.mean), formatMetric(stats.max), formatMetric(stats.min), `${formatMetric(stats.excellent_rate)}%`, `${formatMetric(stats.pass_rate)}%`])).join('')}
+        ${row(['学科', '均分', '与全段差', '最高分', '最低分', '优秀率', '达标率'])}
+        ${subjectRows.map(([subject, stats]) => row([subject, formatMetric(stats.mean), formatMetric(stats.range_diff), formatMetric(stats.max), formatMetric(stats.min), `${formatMetric(stats.excellent_rate)}%`, `${formatMetric(stats.pass_rate)}%`])).join('')}
         ${row([])}
-        ${row(['班级排名', '班级', '层次', '综合积分'])}
-        ${classRows.map(item => row([item.rank, item.class_name, item.layer_code || '-', formatMetric(item.comprehensive_score, 2)])).join('')}
+        ${row(['班级排名', '班级', '层次', '班级均分', '与全段差', '与同层次差', '综合积分'])}
+        ${classRows.map(item => row([item.rank, item.class_name, item.layer_code || '-', formatMetric(item.class_mean), formatMetric(item.range_mean_diff), formatMetric(item.same_layer_diff), formatMetric(item.comprehensive_score, 2)])).join('')}
       </table>
     `;
     const blob = new Blob([`\ufeff<html><head><meta charset="UTF-8" /></head><body>${table}</body></html>`], {

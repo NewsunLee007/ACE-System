@@ -46,6 +46,10 @@ from services.score_visibility_service import (
     filter_rank_fields_by_visibility,
     resolve_visibility_for_user,
 )
+from services.score_history_service import (
+    ScoreHistoryService,
+    class_code as normalize_history_class_code,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/score-analysis", tags=["成绩分析"])
@@ -100,6 +104,13 @@ RECIPIENT_TYPE_PERMISSION_CODES = {
     "grade_leader": ("grade_leader",),
     "head_teacher": ("headmaster",),
     "teacher": ("teacher", "headmaster", "lesson_leader", "subject_leader", "grade_leader"),
+}
+HISTORY_MANAGEMENT_PERMISSION_CODES = {
+    "sys_admin",
+    "edu_admin",
+    "exam_admin",
+    "principal",
+    "vice_principal",
 }
 
 
@@ -1034,12 +1045,19 @@ def analyze_class_contrast(scores_results, db) -> Dict[str, Any]:
     """班级对比分析"""
     # 按班级分组
     class_groups = {}
+    class_layers = {}
+    layer_groups = {}
     for result in scores_results:
         class_name = result.class_name
         if class_name not in class_groups:
             class_groups[class_name] = []
+        layer_code = getattr(result, "layer_code", None) or "C"
+        class_layers[class_name] = layer_code
+        if layer_code not in layer_groups:
+            layer_groups[layer_code] = []
         if result.total_score is not None:
             class_groups[class_name].append(result.total_score)
+            layer_groups[layer_code].append(result.total_score)
     
     # 计算各班统计
     class_stats = {}
@@ -1055,12 +1073,28 @@ def analyze_class_contrast(scores_results, db) -> Dict[str, Any]:
     else:
         grade_std = 1
     
-    # 计算各班Z值
+    layer_means = {
+        layer_code: (sum(scores) / len(scores) if scores else grade_mean)
+        for layer_code, scores in layer_groups.items()
+    }
+
+    # 计算各班Z值，以及全段/同层两个参照差值
     class_z_scores = {}
+    class_benchmarks = {}
     for class_name, scores in class_groups.items():
         if scores:
             class_mean = sum(scores) / len(scores)
+            layer_code = class_layers.get(class_name, "C")
+            same_layer_mean = layer_means.get(layer_code, grade_mean)
             class_z_scores[class_name] = (class_mean - grade_mean) / grade_std if grade_std > 0 else 0
+            class_benchmarks[class_name] = {
+                "layer_code": layer_code,
+                "class_mean": float(class_mean),
+                "range_mean": float(grade_mean),
+                "range_diff": float(class_mean - grade_mean),
+                "same_layer_mean": float(same_layer_mean),
+                "same_layer_diff": float(class_mean - same_layer_mean),
+            }
     
     # 排名
     class_ranking = sorted(class_z_scores.items(), key=lambda x: x[1], reverse=True)
@@ -1068,7 +1102,16 @@ def analyze_class_contrast(scores_results, db) -> Dict[str, Any]:
     return {
         "class_statistics": class_stats,
         "class_z_scores": class_z_scores,
-        "class_ranking": [{"class_name": name, "z_score": score} for name, score in class_ranking],
+        "class_benchmarks": class_benchmarks,
+        "layer_means": {key: float(value) for key, value in layer_means.items()},
+        "class_ranking": [
+            {
+                "class_name": name,
+                "z_score": score,
+                **class_benchmarks.get(name, {}),
+            }
+            for name, score in class_ranking
+        ],
         "grade_mean": float(grade_mean),
         "grade_std": float(grade_std)
     }
@@ -1392,6 +1435,15 @@ def _build_result_bundle_data(exam: Any, scores_results: List[Any], db: Session)
     except Exception as exc:
         progress_data = {"message": f"历史数据暂不可用：{exc}"}
 
+    try:
+        history_index = ScoreHistoryService(db).build_grade_history(
+            exam.grade_level,
+            mode="recent",
+            limit=6,
+        )
+    except Exception as exc:
+        history_index = {"message": f"多考试历史索引暂不可用：{exc}"}
+
     return {
         "exam": {
             "id": exam.id,
@@ -1409,6 +1461,7 @@ def _build_result_bundle_data(exam: Any, scores_results: List[Any], db: Session)
             "class_contrast": analyze_class_contrast(scores_results, db),
             "student_progress": progress_data,
         },
+        "history_index": history_index,
         "generated_at": datetime.now().isoformat(),
     }
 
@@ -1653,6 +1706,259 @@ def export_analysis_bundle(
     except Exception as exc:
         logger.error(f"导出成绩分析结果包失败: {exc}")
         raise HTTPException(status_code=500, detail="导出成绩分析结果包失败")
+
+
+# ============ 多考试纵向分析API ============
+
+def _is_history_manager(current_user: Dict[str, Any]) -> bool:
+    return has_permission_code(current_user, HISTORY_MANAGEMENT_PERMISSION_CODES)
+
+
+def _filter_history_payload(payload: Dict[str, Any], current_user: Dict[str, Any], db: Session) -> Dict[str, Any]:
+    settings = fetch_score_visibility_settings(db)
+    visibility = resolve_visibility_for_user(current_user, settings)
+    filtered = filter_rank_fields_by_visibility(payload, visibility)
+    if isinstance(filtered, dict):
+        filtered["visibility"] = visibility
+    return filtered
+
+
+def _fetch_student_scope(db: Session, student_id: int) -> Optional[Any]:
+    return db.execute(text("""
+        SELECT id, name, class_name, class_id, grade_level
+        FROM biz_students
+        WHERE id = :student_id
+    """), {"student_id": student_id}).fetchone()
+
+
+def _student_grade(student: Any) -> str:
+    if not student:
+        return ""
+    if student.grade_level:
+        return student.grade_level
+    class_text = str(student.class_name or student.class_id or "")
+    return f"{class_text[0]}年级" if class_text[:1].isdigit() else ""
+
+
+def _has_parent_student_scope(current_user: Dict[str, Any], student_id: int, db: Session) -> bool:
+    if current_user.get("permission_code") != "parent":
+        return False
+    row = db.execute(text("""
+        SELECT 1
+        FROM biz_parent_student_rel
+        WHERE parent_user_id = :parent_user_id
+          AND student_id = :student_id
+          AND is_active = 1
+        LIMIT 1
+    """), {
+        "parent_user_id": current_user.get("id"),
+        "student_id": student_id,
+    }).fetchone()
+    return row is not None
+
+
+def _has_teacher_class_scope(current_user: Dict[str, Any], class_name: str, db: Session, subject: Optional[str] = None) -> bool:
+    if current_user.get("permission_code") not in {"headmaster", "teacher", "lesson_leader", "subject_leader", "grade_leader"}:
+        return False
+    params: Dict[str, Any] = {
+        "teacher_id": current_user.get("id"),
+        "class_name": normalize_history_class_code(class_name),
+    }
+    subject_clause = ""
+    if subject:
+        params["subject_name"] = subject
+        subject_clause = """
+          AND (
+            is_headmaster = 1
+            OR subject_name = :subject_name
+          )
+        """
+    row = db.execute(text(f"""
+        SELECT 1
+        FROM biz_teacher_class_rel
+        WHERE teacher_id = :teacher_id
+          AND class_name = :class_name
+          {subject_clause}
+        LIMIT 1
+    """), params).fetchone()
+    return row is not None
+
+
+def _ensure_can_view_student_history(current_user: Dict[str, Any], student_id: int, db: Session) -> Any:
+    student = _fetch_student_scope(db, student_id)
+    if not student:
+        raise HTTPException(status_code=404, detail="学生不存在")
+
+    if _is_history_manager(current_user):
+        return student
+
+    grade_level = _student_grade(student)
+    if current_user.get("permission_code") == "grade_leader" and grade_level in get_accessible_grades(current_user, db):
+        return student
+
+    class_name = normalize_history_class_code(student.class_name or student.class_id)
+    if _has_teacher_class_scope(current_user, class_name, db):
+        return student
+
+    if _has_parent_student_scope(current_user, student_id, db):
+        return student
+
+    raise HTTPException(status_code=403, detail="权限不足，无法查看该学生历史成绩")
+
+
+def _ensure_can_view_grade_history(current_user: Dict[str, Any], grade_level: str, db: Session) -> None:
+    if _is_history_manager(current_user):
+        return
+    if grade_level in get_accessible_grades(current_user, db):
+        return
+    raise HTTPException(status_code=403, detail="权限不足，无法查看该年级历史成绩")
+
+
+def _ensure_can_view_class_history(current_user: Dict[str, Any], class_name: str, db: Session) -> None:
+    grade_level = f"{normalize_history_class_code(class_name)[0]}年级" if normalize_history_class_code(class_name)[:1].isdigit() else ""
+    if _is_history_manager(current_user):
+        return
+    if current_user.get("permission_code") == "grade_leader" and grade_level in get_accessible_grades(current_user, db):
+        return
+    if _has_teacher_class_scope(current_user, class_name, db):
+        return
+    raise HTTPException(status_code=403, detail="权限不足，无法查看该班级历史成绩")
+
+
+@router.get("/history/students/{student_id}")
+def get_student_score_history(
+    student_id: int,
+    mode: str = Query("recent", regex="^(recent|term|academic_year|all)$"),
+    term: Optional[str] = Query(None),
+    academic_year: Optional[str] = Query(None),
+    limit: int = Query(6, ge=1, le=12),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """获取学生多考试历史趋势，默认最近6场。"""
+    _ensure_can_view_student_history(current_user, student_id, db)
+    payload = ScoreHistoryService(db).build_student_history(
+        student_id,
+        mode=mode,
+        term=term,
+        academic_year=academic_year,
+        limit=limit,
+    )
+    return _filter_history_payload(payload, current_user, db)
+
+
+@router.get("/history/grades/{grade_level}")
+def get_grade_score_history(
+    grade_level: str,
+    mode: str = Query("recent", regex="^(recent|term|academic_year|all)$"),
+    term: Optional[str] = Query(None),
+    academic_year: Optional[str] = Query(None),
+    limit: int = Query(6, ge=1, le=12),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """获取年段多考试历史趋势。"""
+    _ensure_can_view_grade_history(current_user, grade_level, db)
+    payload = ScoreHistoryService(db).build_grade_history(
+        grade_level,
+        mode=mode,
+        term=term,
+        academic_year=academic_year,
+        limit=limit,
+    )
+    return _filter_history_payload(payload, current_user, db)
+
+
+@router.get("/history/classes/{class_name}")
+def get_class_score_history(
+    class_name: str,
+    mode: str = Query("recent", regex="^(recent|term|academic_year|all)$"),
+    term: Optional[str] = Query(None),
+    academic_year: Optional[str] = Query(None),
+    limit: int = Query(6, ge=1, le=12),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """获取班级多考试历史趋势。"""
+    _ensure_can_view_class_history(current_user, class_name, db)
+    payload = ScoreHistoryService(db).build_class_history(
+        class_name,
+        mode=mode,
+        term=term,
+        academic_year=academic_year,
+        limit=limit,
+    )
+    return _filter_history_payload(payload, current_user, db)
+
+
+@router.get("/history/subjects/{subject}")
+def get_subject_score_history(
+    subject: str,
+    grade_level: str = Query(...),
+    mode: str = Query("recent", regex="^(recent|term|academic_year|all)$"),
+    term: Optional[str] = Query(None),
+    academic_year: Optional[str] = Query(None),
+    limit: int = Query(6, ge=1, le=12),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """获取学科多考试历史趋势。"""
+    _ensure_can_view_grade_history(current_user, grade_level, db)
+    payload = ScoreHistoryService(db).build_subject_history(
+        grade_level,
+        subject,
+        mode=mode,
+        term=term,
+        academic_year=academic_year,
+        limit=limit,
+    )
+    return _filter_history_payload(payload, current_user, db)
+
+
+@router.get("/history/teachers/{teacher_id}")
+def get_teacher_score_history(
+    teacher_id: int,
+    mode: str = Query("recent", regex="^(recent|term|academic_year|all)$"),
+    term: Optional[str] = Query(None),
+    academic_year: Optional[str] = Query(None),
+    limit: int = Query(6, ge=1, le=12),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """获取教师任教范围的多考试诊断趋势，不做公开排名。"""
+    if not _is_history_manager(current_user) and int(current_user.get("id") or 0) != int(teacher_id):
+        raise HTTPException(status_code=403, detail="权限不足，无法查看该教师历史成绩")
+    payload = ScoreHistoryService(db).build_teacher_history(
+        teacher_id,
+        mode=mode,
+        term=term,
+        academic_year=academic_year,
+        limit=limit,
+    )
+    return _filter_history_payload(payload, current_user, db)
+
+
+@router.get("/history/teacher-scope")
+def get_current_teacher_score_history(
+    mode: str = Query("recent", regex="^(recent|term|academic_year|all)$"),
+    term: Optional[str] = Query(None),
+    academic_year: Optional[str] = Query(None),
+    limit: int = Query(6, ge=1, le=12),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """获取当前登录教师自己的任教范围趋势。"""
+    teacher_id = int(current_user.get("id") or 0)
+    if teacher_id <= 0:
+        raise HTTPException(status_code=403, detail="无法识别当前教师")
+    payload = ScoreHistoryService(db).build_teacher_history(
+        teacher_id,
+        mode=mode,
+        term=term,
+        academic_year=academic_year,
+        limit=limit,
+    )
+    return _filter_history_payload(payload, current_user, db)
 
 
 # ============ 分析结果查询API ============

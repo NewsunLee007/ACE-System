@@ -129,11 +129,13 @@ export default function ScoreAnalysisResultCenter({
 
   const layerRows = ['A', 'B', 'C'].map(layer => {
     const stats = layerStats[layer] || {};
+    const allMean = Number(analysisResult?.scopes?.all?.summary?.grade_mean || 0);
     return {
       layer,
       label: layerMeta[layer].label,
       student_count: stats.student_count || 0,
       mean: stats.mean || 0,
+      range_diff: Number(stats.mean || 0) - allMean,
       pass_rate: stats.pass_rate || 0,
       excellent_rate: stats.excellent_rate || 0,
     };
@@ -347,7 +349,7 @@ export default function ScoreAnalysisResultCenter({
     <div className="overflow-hidden rounded-lg border border-slate-200 bg-white">
       <div className="border-b border-slate-200 bg-slate-50 px-4 py-3">
         <h3 className="font-semibold text-slate-950">层次汇总</h3>
-        <p className="mt-1 text-xs text-slate-500">A/B/C层以同一口径查看人数、均分、优秀率和达标率。</p>
+        <p className="mt-1 text-xs text-slate-500">A/B/C层同时保留全段参照，避免把层内结果和全段结果混在一起。</p>
       </div>
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
@@ -356,6 +358,7 @@ export default function ScoreAnalysisResultCenter({
               <th className="px-4 py-3 text-left">层次</th>
               <th className="px-4 py-3 text-center">人数</th>
               <th className="px-4 py-3 text-center">均分</th>
+              <th className="px-4 py-3 text-center">与全段差</th>
               <th className="px-4 py-3 text-center">优秀率</th>
               <th className="px-4 py-3 text-center">达标率</th>
             </tr>
@@ -366,6 +369,7 @@ export default function ScoreAnalysisResultCenter({
                 <td className="px-4 py-3 font-medium text-slate-900">{row.label}</td>
                 <td className="px-4 py-3 text-center">{row.student_count}</td>
                 <td className="px-4 py-3 text-center font-semibold text-blue-700">{fmt(row.mean)}</td>
+                <td className={cx('px-4 py-3 text-center font-semibold', diffTone(row.range_diff))}>{signed(row.range_diff)}</td>
                 <td className="px-4 py-3 text-center">{pct(row.excellent_rate)}</td>
                 <td className="px-4 py-3 text-center">{pct(row.pass_rate)}</td>
               </tr>
@@ -380,7 +384,7 @@ export default function ScoreAnalysisResultCenter({
     <div className="overflow-hidden rounded-lg border border-slate-200 bg-white">
       <div className="border-b border-slate-200 bg-slate-50 px-4 py-3">
         <h3 className="font-semibold text-slate-950">学科质量</h3>
-        <p className="mt-1 text-xs text-slate-500">按达标率从低到高排序，便于先看薄弱学科。</p>
+        <p className="mt-1 text-xs text-slate-500">按达标率从低到高排序，并显示当前范围与全段均分差。</p>
       </div>
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
@@ -388,6 +392,7 @@ export default function ScoreAnalysisResultCenter({
             <tr>
               <th className="px-4 py-3 text-left">学科</th>
               <th className="px-4 py-3 text-center">均分</th>
+              <th className="px-4 py-3 text-center">与全段差</th>
               <th className="px-4 py-3 text-center">最高分</th>
               <th className="px-4 py-3 text-center">最低分</th>
               <th className="px-4 py-3 text-center">优秀率</th>
@@ -399,6 +404,7 @@ export default function ScoreAnalysisResultCenter({
               <tr key={row.subject} className="hover:bg-slate-50">
                 <td className="px-4 py-3 font-medium text-slate-900">{row.subject}</td>
                 <td className="px-4 py-3 text-center font-semibold text-blue-700">{fmt(row.mean)}</td>
+                <td className={cx('px-4 py-3 text-center font-semibold', diffTone(row.range_diff))}>{signed(row.range_diff)}</td>
                 <td className="px-4 py-3 text-center">{fmt(row.max)}</td>
                 <td className="px-4 py-3 text-center">{fmt(row.min)}</td>
                 <td className="px-4 py-3 text-center">{pct(row.excellent_rate)}</td>
@@ -409,7 +415,7 @@ export default function ScoreAnalysisResultCenter({
             ))}
             {subjectRows.length === 0 && (
               <tr>
-                <td colSpan={6} className="px-4 py-8 text-center text-slate-500">暂无学科统计</td>
+                <td colSpan={7} className="px-4 py-8 text-center text-slate-500">暂无学科统计</td>
               </tr>
             )}
           </tbody>
@@ -422,7 +428,7 @@ export default function ScoreAnalysisResultCenter({
     <div className="overflow-hidden rounded-lg border border-slate-200 bg-white">
       <div className="border-b border-slate-200 bg-slate-50 px-4 py-3">
         <h3 className="font-semibold text-slate-950">班级质量排序</h3>
-        <p className="mt-1 text-xs text-slate-500">当前范围内按教学积分排序，先展示前12个班级。</p>
+        <p className="mt-1 text-xs text-slate-500">同时展示与全段差、与同层次差；分层班级优先看同层参照。</p>
       </div>
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
@@ -432,6 +438,7 @@ export default function ScoreAnalysisResultCenter({
               <th className="px-4 py-3 text-left">班级</th>
               <th className="px-4 py-3 text-center">层次</th>
               <th className="px-4 py-3 text-center">班级均分</th>
+              <th className="px-4 py-3 text-center">与全段差</th>
               <th className="px-4 py-3 text-center">与同层次差</th>
               <th className="px-4 py-3 text-center">参考学科</th>
               <th className="px-4 py-3 text-center">综合积分</th>
@@ -444,6 +451,9 @@ export default function ScoreAnalysisResultCenter({
                 <td className="px-4 py-3 font-medium text-slate-900">{row.class_name}</td>
                 <td className="px-4 py-3 text-center">{row.layer_code || '-'}</td>
                 <td className="px-4 py-3 text-center">{fmt(row.class_mean)}</td>
+                <td className={cx('px-4 py-3 text-center font-semibold', diffTone(row.range_mean_diff))}>
+                  {signed(row.range_mean_diff)}
+                </td>
                 <td className={cx('px-4 py-3 text-center font-semibold', diffTone(row.same_layer_diff))}>
                   {signed(row.same_layer_diff)}
                 </td>
@@ -453,7 +463,7 @@ export default function ScoreAnalysisResultCenter({
             ))}
             {classRows.length === 0 && (
               <tr>
-                <td colSpan={7} className="px-4 py-8 text-center text-slate-500">暂无班级统计</td>
+                <td colSpan={8} className="px-4 py-8 text-center text-slate-500">暂无班级统计</td>
               </tr>
             )}
           </tbody>

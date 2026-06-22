@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import subprocess
 from pathlib import Path
@@ -33,6 +34,16 @@ DEFAULT_TERM = "2025-1"
 DEFAULT_ACADEMIC_YEAR = "2025-2026"
 BCRYPT_MAX_PASSWORD_BYTES = 72
 DEFAULT_SEED_PASSWORD = "NewCentury2025!"
+HISTORY_EXAM_SCHEDULE = [
+    ("2024-1", "期中考试", "2024-11-08"),
+    ("2024-1", "期末考试", "2025-01-18"),
+    ("2024-2", "期中考试", "2025-04-18"),
+    ("2024-2", "期末考试", "2025-07-02"),
+    ("2025-1", "期中考试", "2025-11-07"),
+    ("2025-1", "期末考试", "2026-01-20"),
+    ("2025-2", "期中考试", "2026-04-17"),
+    ("2025-2", "期末考试", "2026-06-26"),
+]
 VALID_STUDENT_STATUSES = {"在籍", "在读", "借读", "休学", "转学", "退学", "请长假", "毕业", "待核验"}
 STUDENT_STATUS_ALIASES = {
     "active": "在籍",
@@ -126,6 +137,108 @@ def class_layer_lookup(data: dict) -> dict[str, dict]:
         class_code(layer.get("class_name") or layer.get("class_id")): layer
         for layer in data.get("classLayers") or []
     }
+
+
+def _stable_random(*parts) -> random.Random:
+    seed = "|".join(str(part) for part in parts)
+    return random.Random(seed)
+
+
+def _clip_score(value: float, low: float = 28.0, high: float = 99.0) -> float:
+    return round(max(low, min(high, value)) * 2) / 2
+
+
+def _student_grade(student: dict) -> str:
+    return student.get("grade_level") or grade_from_class_id(student.get("class_id"))
+
+
+def _layer_code_for_student(student: dict, layers_by_class: dict[str, dict]) -> str:
+    layer = layers_by_class.get(class_code(student.get("class_id")), {})
+    return str(layer.get("layer_code") or "C").upper()
+
+
+def _subject_score_for_student(student: dict, subject: str, exam_index: int, layer_code: str) -> float:
+    rng = _stable_random("history-score", student.get("id"), subject, exam_index)
+    layer_bonus = {"A": 12, "B": 6, "C": 0}.get(layer_code, 0)
+    subject_bias = {
+        "语文": 1.5,
+        "数学": 0.0,
+        "英语": -1.0,
+        "科学": 1.0,
+        "社会": -2.0,
+    }.get(subject, 0)
+    student_anchor = rng.uniform(-13, 13)
+    progress = (exam_index - 3.5) * rng.uniform(0.2, 1.3)
+    wave = rng.uniform(-6.5, 6.5)
+    class_factor = (int(student.get("class_id") or 0) % 10 - 4) * 0.7
+    return _clip_score(66 + layer_bonus + subject_bias + student_anchor + progress + wave + class_factor)
+
+
+def expand_historical_exam_data(data: dict) -> dict:
+    """Add deterministic multi-term exams for longitudinal verification."""
+    subjects = data.get("subjects") or ["语文", "数学", "英语", "科学", "社会"]
+    existing_exam_ids = {int(exam["id"]) for exam in data.get("exams") or []}
+    existing_score_keys = {
+        (int(score["exam_id"]), int(score["student_id"]))
+        for score in data.get("examScores") or []
+        if score.get("exam_id") and score.get("student_id")
+    }
+    layers_by_class = class_layer_lookup(data)
+
+    generated_exams = []
+    generated_scores = []
+    for grade_number in (7, 8, 9):
+        grade_level = f"{grade_number}年级"
+        grade_students = [
+            student for student in data.get("students") or []
+            if _student_grade(student) == grade_level
+        ]
+        if not grade_students:
+            continue
+
+        for index, (term, exam_label, exam_date) in enumerate(HISTORY_EXAM_SCHEDULE, start=1):
+            exam_id = grade_number * 1000 + index
+            if exam_id not in existing_exam_ids:
+                generated_exams.append({
+                    "id": exam_id,
+                    "exam_name": f"{term} {grade_level}{exam_label}",
+                    "term": term,
+                    "exam_type": "统测",
+                    "grade_level": grade_level,
+                    "exam_date": exam_date,
+                    "subjects": subjects,
+                    "full_score": len(subjects) * 100,
+                    "created_at": exam_date,
+                })
+
+            for student in grade_students:
+                student_id = int(student["id"])
+                if (exam_id, student_id) in existing_score_keys:
+                    continue
+                layer_code = _layer_code_for_student(student, layers_by_class)
+                scores = {
+                    subject: _subject_score_for_student(student, subject, index, layer_code)
+                    for subject in subjects
+                }
+                total_score = round(sum(scores.values()), 1)
+                generated_scores.append({
+                    "id": f"{exam_id}_{student_id}",
+                    "exam_id": exam_id,
+                    "student_id": student_id,
+                    "student_code": student.get("student_code") or student.get("code") or "",
+                    "student_name": student.get("name") or student.get("student_name") or "",
+                    "class_id": student.get("class_id"),
+                    "scores": scores,
+                    "total_score": total_score,
+                    "is_valid": True,
+                    "additional_classes": [],
+                    "created_at": exam_date,
+                    "updated_at": exam_date,
+                })
+
+    data["exams"] = [*(data.get("exams") or []), *generated_exams]
+    data["examScores"] = [*(data.get("examScores") or []), *generated_scores]
+    return data
 
 
 def normalize_student_status(value) -> str:
@@ -646,7 +759,7 @@ def main() -> None:
 
     default_password = normalize_seed_password(os.getenv("SEED_DEFAULT_PASSWORD"))
 
-    data = load_demo_data()
+    data = expand_historical_exam_data(load_demo_data())
     if args.dry_run:
         parent = next((item for item in data["parents"] if item.get("phone")), None)
         print(

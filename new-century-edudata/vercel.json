@@ -1,42 +1,37 @@
 {
   "version": 2,
-  "builds": [
-    {
-      "src": "backend/main.py",
-      "use": "@vercel/python"
-    },
-    {
-      "src": "frontend/package.json",
-      "use": "@vercel/static-build",
-      "config": {
-        "distDir": "build"
-      }
+  "installCommand": "cd frontend && npm ci",
+  "buildCommand": "cd frontend && npm run build",
+  "outputDirectory": "frontend/build",
+  "functions": {
+    "api/index.py": {
+      "includeFiles": "backend/**"
     }
-  ],
-  "routes": [
+  },
+  "rewrites": [
     {
-      "src": "/health",
-      "dest": "backend/main.py"
+      "source": "/health",
+      "destination": "/api/index.py"
     },
     {
-      "src": "/ready",
-      "dest": "backend/main.py"
+      "source": "/ready",
+      "destination": "/api/index.py"
     },
     {
-      "src": "/api/docs",
-      "dest": "backend/main.py"
+      "source": "/api/docs",
+      "destination": "/api/index.py"
     },
     {
-      "src": "/api/redoc",
-      "dest": "backend/main.py"
+      "source": "/api/redoc",
+      "destination": "/api/index.py"
     },
     {
-      "src": "/api/(.*)",
-      "dest": "backend/main.py"
+      "source": "/api/(.*)",
+      "destination": "/api/index.py"
     },
     {
-      "src": "/(.*)",
-      "dest": "frontend/build/index.html"
+      "source": "/(.*)",
+      "destination": "/index.html"
     }
   ]
 }

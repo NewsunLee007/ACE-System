@@ -1,43 +1,33 @@
 {
   "version": 2,
+  "installCommand": "cd new-century-edudata/frontend && npm ci",
+  "buildCommand": "cd new-century-edudata/frontend && npm run build",
+  "outputDirectory": "new-century-edudata/frontend/build",
   "functions": {
     "api/index.py": {
       "includeFiles": "new-century-edudata/backend/**"
     }
   },
-  "builds": [
+  "rewrites": [
     {
-      "src": "api/index.py",
-      "use": "@vercel/python"
+      "source": "/health",
+      "destination": "/api/index.py"
     },
     {
-      "src": "new-century-edudata/frontend/package.json",
-      "use": "@vercel/static-build",
-      "config": {
-        "distDir": "build"
-      }
-    }
-  ],
-  "routes": [
-    {
-      "src": "/health",
-      "dest": "api/index.py"
+      "source": "/api/docs",
+      "destination": "/api/index.py"
     },
     {
-      "src": "/api/docs",
-      "dest": "api/index.py"
+      "source": "/api/redoc",
+      "destination": "/api/index.py"
     },
     {
-      "src": "/api/redoc",
-      "dest": "api/index.py"
+      "source": "/api/(.*)",
+      "destination": "/api/index.py"
     },
     {
-      "src": "/api/(.*)",
-      "dest": "api/index.py"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "new-century-edudata/frontend/build/index.html"
+      "source": "/(.*)",
+      "destination": "/index.html"
     }
   ]
 }

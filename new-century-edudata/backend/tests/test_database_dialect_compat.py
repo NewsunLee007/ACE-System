@@ -5,7 +5,7 @@ from routers.parent_management_api import (
     upsert_parent_profile,
     upsert_parent_student_binding,
 )
-from routers.exam_management_api import _exam_response_from_row, _parse_subjects
+from routers.exam_management_api import _ensure_exam_table_columns, _exam_response_from_row, _parse_subjects
 from routers.score_analysis_api import _fetch_bundle_scores, _store_result_bundle
 from services.score_visibility_service import save_score_visibility_settings
 
@@ -139,3 +139,14 @@ def test_exam_response_handles_postgres_subject_and_date_shapes():
     assert exam.subjects == ["语文", "数学", "英语"]
     assert exam.exam_date == "2026-02-21"
     assert exam.created_at == "2026-02-25 00:00:00"
+
+
+def test_exam_table_migration_adds_missing_postgres_columns():
+    db = FakeDB("postgresql")
+
+    _ensure_exam_table_columns(db)
+
+    sql = joined_sql(db)
+    assert "ALTER TABLE biz_exams ADD COLUMN IF NOT EXISTS description TEXT" in sql
+    assert "ALTER TABLE biz_exams ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP" in sql
+    assert ("COMMIT", {}) in db.calls

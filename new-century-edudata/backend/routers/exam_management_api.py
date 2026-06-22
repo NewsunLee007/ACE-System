@@ -12,7 +12,7 @@ from datetime import date
 import json
 import logging
 
-from core.database import get_db
+from core.database import get_db, is_postgresql
 from core.security import get_current_user, require_permission
 
 logger = logging.getLogger(__name__)
@@ -73,6 +73,15 @@ def _exam_response_from_row(row) -> "ExamResponse":
         description=row.description,
         created_at=_format_date(row.created_at)
     )
+
+
+def _ensure_exam_table_columns(db: Session) -> None:
+    if not is_postgresql(db):
+        return
+
+    db.execute(text("ALTER TABLE biz_exams ADD COLUMN IF NOT EXISTS description TEXT"))
+    db.execute(text("ALTER TABLE biz_exams ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"))
+    db.commit()
 
 
 # ============ Pydantic模型定义 ============
@@ -154,6 +163,8 @@ def create_exam(
     需要考务管理员或教务主任权限
     """
     try:
+        _ensure_exam_table_columns(db)
+
         # 检查同学期同类型考试是否已存在
         check_sql = """
             SELECT id FROM biz_exams 
@@ -225,6 +236,8 @@ def get_exam_list(
     获取考试列表
     """
     try:
+        _ensure_exam_table_columns(db)
+
         offset = (page - 1) * page_size
         
         # 构建查询条件
@@ -288,6 +301,8 @@ def get_exam_detail(
     获取考试详情
     """
     try:
+        _ensure_exam_table_columns(db)
+
         # 查询考试基本信息
         exam_sql = """
             SELECT id, exam_name, term, exam_type, grade_level, exam_date, 
@@ -349,6 +364,8 @@ def update_exam(
     需要考务管理员或教务主任权限
     """
     try:
+        _ensure_exam_table_columns(db)
+
         # 检查考试是否存在
         check_sql = "SELECT id FROM biz_exams WHERE id = :exam_id"
         existing = db.execute(text(check_sql), {"exam_id": exam_id}).fetchone()

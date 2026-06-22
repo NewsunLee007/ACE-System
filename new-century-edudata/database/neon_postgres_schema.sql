@@ -180,9 +180,13 @@ CREATE TABLE IF NOT EXISTS biz_exams (
   exam_date DATE,
   subjects TEXT,
   full_score DECIMAL(6,1) DEFAULT 500.0,
+  description TEXT,
   created_by BIGINT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+ALTER TABLE biz_exams ADD COLUMN IF NOT EXISTS description TEXT;
+ALTER TABLE biz_exams ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 CREATE INDEX IF NOT EXISTS idx_exam_term_grade ON biz_exams (term, grade_level);
 CREATE INDEX IF NOT EXISTS idx_exam_date ON biz_exams (exam_date);
 

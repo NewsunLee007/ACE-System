@@ -1,0 +1,38 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "new-century-edudata/backend/main.py",
+      "use": "@vercel/python"
+    },
+    {
+      "src": "new-century-edudata/frontend/package.json",
+      "use": "@vercel/static-build",
+      "config": {
+        "distDir": "build"
+      }
+    }
+  ],
+  "routes": [
+    {
+      "src": "/health",
+      "dest": "new-century-edudata/backend/main.py"
+    },
+    {
+      "src": "/api/docs",
+      "dest": "new-century-edudata/backend/main.py"
+    },
+    {
+      "src": "/api/redoc",
+      "dest": "new-century-edudata/backend/main.py"
+    },
+    {
+      "src": "/api/(.*)",
+      "dest": "new-century-edudata/backend/main.py"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "new-century-edudata/frontend/build/index.html"
+    }
+  ]
+}

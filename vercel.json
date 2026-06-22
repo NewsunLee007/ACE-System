@@ -5,7 +5,12 @@
   "outputDirectory": "new-century-edudata/frontend/build",
   "functions": {
     "api/index.py": {
-      "includeFiles": "new-century-edudata/backend/**"
+      "includeFiles": [
+        "new-century-edudata/backend/**",
+        "new-century-edudata/database/neon_postgres_schema.sql",
+        "new-century-edudata/frontend/src/data/demoSchoolData.js",
+        "new-century-edudata/scripts/seed_neon_demo_data.py"
+      ]
     }
   },
   "rewrites": [

@@ -216,11 +216,11 @@ def bootstrap_seed(x_bootstrap_token: str | None = Header(default=None)):
     if not _valid_bootstrap_token(x_bootstrap_token):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
 
-    seed_module = _load_seed_module()
-    data = seed_module.load_demo_data()
-    default_password = os.getenv("SEED_DEFAULT_PASSWORD", "NewCentury2025!")
-    conn = seed_module.psycopg2.connect(seed_module.normalize_database_url(DATABASE_URL))
     try:
+        seed_module = _load_seed_module()
+        data = seed_module.load_demo_data()
+        default_password = os.getenv("SEED_DEFAULT_PASSWORD", "NewCentury2025!")
+        conn = seed_module.psycopg2.connect(seed_module.normalize_database_url(DATABASE_URL))
         seed_module.execute_schema(conn)
         with conn.cursor() as cur:
             role_ids = seed_module.fetch_role_ids(cur)
@@ -235,11 +235,20 @@ def bootstrap_seed(x_bootstrap_token: str | None = Header(default=None)):
             seed_module.seed_user_layer_permissions(cur, data)
             seed_module.seed_exams_scores_and_layers(cur, data)
         conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+    except Exception as exc:
+        if "conn" in locals():
+            conn.rollback()
+        logger.exception("Bootstrap seed failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error_type": exc.__class__.__name__,
+                "message": str(exc)[:1000],
+            },
+        ) from exc
     finally:
-        conn.close()
+        if "conn" in locals():
+            conn.close()
 
     return {
         "status": "seeded",

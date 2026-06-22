@@ -178,7 +178,7 @@ CREATE TABLE IF NOT EXISTS biz_exams (
   exam_type VARCHAR(20),
   grade_level VARCHAR(20),
   exam_date DATE,
-  subjects JSONB,
+  subjects TEXT,
   full_score DECIMAL(6,1) DEFAULT 500.0,
   created_by BIGINT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -209,14 +209,33 @@ CREATE INDEX IF NOT EXISTS idx_score_included ON biz_scores (is_included);
 
 CREATE TABLE IF NOT EXISTS biz_class_layers (
   id BIGSERIAL PRIMARY KEY,
-  exam_id BIGINT NOT NULL REFERENCES biz_exams(id) ON DELETE CASCADE,
+  exam_id BIGINT REFERENCES biz_exams(id) ON DELETE CASCADE,
+  grade_level VARCHAR(20),
+  class_id BIGINT,
+  class_name VARCHAR(20),
+  layer_code VARCHAR(10),
   layer_name VARCHAR(50) NOT NULL,
+  academic_year VARCHAR(20),
+  term VARCHAR(10),
   description VARCHAR(255),
   created_by BIGINT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  CONSTRAINT uk_exam_layer UNIQUE (exam_id, layer_name)
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uk_exam_layer UNIQUE (exam_id, layer_name),
+  CONSTRAINT uk_grade_class_term UNIQUE (grade_level, class_id, academic_year, term)
 );
 CREATE INDEX IF NOT EXISTS idx_class_layers_exam ON biz_class_layers (exam_id);
+CREATE INDEX IF NOT EXISTS idx_class_layers_grade_layer ON biz_class_layers (grade_level, layer_code);
+CREATE INDEX IF NOT EXISTS idx_class_layers_class_name ON biz_class_layers (class_name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_class_layers_grade_class_term ON biz_class_layers (grade_level, class_id, academic_year, term);
+ALTER TABLE biz_class_layers ALTER COLUMN exam_id DROP NOT NULL;
+ALTER TABLE biz_class_layers ADD COLUMN IF NOT EXISTS grade_level VARCHAR(20);
+ALTER TABLE biz_class_layers ADD COLUMN IF NOT EXISTS class_id BIGINT;
+ALTER TABLE biz_class_layers ADD COLUMN IF NOT EXISTS class_name VARCHAR(20);
+ALTER TABLE biz_class_layers ADD COLUMN IF NOT EXISTS layer_code VARCHAR(10);
+ALTER TABLE biz_class_layers ADD COLUMN IF NOT EXISTS academic_year VARCHAR(20);
+ALTER TABLE biz_class_layers ADD COLUMN IF NOT EXISTS term VARCHAR(10);
+ALTER TABLE biz_class_layers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 
 CREATE TABLE IF NOT EXISTS biz_class_layer_details (
   id BIGSERIAL PRIMARY KEY,
@@ -281,7 +300,7 @@ CREATE TABLE IF NOT EXISTS biz_layered_statistics (
   excellent_rate DECIMAL(5,2),
   fail_count INT,
   fail_rate DECIMAL(5,2),
-  score_distribution JSONB,
+  score_distribution TEXT,
   calculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT uk_exam_layer_subject UNIQUE (exam_id, layer_code, subject_name)
 );
@@ -327,7 +346,7 @@ CREATE TABLE IF NOT EXISTS biz_score_analysis (
   grade_level VARCHAR(20) NOT NULL,
   analysis_type VARCHAR(50) NOT NULL,
   analysis_scope VARCHAR(50) NOT NULL,
-  analysis_data JSONB NOT NULL,
+  analysis_data TEXT NOT NULL,
   created_by BIGINT NOT NULL,
   created_by_name VARCHAR(50),
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -345,7 +364,7 @@ CREATE TABLE IF NOT EXISTS biz_analysis_logs (
   action_by BIGINT NOT NULL,
   action_by_name VARCHAR(50),
   action_by_role VARCHAR(50),
-  action_detail JSONB,
+  action_detail TEXT,
   ip_address VARCHAR(50),
   user_agent VARCHAR(255),
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -378,6 +397,190 @@ CREATE TABLE IF NOT EXISTS sys_score_visibility_settings (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS biz_analysis_publications (
+  id BIGSERIAL PRIMARY KEY,
+  publication_id VARCHAR(50) NOT NULL UNIQUE,
+  analysis_id VARCHAR(50) NOT NULL,
+  exam_id BIGINT NOT NULL REFERENCES biz_exams(id) ON DELETE CASCADE,
+  exam_name VARCHAR(100) NOT NULL,
+  grade_level VARCHAR(20) NOT NULL,
+  title VARCHAR(200) NOT NULL,
+  content_summary TEXT,
+  published_by BIGINT NOT NULL REFERENCES sys_users(id),
+  published_by_name VARCHAR(50),
+  published_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  recipient_types TEXT,
+  recipient_count INT DEFAULT 0,
+  status VARCHAR(20) DEFAULT 'active'
+);
+CREATE INDEX IF NOT EXISTS idx_publications_analysis ON biz_analysis_publications (analysis_id);
+CREATE INDEX IF NOT EXISTS idx_publications_exam ON biz_analysis_publications (exam_id);
+CREATE INDEX IF NOT EXISTS idx_publications_published_at ON biz_analysis_publications (published_at);
+
+CREATE TABLE IF NOT EXISTS biz_publication_recipients (
+  id BIGSERIAL PRIMARY KEY,
+  publication_id VARCHAR(50) NOT NULL REFERENCES biz_analysis_publications(publication_id) ON DELETE CASCADE,
+  user_id BIGINT NOT NULL REFERENCES sys_users(id),
+  user_name VARCHAR(50),
+  user_role VARCHAR(50),
+  read_status VARCHAR(20) DEFAULT 'unread',
+  read_at TIMESTAMP NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uk_pub_user UNIQUE (publication_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_publication_recipients_pub ON biz_publication_recipients (publication_id);
+CREATE INDEX IF NOT EXISTS idx_publication_recipients_user ON biz_publication_recipients (user_id);
+
+CREATE TABLE IF NOT EXISTS biz_analysis_configs (
+  id BIGSERIAL PRIMARY KEY,
+  config_key VARCHAR(100) NOT NULL UNIQUE,
+  config_value TEXT NOT NULL,
+  description VARCHAR(255),
+  updated_by BIGINT,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO biz_analysis_configs (config_key, config_value, description) VALUES
+('layer_definitions', '[{"code": "A", "name": "提高班", "description": "学业水平较高的班级"}, {"code": "B", "name": "平行班", "description": "标准教学班级"}, {"code": "C", "name": "基础班", "description": "需要加强基础的班级"}]', '层次定义配置'),
+('analysis_dimensions', '["overall", "layer_comparison", "subject_analysis", "student_progress", "class_contrast"]', '分析维度配置'),
+('publication_roles', '["school_leader", "middle_manager", "research_leader", "prep_leader", "grade_leader", "head_teacher", "teacher"]', '可接收发布的角色配置'),
+('score_thresholds', '{"excellent": 90, "good": 80, "pass": 60, "fail": 60}', '成绩等级阈值配置'),
+('layered_analysis_enabled', 'true', '是否启用分层分析功能'),
+('layered_push_enabled', 'true', '是否启用分层推送功能'),
+('default_layer_percentages', '[0.20, 0.40, 0.60, 0.80]', '默认分层临界分百分比'),
+('teacher_layer_permissions', '{"headmaster": ["view", "push"], "teacher": ["view"]}', '教师分层权限配置'),
+('parent_data_isolation', 'true', '家长数据隔离开关')
+ON CONFLICT (config_key) DO UPDATE SET
+  config_value = excluded.config_value,
+  description = excluded.description,
+  updated_at = CURRENT_TIMESTAMP;
+
+CREATE TABLE IF NOT EXISTS biz_layer_definitions (
+  id BIGSERIAL PRIMARY KEY,
+  layer_code VARCHAR(10) NOT NULL UNIQUE,
+  layer_name VARCHAR(50) NOT NULL,
+  layer_type VARCHAR(20) NOT NULL,
+  description VARCHAR(255),
+  sort_order INT DEFAULT 0,
+  is_active SMALLINT DEFAULT 1,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_layer_definitions_type ON biz_layer_definitions (layer_type);
+CREATE INDEX IF NOT EXISTS idx_layer_definitions_active ON biz_layer_definitions (is_active);
+
+INSERT INTO biz_layer_definitions (layer_code, layer_name, layer_type, description, sort_order) VALUES
+('ALL', '全年级', 'all', '包含全年级的所有学生', 0),
+('A', 'A层', 'layer', '学业水平较高的班级层次', 1),
+('B', 'B层', 'layer', '标准教学班级层次', 2),
+('C', 'C层', 'layer', '基础教学班级层次', 3)
+ON CONFLICT (layer_code) DO UPDATE SET
+  layer_name = excluded.layer_name,
+  layer_type = excluded.layer_type,
+  description = excluded.description,
+  sort_order = excluded.sort_order,
+  is_active = 1,
+  updated_at = CURRENT_TIMESTAMP;
+
+CREATE TABLE IF NOT EXISTS biz_exam_layer_configs (
+  id BIGSERIAL PRIMARY KEY,
+  exam_id BIGINT NOT NULL REFERENCES biz_exams(id) ON DELETE CASCADE,
+  layer_id BIGINT NOT NULL REFERENCES biz_class_layers(id) ON DELETE CASCADE,
+  layer_code VARCHAR(10) NOT NULL,
+  config_type VARCHAR(20) NOT NULL DEFAULT 'auto',
+  included_classes TEXT,
+  excluded_students TEXT,
+  created_by BIGINT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uk_exam_layer_config UNIQUE (exam_id, layer_id)
+);
+CREATE INDEX IF NOT EXISTS idx_exam_layer_configs_exam ON biz_exam_layer_configs (exam_id);
+CREATE INDEX IF NOT EXISTS idx_exam_layer_configs_layer_code ON biz_exam_layer_configs (layer_code);
+
+CREATE TABLE IF NOT EXISTS biz_layered_notifications (
+  id BIGSERIAL PRIMARY KEY,
+  notification_id VARCHAR(50) NOT NULL UNIQUE,
+  exam_id BIGINT NOT NULL REFERENCES biz_exams(id) ON DELETE CASCADE,
+  layer_code VARCHAR(10) NOT NULL,
+  title VARCHAR(200) NOT NULL,
+  content TEXT,
+  notification_type VARCHAR(50) NOT NULL,
+  target_role VARCHAR(50) NOT NULL,
+  target_users TEXT,
+  sent_count INT DEFAULT 0,
+  read_count INT DEFAULT 0,
+  status VARCHAR(20) DEFAULT 'pending',
+  sent_at TIMESTAMP NULL,
+  created_by BIGINT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_layered_notifications_exam_layer ON biz_layered_notifications (exam_id, layer_code);
+CREATE INDEX IF NOT EXISTS idx_layered_notifications_status ON biz_layered_notifications (status);
+
+CREATE TABLE IF NOT EXISTS biz_layered_notification_recipients (
+  id BIGSERIAL PRIMARY KEY,
+  notification_id VARCHAR(50) NOT NULL REFERENCES biz_layered_notifications(notification_id) ON DELETE CASCADE,
+  user_id BIGINT NOT NULL REFERENCES sys_users(id),
+  user_role VARCHAR(50) NOT NULL,
+  user_name VARCHAR(50),
+  layer_code VARCHAR(10),
+  class_name VARCHAR(20),
+  read_status VARCHAR(20) DEFAULT 'unread',
+  read_at TIMESTAMP NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uk_layered_notification_user UNIQUE (notification_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_layered_recipients_notification ON biz_layered_notification_recipients (notification_id);
+CREATE INDEX IF NOT EXISTS idx_layered_recipients_user ON biz_layered_notification_recipients (user_id);
+
+CREATE TABLE IF NOT EXISTS biz_user_layer_permissions (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES sys_users(id) ON DELETE CASCADE,
+  user_role VARCHAR(50) NOT NULL,
+  layer_code VARCHAR(10) NOT NULL,
+  class_name VARCHAR(20),
+  permission_type VARCHAR(20) NOT NULL DEFAULT 'view',
+  grant_by BIGINT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uk_user_layer_class_permission UNIQUE (user_id, layer_code, class_name, permission_type)
+);
+CREATE INDEX IF NOT EXISTS idx_user_layer_permissions_user ON biz_user_layer_permissions (user_id);
+CREATE INDEX IF NOT EXISTS idx_user_layer_permissions_layer ON biz_user_layer_permissions (layer_code);
+
+CREATE TABLE IF NOT EXISTS biz_parent_student_layer (
+  id BIGSERIAL PRIMARY KEY,
+  parent_user_id BIGINT NOT NULL REFERENCES sys_users(id) ON DELETE CASCADE,
+  student_id BIGINT NOT NULL REFERENCES biz_students(id) ON DELETE CASCADE,
+  layer_code VARCHAR(10) NOT NULL,
+  class_name VARCHAR(20) NOT NULL,
+  academic_year VARCHAR(20) NOT NULL,
+  term VARCHAR(10) NOT NULL,
+  is_active SMALLINT DEFAULT 1,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uk_parent_student_layer_term UNIQUE (parent_user_id, student_id, academic_year, term)
+);
+CREATE INDEX IF NOT EXISTS idx_parent_student_layer_parent ON biz_parent_student_layer (parent_user_id);
+CREATE INDEX IF NOT EXISTS idx_parent_student_layer_student ON biz_parent_student_layer (student_id);
+CREATE INDEX IF NOT EXISTS idx_parent_student_layer_code ON biz_parent_student_layer (layer_code);
+
+CREATE TABLE IF NOT EXISTS biz_layered_analysis_logs (
+  id BIGSERIAL PRIMARY KEY,
+  exam_id BIGINT,
+  layer_code VARCHAR(10),
+  action_type VARCHAR(50) NOT NULL,
+  action_by BIGINT NOT NULL,
+  action_by_name VARCHAR(50),
+  action_by_role VARCHAR(50),
+  action_detail TEXT,
+  ip_address VARCHAR(50),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_layered_logs_exam_layer ON biz_layered_analysis_logs (exam_id, layer_code);
+CREATE INDEX IF NOT EXISTS idx_layered_logs_actor ON biz_layered_analysis_logs (action_by);
+
 CREATE TABLE IF NOT EXISTS biz_absence_records (
   id BIGSERIAL PRIMARY KEY,
   exam_id BIGINT NOT NULL REFERENCES biz_exams(id) ON DELETE CASCADE,
@@ -386,7 +589,7 @@ CREATE TABLE IF NOT EXISTS biz_absence_records (
   student_name VARCHAR(50) NOT NULL,
   class_id BIGINT,
   class_name VARCHAR(20),
-  absent_subjects JSONB,
+  absent_subjects TEXT,
   reason_type VARCHAR(20) DEFAULT '其他',
   reason_detail VARCHAR(255),
   report_source VARCHAR(20) DEFAULT '教务处',
@@ -398,7 +601,7 @@ CREATE TABLE IF NOT EXISTS biz_absence_records (
   audit_by_name VARCHAR(50),
   audit_time TIMESTAMP NULL,
   audit_comment VARCHAR(255),
-  attachments JSONB,
+  attachments TEXT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT uk_absence_exam_student UNIQUE (exam_id, student_id)
@@ -413,8 +616,85 @@ CREATE TABLE IF NOT EXISTS biz_absence_logs (
   action_by BIGINT REFERENCES sys_users(id),
   action_by_name VARCHAR(50),
   action_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  old_values JSONB,
-  new_values JSONB,
+  old_values TEXT,
+  new_values TEXT,
   remark VARCHAR(255)
 );
 CREATE INDEX IF NOT EXISTS idx_absence_logs_absence ON biz_absence_logs (absence_id);
+
+CREATE TABLE IF NOT EXISTS sys_audit_logs (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT,
+  username VARCHAR(50),
+  operation VARCHAR(100) NOT NULL,
+  module VARCHAR(50),
+  description TEXT,
+  ip_address VARCHAR(50),
+  user_agent VARCHAR(255),
+  request_data TEXT,
+  response_data TEXT,
+  status VARCHAR(20) DEFAULT 'success',
+  error_message TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_user ON sys_audit_logs (user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_operation ON sys_audit_logs (operation);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_module ON sys_audit_logs (module);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON sys_audit_logs (created_at);
+
+CREATE OR REPLACE VIEW view_analysis_statistics AS
+SELECT
+  sa.exam_id,
+  sa.grade_level,
+  COUNT(*) as total_analysis_count,
+  SUM(CASE WHEN sa.status = 'published' THEN 1 ELSE 0 END) as published_count,
+  SUM(CASE WHEN sa.status = 'draft' THEN 1 ELSE 0 END) as draft_count,
+  MAX(sa.created_at) as last_analysis_time
+FROM biz_score_analysis sa
+GROUP BY sa.exam_id, sa.grade_level;
+
+CREATE OR REPLACE VIEW view_publication_statistics AS
+SELECT
+  p.exam_id,
+  p.grade_level,
+  COUNT(*) as total_publications,
+  SUM(p.recipient_count) as total_recipients,
+  SUM(CASE WHEN pr.read_status = 'read' THEN 1 ELSE 0 END) as read_count,
+  MAX(p.published_at) as last_publication_time
+FROM biz_analysis_publications p
+LEFT JOIN biz_publication_recipients pr ON p.publication_id = pr.publication_id
+GROUP BY p.exam_id, p.grade_level;
+
+CREATE OR REPLACE VIEW view_layered_statistics_summary AS
+SELECT
+  ls.exam_id,
+  e.exam_name,
+  e.grade_level,
+  e.exam_date,
+  ls.layer_code,
+  ld.layer_name,
+  COUNT(DISTINCT ls.subject_name) as subject_count,
+  MAX(CASE WHEN ls.subject_name = 'total' THEN ls.mean_score END) as total_mean,
+  MAX(CASE WHEN ls.subject_name = 'total' THEN ls.pass_rate END) as total_pass_rate,
+  MAX(CASE WHEN ls.subject_name = 'total' THEN ls.excellent_rate END) as total_excellent_rate,
+  MAX(CASE WHEN ls.subject_name = 'total' THEN ls.valid_students END) as total_students,
+  MAX(ls.calculated_at) as last_calculated_at
+FROM biz_layered_statistics ls
+JOIN biz_exams e ON ls.exam_id = e.id
+JOIN biz_layer_definitions ld ON ls.layer_code = ld.layer_code
+GROUP BY ls.exam_id, e.exam_name, e.grade_level, e.exam_date, ls.layer_code, ld.layer_name;
+
+CREATE OR REPLACE VIEW view_layered_notification_summary AS
+SELECT
+  ln.exam_id,
+  ln.layer_code,
+  ln.notification_type,
+  ln.target_role,
+  COUNT(*) as total_notifications,
+  SUM(ln.sent_count) as total_sent,
+  SUM(ln.read_count) as total_read,
+  ROUND(SUM(ln.read_count)::numeric / NULLIF(SUM(ln.sent_count), 0) * 100, 2) as read_rate,
+  MAX(ln.sent_at) as last_sent_at
+FROM biz_layered_notifications ln
+WHERE ln.status = 'sent'
+GROUP BY ln.exam_id, ln.layer_code, ln.notification_type, ln.target_role;

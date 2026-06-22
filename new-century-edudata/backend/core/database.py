@@ -10,14 +10,34 @@ from typing import Generator, Optional
 import os
 
 # 数据库配置
-DATABASE_URL = os.getenv(
+DATABASE_URL_ENV_KEYS = (
     "DATABASE_URL",
-    "mysql+pymysql://root:NewCentury2025!@localhost:3306/new_century_edudata?charset=utf8mb4"
+    "POSTGRES_URL",
+    "POSTGRES_URL_NON_POOLING",
+    "POSTGRES_PRISMA_URL",
+    "NEON_DATABASE_URL",
 )
+DEFAULT_DATABASE_URL = "mysql+pymysql://root:NewCentury2025!@localhost:3306/new_century_edudata?charset=utf8mb4"
 
-# 兼容部分云服务(如Neon/Heroku)提供的 postgres:// 旧前缀
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+def normalize_database_url(url: str) -> str:
+    """Normalize provider-specific Postgres URL variants for SQLAlchemy."""
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql://", 1)
+    return url
+
+
+def resolve_database_url(environment: Optional[dict[str, str]] = None) -> tuple[str, str]:
+    """Resolve the database URL from common Vercel/Neon environment names."""
+    source = environment if environment is not None else os.environ
+    for key in DATABASE_URL_ENV_KEYS:
+        value = source.get(key)
+        if value:
+            return normalize_database_url(value), key
+    return DEFAULT_DATABASE_URL, "fallback"
+
+
+DATABASE_URL, DATABASE_URL_ENV_KEY = resolve_database_url()
 
 # 创建引擎
 engine = create_engine(

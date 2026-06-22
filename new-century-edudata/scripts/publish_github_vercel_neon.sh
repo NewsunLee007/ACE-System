@@ -103,6 +103,20 @@ add_vercel_env_if_set() {
   done
 }
 
+database_url_value() {
+  if [[ -n "${DATABASE_URL:-}" ]]; then
+    printf '%s' "${DATABASE_URL}"
+  elif [[ -n "${POSTGRES_URL:-}" ]]; then
+    printf '%s' "${POSTGRES_URL}"
+  elif [[ -n "${POSTGRES_URL_NON_POOLING:-}" ]]; then
+    printf '%s' "${POSTGRES_URL_NON_POOLING}"
+  elif [[ -n "${POSTGRES_PRISMA_URL:-}" ]]; then
+    printf '%s' "${POSTGRES_PRISMA_URL}"
+  elif [[ -n "${NEON_DATABASE_URL:-}" ]]; then
+    printf '%s' "${NEON_DATABASE_URL}"
+  fi
+}
+
 if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=no)" ]]; then
   printf 'Tracked files have uncommitted changes. Commit or stash them before publishing.\n' >&2
   git -C "${REPO_ROOT}" status --short
@@ -135,12 +149,13 @@ log "Pushing branch to GitHub"
 git -C "${REPO_ROOT}" push -u origin "${BRANCH}"
 
 if [[ "${SEED_NEON}" == "1" ]]; then
-  if [[ -z "${DATABASE_URL:-}" ]]; then
-    printf 'DATABASE_URL is required when SEED_NEON=1.\n' >&2
+  RESOLVED_DATABASE_URL="$(database_url_value)"
+  if [[ -z "${RESOLVED_DATABASE_URL}" ]]; then
+    printf 'DATABASE_URL, POSTGRES_URL, POSTGRES_URL_NON_POOLING, POSTGRES_PRISMA_URL, or NEON_DATABASE_URL is required when SEED_NEON=1.\n' >&2
     exit 1
   fi
   log "Initializing Neon schema and seeding real demo data"
-  (cd "${APP_DIR}" && "${PYTHON_BIN:-python3}" scripts/seed_neon_demo_data.py --with-schema)
+  (cd "${APP_DIR}" && DATABASE_URL="${RESOLVED_DATABASE_URL}" "${PYTHON_BIN:-python3}" scripts/seed_neon_demo_data.py --with-schema)
 fi
 
 if [[ -n "${VERCEL_SCOPE}" ]]; then
@@ -161,13 +176,13 @@ if [[ "${SYNC_VERCEL_ENV}" == "1" ]]; then
     exit 1
   fi
   require_vercel_auth
-  add_vercel_env_if_set "DATABASE_URL" "${DATABASE_URL:-}"
+  add_vercel_env_if_set "DATABASE_URL" "$(database_url_value)"
   add_vercel_env_if_set "SECRET_KEY" "${SECRET_KEY}"
   add_vercel_env_if_set "DEEPSEEK_API_KEY" "${DEEPSEEK_API_KEY:-}"
   add_vercel_env_if_set "DEEPSEEK_API_BASE_URL" "${DEEPSEEK_API_BASE_URL:-}"
   add_vercel_env_if_set "DEEPSEEK_MODEL" "${DEEPSEEK_MODEL:-}"
-elif [[ -n "${DATABASE_URL:-}" ]]; then
-  log "DATABASE_URL is set locally. Set SYNC_VERCEL_ENV=1 to add it to the linked Vercel project."
+elif [[ -n "$(database_url_value)" ]]; then
+  log "A database URL is set locally. Set SYNC_VERCEL_ENV=1 to add it to the linked Vercel project as DATABASE_URL."
 fi
 
 require_vercel_auth

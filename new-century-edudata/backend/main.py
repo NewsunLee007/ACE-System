@@ -35,7 +35,7 @@ from routers import (
     ai_analysis_api,
     score_visibility_api
 )
-from core.database import DATABASE_URL, SessionLocal, get_db_dialect, init_db
+from core.database import DATABASE_URL, DATABASE_URL_ENV_KEY, DATABASE_URL_ENV_KEYS, SessionLocal, get_db_dialect, init_db
 
 # 配置日志
 logging.basicConfig(
@@ -111,7 +111,7 @@ def health_check():
 
 
 def _database_url_source() -> str:
-    return "environment" if os.getenv("DATABASE_URL") else "fallback"
+    return "environment" if DATABASE_URL_ENV_KEY != "fallback" else "fallback"
 
 
 def _database_target() -> str:
@@ -131,8 +131,9 @@ def readiness_check():
         "status": "ready",
         "checks": {
             "database_url_source": _database_url_source(),
+            "database_url_key": DATABASE_URL_ENV_KEY,
             "database_target": _database_target(),
-            "database_url_configured": bool(os.getenv("DATABASE_URL")),
+            "database_url_configured": DATABASE_URL_ENV_KEY != "fallback",
             "database_connection": False,
             "seed_data": False,
         },
@@ -141,7 +142,10 @@ def readiness_check():
 
     if not payload["checks"]["database_url_configured"]:
         payload["status"] = "not_ready"
-        payload["reason"] = "DATABASE_URL is not configured; runtime is using the local fallback database URL."
+        payload["reason"] = (
+            "No supported database URL environment variable is configured; runtime is using "
+            f"the local fallback database URL. Supported keys: {', '.join(DATABASE_URL_ENV_KEYS)}."
+        )
         return JSONResponse(status_code=503, content=payload)
 
     db = SessionLocal()

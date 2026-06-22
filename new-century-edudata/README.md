@@ -263,6 +263,10 @@ development 环境；如果变量已存在，需要先在 Vercel 控制台删除
 登录、家长账号登录、家长学生绑定和学生报告链路。生产默认地址为
 `https://ace-system-sandy.vercel.app`，如需验证预览地址可额外传入
 `ACE_BASE_URL="https://preview-url.vercel.app"`。
+后端也兼容 Vercel/Neon 常见变量名：`DATABASE_URL`、`POSTGRES_URL`、
+`POSTGRES_URL_NON_POOLING`、`POSTGRES_PRISMA_URL`、`NEON_DATABASE_URL`。
+如果本地只拿到了 `POSTGRES_URL` 或 `NEON_DATABASE_URL`，发布脚本会在同步
+Vercel 时写入标准的 `DATABASE_URL`。
 
 当前后端已对核心教务链路的 PostgreSQL 方言做兼容：家长绑定、班级/学科/角色/教师职务管理、成绩导入、成绩分析结果包、分层统计缓存和排名可见性设置。
 

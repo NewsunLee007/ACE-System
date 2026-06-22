@@ -45,8 +45,10 @@ app = FastAPI(
     title="新纪元教务大数据平台 API",
     description="瑞安市新纪元实验学校 - 初中教务协同与精准学情分析平台",
     version="1.0.0",
+    openapi_url="/api/openapi.json",
     docs_url="/api/docs",
-    redoc_url="/api/redoc"
+    redoc_url="/api/redoc",
+    swagger_ui_oauth2_redirect_url="/api/docs/oauth2-redirect"
 )
 
 # 配置CORS

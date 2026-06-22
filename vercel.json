@@ -1,8 +1,13 @@
 {
   "version": 2,
+  "functions": {
+    "api/index.py": {
+      "includeFiles": "new-century-edudata/backend/**"
+    }
+  },
   "builds": [
     {
-      "src": "new-century-edudata/backend/main.py",
+      "src": "api/index.py",
       "use": "@vercel/python"
     },
     {
@@ -16,19 +21,19 @@
   "routes": [
     {
       "src": "/health",
-      "dest": "new-century-edudata/backend/main.py"
+      "dest": "api/index.py"
     },
     {
       "src": "/api/docs",
-      "dest": "new-century-edudata/backend/main.py"
+      "dest": "api/index.py"
     },
     {
       "src": "/api/redoc",
-      "dest": "new-century-edudata/backend/main.py"
+      "dest": "api/index.py"
     },
     {
       "src": "/api/(.*)",
-      "dest": "new-century-edudata/backend/main.py"
+      "dest": "api/index.py"
     },
     {
       "src": "/(.*)",

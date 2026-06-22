@@ -3,9 +3,9 @@
 .env.*
 !.env.example
 .trae/
-frontend/
-data/
-数据导入/
+/frontend/
+/data/
+/数据导入/
 *.csv
 *.xlsx
 *.xls

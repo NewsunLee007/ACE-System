@@ -5,6 +5,7 @@ from routers.parent_management_api import (
     upsert_parent_profile,
     upsert_parent_student_binding,
 )
+from routers.exam_management_api import _exam_response_from_row, _parse_subjects
 from routers.score_analysis_api import _fetch_bundle_scores, _store_result_bundle
 from services.score_visibility_service import save_score_visibility_settings
 
@@ -111,3 +112,30 @@ def test_bundle_store_uses_postgres_conflict_update():
     assert "ON CONFLICT (exam_id, grade_level) DO UPDATE" in sql
     assert "LONGTEXT" not in sql
     assert "ON DUPLICATE KEY" not in sql
+
+
+def test_exam_response_handles_postgres_subject_and_date_shapes():
+    assert _parse_subjects(["语文", "数学"]) == ["语文", "数学"]
+    assert _parse_subjects('["语文", "数学"]') == ["语文", "数学"]
+    assert _parse_subjects("语文，数学、英语") == ["语文", "数学", "英语"]
+
+    row = SimpleNamespace(
+        id="1001",
+        exam_name="2025-1 7年级教学调研",
+        term="2025-1",
+        exam_type=None,
+        grade_level="7年级",
+        exam_date="2026-02-21",
+        subjects=["语文", "数学", "英语"],
+        full_score="300",
+        description=None,
+        created_at="2026-02-25 00:00:00",
+    )
+
+    exam = _exam_response_from_row(row)
+
+    assert exam.id == 1001
+    assert exam.exam_type == ""
+    assert exam.subjects == ["语文", "数学", "英语"]
+    assert exam.exam_date == "2026-02-21"
+    assert exam.created_at == "2026-02-25 00:00:00"

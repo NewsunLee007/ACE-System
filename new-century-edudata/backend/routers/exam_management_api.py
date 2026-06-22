@@ -19,6 +19,62 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/exams", tags=["考试管理"])
 
 
+def _parse_subjects(value) -> List[str]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    text_value = str(value).strip()
+    if not text_value:
+        return []
+
+    try:
+        parsed = json.loads(text_value)
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+
+    return [item.strip() for item in text_value.replace("、", ",").replace("，", ",").split(",") if item.strip()]
+
+
+def _format_date(value) -> str:
+    if not value:
+        return ""
+    isoformat = getattr(value, "isoformat", None)
+    return isoformat() if callable(isoformat) else str(value)
+
+
+def _to_int(value, fallback: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _to_float(value, fallback: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _exam_response_from_row(row) -> "ExamResponse":
+    return ExamResponse(
+        id=_to_int(row.id),
+        exam_name=row.exam_name or "",
+        term=row.term or "",
+        exam_type=row.exam_type or "",
+        grade_level=row.grade_level or "",
+        exam_date=_format_date(row.exam_date),
+        subjects=_parse_subjects(row.subjects),
+        full_score=_to_float(row.full_score, 500.0),
+        description=row.description,
+        created_at=_format_date(row.created_at)
+    )
+
+
 # ============ Pydantic模型定义 ============
 
 class ExamCreateRequest(BaseModel):
@@ -208,21 +264,7 @@ def get_exam_list(
         
         results = db.execute(text(list_sql), params).fetchall()
         
-        exams = []
-        for result in results:
-            subjects = json.loads(result.subjects) if result.subjects else []
-            exams.append(ExamResponse(
-                id=result.id,
-                exam_name=result.exam_name,
-                term=result.term,
-                exam_type=result.exam_type,
-                grade_level=result.grade_level,
-                exam_date=result.exam_date.isoformat() if result.exam_date else "",
-                subjects=subjects,
-                full_score=float(result.full_score) if result.full_score else 500.0,
-                description=result.description,
-                created_at=result.created_at.isoformat() if result.created_at else ""
-            ))
+        exams = [_exam_response_from_row(result) for result in results]
         
         return ExamListResponse(
             total=total,
@@ -269,22 +311,22 @@ def get_exam_detail(
         """
         stats = db.execute(text(stats_sql), {"exam_id": exam_id}).fetchone()
         
-        subjects = json.loads(exam.subjects) if exam.subjects else []
+        subjects = _parse_subjects(exam.subjects)
         
         return ExamDetailResponse(
-            id=exam.id,
-            exam_name=exam.exam_name,
-            term=exam.term,
-            exam_type=exam.exam_type,
-            grade_level=exam.grade_level,
-            exam_date=exam.exam_date.isoformat() if exam.exam_date else "",
+            id=_to_int(exam.id),
+            exam_name=exam.exam_name or "",
+            term=exam.term or "",
+            exam_type=exam.exam_type or "",
+            grade_level=exam.grade_level or "",
+            exam_date=_format_date(exam.exam_date),
             subjects=subjects,
-            full_score=float(exam.full_score) if exam.full_score else 500.0,
+            full_score=_to_float(exam.full_score, 500.0),
             description=exam.description,
-            total_students=stats.total_students if stats else 0,
-            valid_students=stats.valid_students if stats else 0,
-            class_count=stats.class_count if stats else 0,
-            created_at=exam.created_at.isoformat() if exam.created_at else ""
+            total_students=_to_int(stats.total_students if stats else 0),
+            valid_students=_to_int(stats.valid_students if stats else 0),
+            class_count=_to_int(stats.class_count if stats else 0),
+            created_at=_format_date(exam.created_at)
         )
         
     except HTTPException:
@@ -495,20 +537,20 @@ def get_exam_statistics(
             "success": True,
             "exam_id": exam_id,
             "overview": {
-                "total_students": total_stats.total_students if total_stats else 0,
-                "valid_students": total_stats.valid_students if total_stats else 0,
-                "class_count": total_stats.class_count if total_stats else 0,
+                "total_students": _to_int(total_stats.total_students if total_stats else 0),
+                "valid_students": _to_int(total_stats.valid_students if total_stats else 0),
+                "class_count": _to_int(total_stats.class_count if total_stats else 0),
                 "avg_score": round(float(total_stats.avg_score), 2) if total_stats and total_stats.avg_score else 0,
                 "max_score": round(float(total_stats.max_score), 1) if total_stats and total_stats.max_score else 0,
                 "min_score": round(float(total_stats.min_score), 1) if total_stats and total_stats.min_score else 0
             },
             "score_distribution": {
-                "450-500": range_stats.range_450_500 if range_stats else 0,
-                "400-449": range_stats.range_400_449 if range_stats else 0,
-                "350-399": range_stats.range_350_399 if range_stats else 0,
-                "300-349": range_stats.range_300_349 if range_stats else 0,
-                "250-299": range_stats.range_250_299 if range_stats else 0,
-                "below_250": range_stats.range_below_250 if range_stats else 0
+                "450-500": _to_int(range_stats.range_450_500 if range_stats else 0),
+                "400-449": _to_int(range_stats.range_400_449 if range_stats else 0),
+                "350-399": _to_int(range_stats.range_350_399 if range_stats else 0),
+                "300-349": _to_int(range_stats.range_300_349 if range_stats else 0),
+                "250-299": _to_int(range_stats.range_250_299 if range_stats else 0),
+                "below_250": _to_int(range_stats.range_below_250 if range_stats else 0)
             }
         }
         

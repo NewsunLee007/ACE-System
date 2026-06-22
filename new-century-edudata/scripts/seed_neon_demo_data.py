@@ -212,7 +212,7 @@ def seed_users(cur, data: dict, role_ids: dict, default_password: str) -> None:
         cur,
         """
         INSERT INTO sys_users
-          (id, role_id, username, password_hash, real_name, phone, email, is_active, created_at, updated_at)
+          (id, role_id, username, password_hash, real_name, phone, email, is_active)
         VALUES %s
         ON CONFLICT (username) DO UPDATE SET
           role_id = excluded.role_id,
